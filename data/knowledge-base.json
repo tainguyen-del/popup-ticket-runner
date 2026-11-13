@@ -1,0 +1,74 @@
+[
+  {
+    "id": "case-create-verb-scheduled-expiry",
+    "title": "Động từ 'pop up' kèm lịch hẹn gỡ (Tạo mới, không phải Xóa)",
+    "ticketSample": "ID#19191 - Website support\nNhờ team pop up poster ở đính kèm, Schedule gỡ pop up vào cuối ngày 11/26\nthanks team",
+    "explanation": "Cụm 'pop up poster' là động từ thêm popup. Cụm 'Schedule gỡ' là ngày hết hạn (expiry), KHÔNG PHẢI lệnh xóa ngay.",
+    "expected": {
+      "siteId": "19191",
+      "operation": "create",
+      "expiry": "11/26",
+      "popupPosition": null
+    }
+  },
+  {
+    "id": "case-replace-dual-action",
+    "title": "Lệnh kép: Gỡ poster cũ & Thêm poster mới (Thay thế - Replace)",
+    "ticketSample": "ID - 19914 - Website Support\nHi team\nNhờ team hỗ trợ remove poster Happy Thanksgiving & popup poster đính kèm nha\nEXP: 11/26/2026\nThank You!",
+    "explanation": "Yêu cầu vừa remove poster có tên 'Happy Thanksgiving' vừa đăng poster đính kèm. Hành động chính xác là 'replace'.",
+    "expected": {
+      "siteId": "19914",
+      "operation": "replace",
+      "expiry": "11/26/2026",
+      "popupPosition": null
+    }
+  },
+  {
+    "id": "case-pure-remove",
+    "title": "Chỉ gỡ bỏ popup hiện tại (Remove)",
+    "ticketSample": "Website ID: 12345 - Support\nNhờ team gỡ giúp tiệm popup Thanksgiving đang chạy trên website nhé\nCảm ơn team",
+    "explanation": "Chỉ yêu cầu gỡ bỏ, không đính kèm poster mới hay yêu cầu đăng mới. Hành động là 'remove'.",
+    "expected": {
+      "siteId": "12345",
+      "operation": "remove",
+      "expiry": null,
+      "popupPosition": null
+    }
+  },
+  {
+    "id": "case-short-date-mm-dd",
+    "title": "Định dạng ngày ngắn không năm (MM/DD)",
+    "ticketSample": "ID 169\nTeam pop up poster đính kèm giúp tiệm, hạn tới 11/28\nThanks",
+    "explanation": "Ngày viết tắt '11/28' là tháng 11 ngày 28. Ghi nhận expiry là 11/28.",
+    "expected": {
+      "siteId": "169",
+      "operation": "create",
+      "expiry": "11/28",
+      "popupPosition": null
+    }
+  },
+  {
+    "id": "case-end-of-month",
+    "title": "Hết hạn vào cuối tháng",
+    "ticketSample": "ID# 20456\nNhờ team treo poster này lên web tới hết tháng 11 giúp tiệm nhé",
+    "explanation": "Cụm 'hết tháng 11' chỉ ngày cuối cùng của tháng 11.",
+    "expected": {
+      "siteId": "20456",
+      "operation": "create",
+      "expiry": "end of November",
+      "popupPosition": null
+    }
+  },
+  {
+    "id": "case-explicit-position-first",
+    "title": "Chỉ định vị trí ưu tiên đầu tiên (First)",
+    "ticketSample": "Site ID 7890\nPop up poster giùm tiệm, để popup này ở vị trí đầu tiên / first popup giúp mình",
+    "explanation": "Có chỉ định rõ ràng về thứ tự: popupPosition là 'first'.",
+    "expected": {
+      "siteId": "7890",
+      "operation": "create",
+      "expiry": null,
+      "popupPosition": "first"
+    }
+  }
+]

@@ -1,6 +1,6 @@
 {
   "name": "popup-ticket-runner",
-  "version": "1.0.0",
+  "version": "1.0.2",
   "private": true,
   "description": "Safe CRM-to-CMS popup workflow assistant",
   "main": "electron/main.js",
@@ -27,6 +27,7 @@
     "files": [
       "electron/**/*",
       "src/**/*",
+      "data/**/*",
       "public/**/*",
       "package.json"
     ],

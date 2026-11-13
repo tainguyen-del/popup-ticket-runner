@@ -790,15 +790,30 @@ async function openPopupSection(page, sectionId = null) {
 
 async function openPopupSettings(page, sectionId = null) {
   await openPopupSection(page, sectionId);
+  const isAddBlockVisible = async () => page.getByRole('button', { name: 'Add block', exact: true }).isVisible().catch(() => false);
+  if (await isAddBlockVisible()) return;
+
   const popupSetting = await visibleMatch(page.getByText('Popup_setting', { exact: true }), 'Popup setting control');
   await popupSetting.click();
-  // The settings panel is rendered after the section card is selected.
-  await waitForVisibleMatch(
+
+  const appeared = await waitForVisibleMatch(
     page.getByRole('button', { name: 'Add block', exact: true }),
-    'Popup Add block control',
+    null,
     true,
-    5000
-  );
+    4000
+  ).catch(() => null);
+
+  if (!appeared) {
+    // If clicking closed an already open accordion or if the transition was delayed,
+    // retry clicking Popup_setting once to re-open the panel.
+    await popupSetting.click().catch(() => {});
+    await waitForVisibleMatch(
+      page.getByRole('button', { name: 'Add block', exact: true }),
+      'Popup Add block control',
+      true,
+      8000
+    );
+  }
 }
 
 function expiryAriaLabel(expiry) {
