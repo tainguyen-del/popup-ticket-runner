@@ -74,6 +74,7 @@ async function findDuplicatePopupImagesWithVision(page, ticketImages, cmsImages)
     const ticketBase64 = fs.readFileSync(ticketPath).toString('base64');
     const ticketMime = ticketPath.endsWith('.png') ? 'image/png' : (ticketPath.endsWith('.webp') ? 'image/webp' : 'image/jpeg');
 
+    let bestMatch = null;
     for (let cmsIndex = 0; cmsIndex < cmsImages.length; cmsIndex += 1) {
       const cms = cmsImages[cmsIndex];
       const cmsPath = cms?.imagePath || cms?.path || cms?.uploadPath;
@@ -117,20 +118,31 @@ async function findDuplicatePopupImagesWithVision(page, ticketImages, cmsImages)
         }, { tData: ticketBase64, tMime: ticketMime, cData: cmsBase64, cMime: cmsMime });
 
         if (similarity >= 0.90) {
-          matches.push({
+          const candidate = {
             ticketIndex,
             cmsIndex,
             method: 'visual-similarity',
             similarity,
             ticket,
             cms
-          });
-          break;
+          };
+          if (!bestMatch) {
+            bestMatch = candidate;
+          } else {
+            const candidateHasSchedule = !!(candidate.cms?.end || candidate.cms?.start);
+            const bestHasSchedule = !!(bestMatch.cms?.end || bestMatch.cms?.start);
+            if (candidateHasSchedule && !bestHasSchedule) {
+              bestMatch = candidate;
+            } else if (candidateHasSchedule === bestHasSchedule && candidate.similarity > bestMatch.similarity) {
+              bestMatch = candidate;
+            }
+          }
         }
       } catch {
         // Fall back gracefully on canvas error
       }
     }
+    if (bestMatch) matches.push(bestMatch);
   }
   return matches;
 }

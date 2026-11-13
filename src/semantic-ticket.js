@@ -311,7 +311,7 @@ function semanticPrompt(ticketText, attachmentCandidates = []) {
     'Every non-null extracted field must include a short verbatim evidence substring copied from the ticket.',
     'Rules:',
     '- siteId is the Website/Site/Project ID in the ticket header, not the CRM ticket number.',
-    '- operation is replace only if the ticket explicitly asks to remove an old popup and add/replace a new one; remove only if it asks to remove with no new popup; otherwise create when it asks to add/show a popup.',
+    '- operation is replace if the ticket asks to replace, swap, change, or "update lại" / "cập nhật lại" / "đổi" / "thay" an existing poster with a new one, OR asks to remove an old popup and add a new one; remove only if it asks to remove with no new popup; otherwise create when it asks to add/show a brand-new popup.',
     '- popupPosition is first or last only when the ticket explicitly requests that popup ordering position. Do not infer it from attachment order, dates, or phrases such as "last updated".',
     '- Dates are date-only. Return YYYY-MM-DD only when a year is explicit.',
     '- Interpret "until", "through", "till", "expiry", "end", "den", "toi", "het han" as an end date.',
@@ -795,8 +795,10 @@ function mergeSemanticTicket(baseTicket, semantic, ticketText, model = DEFAULT_G
     audit.appliedFields.push('popupAction');
   }
   if ((ticket.popupAction === 'remove-one' || ticket.popupAction === 'replace') && semantic.operation === 'create' && canUseEvidence('operation', createEvidenceIsExplicit)) {
-    ticket.popupAction = 'create';
-    audit.appliedFields.push('popupAction');
+    if (!hasAffirmativePopupReplace(ticketText)) {
+      ticket.popupAction = 'create';
+      audit.appliedFields.push('popupAction');
+    }
   }
   if (!ticket.popupRequested && semantic.popupRequested && canUseEvidence('operation')) {
     ticket.popupRequested = true;

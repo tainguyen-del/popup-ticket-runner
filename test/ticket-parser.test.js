@@ -4,6 +4,7 @@ const {
   ticketData,
   ticketMarkerPattern,
   buildPopupEntries,
+  buildPopupEntriesForTickets,
   isInlineTicketImageUrl,
   resolveRemovalScopeFromAttachments,
   popupTicketEntriesFromDownloads,
@@ -330,6 +331,32 @@ test('adds a second block only after the first popup entry', () => {
   assert.equal(entries[0].isTicket, false);
   assert.equal(entries[1].isTicket, false);
   assert.equal(entries[2].isTicket, true);
+});
+
+test('replaces matching legacy block in-place when duplicateMatches is provided', () => {
+  const tickets = [{
+    ticketIndex: 0,
+    uploadPath: 'C:/tmp/Celine Holiday Gift Special.png',
+    schedule: { start: null, end: null }
+  }];
+  const legacy = [
+    { imagePath: 'C:/tmp/legacy-1.webp', sourceImageUrl: 'https://cdn.example/50-off.webp', end: { date: '2026-12-31' } },
+    { imagePath: 'C:/tmp/legacy-2.webp', sourceImageUrl: 'https://cdn.example/holiday-gift.webp', end: { date: '2026-12-31' } }
+  ];
+  const duplicateMatches = [{
+    ticketIndex: 0,
+    cmsIndex: 1,
+    method: 'visual-similarity',
+    similarity: 0.97
+  }];
+  const { entries, matchingLegacyIndex } = buildPopupEntriesForTickets(tickets, legacy, duplicateMatches);
+  assert.equal(matchingLegacyIndex, 1);
+  assert.equal(entries.length, 2);
+  assert.equal(entries[0].imagePath, 'C:/tmp/legacy-1.webp');
+  assert.equal(entries[0].isTicket, false);
+  assert.equal(entries[1].imagePath, 'C:/tmp/Celine Holiday Gift Special.png');
+  assert.equal(entries[1].isTicket, true);
+  assert.equal(entries[1].schedule.end.date, '2026-12-31');
 });
 
 test('keeps two staged ticket posters as distinct popup entries with the shared schedule', () => {

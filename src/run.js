@@ -1663,67 +1663,76 @@ async function movePopupImagesToPosition(page, imageUrls, position) {
   return { applied: true, moved };
 }
 
-async function openPopupListItem(page, { forceNewBlock = false } = {}) {
+async function openPopupListItem(page, { forceNewBlock = false, replaceTargetIndex = null } = {}) {
   const before = await readPopupListItems(page);
-  let target = planPopupItemTarget(before.items, { forceNewBlock });
+  let target;
   let items = before.items;
-  if (target.addBlock) {
-    const panel = await waitForPopupListItemsPanel(page, 6000).catch(() => null);
-    const addBlockLocator = panel
-      ? panel.getByRole('button', { name: /Add\s*block/i })
-      : page.getByRole('button', { name: /Add\s*block/i });
+  if (Number.isInteger(replaceTargetIndex) && replaceTargetIndex >= 0 && replaceTargetIndex < before.items.length) {
+    target = {
+      targetIndex: replaceTargetIndex,
+      expectedCount: before.items.length,
+      addBlock: false
+    };
+  } else {
+    target = planPopupItemTarget(before.items, { forceNewBlock });
+    if (target.addBlock) {
+      const panel = await waitForPopupListItemsPanel(page, 6000).catch(() => null);
+      const addBlockLocator = panel
+        ? panel.getByRole('button', { name: /Add\s*block/i })
+        : page.getByRole('button', { name: /Add\s*block/i });
 
-    const addBlock = await waitForVisibleMatch(
-      addBlockLocator,
-      null,
-      true,
-      6000
-    ).catch(() => null) || await waitForVisibleMatch(
-      page.locator('button:has-text("Add block")'),
-      'Popup Add block control',
-      true,
-      8000
-    );
-    await addBlock.click();
-    // CMS sometimes auto-opens the last card, and sometimes leaves the
-    // previous card open. Always return to the list then select the exact
-    // serialized index; an open editor alone is not proof of its identity.
-    if (await popupListItemEditorIsOpen(page, 1000)) await backToPopupSettings(page);
-    items = await waitForPopupListItemCount(page, target.expectedCount);
-    const resolved = resolveAddedPopupItemTarget(before.items, items);
-    if (!Number.isInteger(resolved.targetIndex)) {
+      const addBlock = await waitForVisibleMatch(
+        addBlockLocator,
+        null,
+        true,
+        6000
+      ).catch(() => null) || await waitForVisibleMatch(
+        page.locator('button:has-text("Add block")'),
+        'Popup Add block control',
+        true,
+        8000
+      );
+      await addBlock.click();
+      // CMS sometimes auto-opens the last card, and sometimes leaves the
+      // previous card open. Always return to the list then select the exact
+      // serialized index; an open editor alone is not proof of its identity.
+      if (await popupListItemEditorIsOpen(page, 1000)) await backToPopupSettings(page);
+      items = await waitForPopupListItemCount(page, target.expectedCount);
+      const resolved = resolveAddedPopupItemTarget(before.items, items);
+      if (!Number.isInteger(resolved.targetIndex)) {
+        const error = new Error(
+          `CMS added a popup item but it was not a uniquely identifiable blank card (${resolved.reason}). `
+          + 'The ticket poster and dates were not changed.'
+        );
+        error.stage = 'popup-item-target';
+        error.popupItems = popupItemsForReport(items, { iana: 'UTC' });
+        throw error;
+      }
+      target = {
+        ...target,
+        targetIndex: resolved.targetIndex,
+        expectedCount: resolved.expectedCount,
+        targetResolution: resolved.method
+      };
+    }
+    if (!isEmptyPopupItem(items[target.targetIndex])) {
       const error = new Error(
-        `CMS added a popup item but it was not a uniquely identifiable blank card (${resolved.reason}). `
+        `Popup item ${target.targetIndex + 1} is not blank before opening it. `
         + 'The ticket poster and dates were not changed.'
       );
       error.stage = 'popup-item-target';
-      error.popupItems = popupItemsForReport(items, { iana: 'UTC' });
       throw error;
     }
-    target = {
-      ...target,
-      targetIndex: resolved.targetIndex,
-      expectedCount: resolved.expectedCount,
-      targetResolution: resolved.method
-    };
-  }
-  if (!isEmptyPopupItem(items[target.targetIndex])) {
-    const error = new Error(
-      `Popup item ${target.targetIndex + 1} is not blank before opening it. `
-      + 'The ticket poster and dates were not changed.'
-    );
-    error.stage = 'popup-item-target';
-    throw error;
   }
   if (await popupListItemEditorIsOpen(page, 500)) await backToPopupSettings(page);
-  await openPopupListCard(page, target.targetIndex, target.addBlock ? 'New popup block' : 'Popup placeholder', {
+  await openPopupListCard(page, target.targetIndex, target.addBlock ? 'New popup block' : (Number.isInteger(replaceTargetIndex) ? 'Popup block for replacement' : 'Popup placeholder'), {
     expectedCount: target.expectedCount
   });
   return { ...target, beforeItems: before.items };
 }
 
-async function configurePopupListItem(page, imagePath, schedule, timezone, { forceNewBlock = false } = {}) {
-  const target = await openPopupListItem(page, { forceNewBlock });
+async function configurePopupListItem(page, imagePath, schedule, timezone, { forceNewBlock = false, replaceTargetIndex = null, isReplacement = false } = {}) {
+  const target = await openPopupListItem(page, { forceNewBlock, replaceTargetIndex });
   await waitForVisibleMatch(
     page.getByRole('heading', { name: 'List items', exact: true }),
     'Popup list item editor',
@@ -1738,7 +1747,7 @@ async function configurePopupListItem(page, imagePath, schedule, timezone, { for
     .map((image) => image.src)
     .filter((source) => source && !/\/images\/download\.png(?:$|\?)/.test(source))
   ).catch(() => []);
-  if (previousImageUrls.length > 0) {
+  if (!isReplacement && previousImageUrls.length > 0) {
     const error = new Error(`Popup item ${target.targetIndex + 1} unexpectedly contains an existing image. The ticket poster was not uploaded.`);
     error.stage = 'popup-item-target';
     throw error;
@@ -1747,8 +1756,8 @@ async function configurePopupListItem(page, imagePath, schedule, timezone, { for
   // calendar date: only a date written in the ticket is allowed to populate
   // Time start. The blank-card assertion above happens first so a stale
   // editor can never alter a legacy popup's dates.
-  const start = schedule.start ? await setPopupStart(page, schedule.start, timezone) : null;
-  const end = schedule.end ? await setPopupExpiry(page, schedule.end) : null;
+  const start = schedule?.start ? await setPopupStart(page, schedule.start, timezone) : null;
+  const end = schedule?.end ? await setPopupExpiry(page, schedule.end) : null;
   await imageInput.setInputFiles(imagePath);
   await page.waitForFunction((before) => {
     const labels = [...document.querySelectorAll('label')].filter((label) => {
@@ -2113,26 +2122,44 @@ function normalizeTicketPopupEntries(ticketEntries, imagePath, schedule, ticketF
   });
 }
 
-function buildPopupEntriesForTickets(ticketEntries, legacyPopups = []) {
+function buildPopupEntriesForTickets(ticketEntries, legacyPopups = [], duplicateMatches = []) {
   const normalizedTickets = Array.isArray(ticketEntries) ? ticketEntries : [];
   const matchedTicketIndexes = new Set();
   const matchingLegacyIndexes = [];
+  const legacyToTicketMap = new Map();
+
+  for (const match of duplicateMatches) {
+    if (match && Number.isInteger(match.cmsIndex) && Number.isInteger(match.ticketIndex)) {
+      legacyToTicketMap.set(match.cmsIndex, match.ticketIndex);
+    }
+  }
+
   const entries = legacyPopups.map((legacy, legacyIndex) => {
-    const legacyIdentity = popupImageIdentity(legacy?.sourceImageUrl);
-    const ticket = legacyIdentity
-      ? normalizedTickets.find((candidate) => (
-        !matchedTicketIndexes.has(candidate.ticketIndex)
-        && popupImageIdentity(candidate.filename || path.basename(candidate.imagePath)) === legacyIdentity
-      ))
-      : null;
+    let ticket = null;
+    if (legacyToTicketMap.has(legacyIndex)) {
+      const tIndex = legacyToTicketMap.get(legacyIndex);
+      ticket = normalizedTickets.find((c) => c.ticketIndex === tIndex) || null;
+    }
+    if (!ticket) {
+      const legacyIdentity = popupImageIdentity(legacy?.sourceImageUrl);
+      ticket = legacyIdentity
+        ? normalizedTickets.find((candidate) => (
+          !matchedTicketIndexes.has(candidate.ticketIndex)
+          && popupImageIdentity(candidate.filename || (candidate.imagePath ? path.basename(candidate.imagePath) : (candidate.uploadPath ? path.basename(candidate.uploadPath) : ''))) === legacyIdentity
+        ))
+        : null;
+    }
     if (ticket) {
       matchedTicketIndexes.add(ticket.ticketIndex);
       matchingLegacyIndexes.push(legacyIndex);
       return {
-        imagePath: legacy.imagePath,
+        imagePath: ticket.uploadPath || ticket.path || ticket.imagePath || legacy.imagePath,
         // An old active popup is retained for its poster and expiry. The new
         // section must not introduce a start date unless this ticket gave one.
-        schedule: { start: ticket.schedule.start || null, end: ticket.schedule.end || legacy.end },
+        schedule: {
+          start: ticket.schedule?.start || null,
+          end: ticket.schedule?.end || legacy.end
+        },
         isTicket: true,
         ticketIndexes: [ticket.ticketIndex]
       };
@@ -2147,7 +2174,7 @@ function buildPopupEntriesForTickets(ticketEntries, legacyPopups = []) {
   for (const ticket of normalizedTickets) {
     if (matchedTicketIndexes.has(ticket.ticketIndex)) continue;
     entries.push({
-      imagePath: ticket.imagePath,
+      imagePath: ticket.uploadPath || ticket.path || ticket.imagePath,
       schedule: ticket.schedule,
       isTicket: true,
       ticketIndexes: [ticket.ticketIndex]
@@ -2174,7 +2201,8 @@ async function configurePopup(page, imagePath, schedule, timezone, {
   repairOnly = false,
   ticketFilename = null,
   ticketEntries = null,
-  popupPosition = null
+  popupPosition = null,
+  duplicateMatches = []
 } = {}) {
   await openPopupSection(page, sectionId);
   const timezoneControl = await setPopupTimezone(page, timezone);
@@ -2185,30 +2213,85 @@ async function configurePopup(page, imagePath, schedule, timezone, {
   }
   const normalizedTicketEntries = normalizeTicketPopupEntries(ticketEntries, imagePath, schedule, ticketFilename);
   const before = await readPopupListItems(page);
-  const replacement = replaceExisting ? await removeSingleExistingPopup(page) : { removed: false, previous: null };
-  const { entries, matchingLegacyIndex, matchingLegacyIndexes } = buildPopupEntriesForTickets(normalizedTicketEntries, legacyPopups);
+  let duplicateTargetIndex = -1;
+  let duplicateMatch = null;
+  if (duplicateMatches.length > 0) {
+    duplicateMatch = duplicateMatches[0];
+    if (duplicateMatch?.cms?.sourceImageUrl) {
+      const targetUrl = stableImageUrl(duplicateMatch.cms.sourceImageUrl);
+      const matches = before.items
+        .map((item, idx) => ({ item, idx }))
+        .filter(({ item }) => stableImageUrl(item.image) === targetUrl);
+      if (matches.length > 0) {
+        const configuredMatch = matches.find(({ item }) => item.time_end);
+        duplicateTargetIndex = configuredMatch ? configuredMatch.idx : matches[0].idx;
+      }
+    }
+    if (duplicateTargetIndex < 0 && Number.isInteger(duplicateMatch?.cmsIndex) && before.items[duplicateMatch.cmsIndex]) {
+      duplicateTargetIndex = duplicateMatch.cmsIndex;
+    }
+  }
+
+  const shouldRemoveSingle = replaceExisting && duplicateMatches.length === 0 && before.items.length === 1;
+  const replacement = shouldRemoveSingle ? await removeSingleExistingPopup(page) : { removed: false, previous: null };
+  const { entries, matchingLegacyIndex, matchingLegacyIndexes } = buildPopupEntriesForTickets(normalizedTicketEntries, legacyPopups, duplicateMatches);
   const emptyItemsBefore = before.items.filter(isEmptyPopupItem);
   const configuredItemsBefore = before.items.filter((item) => !isEmptyPopupItem(item));
   const hasReusablePlaceholder = emptyItemsBefore.length > 0;
   const ticketItems = new Map();
   let lastConfiguredItem = null;
-  for (let index = 0; index < entries.length; index += 1) {
-    const entry = entries[index];
-    const configured = await configurePopupListItem(page, entry.imagePath, entry.schedule, timezone, {
-      // The first item uses NewZen's existing "Not configured" placeholder.
-      // Additional migrated popups require a genuine new block. If an older
-      // current section already has an active item but no empty placeholder,
-      // preserve it and add a real block for this ticket instead of replacing
-      // the legacy poster.
-      forceNewBlock: index > 0 || (index === 0 && configuredItemsBefore.length > 0 && !hasReusablePlaceholder)
-    });
+  let effectiveScheduleForVerification = schedule;
+
+  if (duplicateTargetIndex >= 0 && duplicateMatch) {
+    const targetItem = before.items[duplicateTargetIndex];
+    const ticketEntry = normalizedTicketEntries.find((t) => t.ticketIndex === duplicateMatch.ticketIndex) || normalizedTicketEntries[0];
+    const targetSchedule = {
+      start: ticketEntry?.schedule?.start || (targetItem?.time_start ? { date: popupDateFromCmsValue(targetItem.time_start, timezone) } : null),
+      end: ticketEntry?.schedule?.end || (targetItem?.time_end ? { date: popupDateFromCmsValue(targetItem.time_end, timezone) } : null)
+    };
+    effectiveScheduleForVerification = targetSchedule;
+    progress('popup-replace', `Thay thế poster vào block hiện có tại vị trí #${duplicateTargetIndex + 1} (giữ nguyên lịch hiển thị cũ nếu ticket không đổi)`);
+    const configured = await configurePopupListItem(
+      page,
+      ticketEntry.uploadPath || ticketEntry.path || ticketEntry.imagePath,
+      targetSchedule,
+      timezone,
+      { replaceTargetIndex: duplicateTargetIndex, isReplacement: true }
+    );
     await backToPopupSettings(page);
-    // A preview inside the nested editor is not a save acknowledgement. Wait
-    // until the outer Popup settings model contains this exact target card,
-    // including the requested dates, before moving to the next item or Build.
-    const item = await waitForPersistedPopupItem(page, configured, entry.schedule, timezone);
+    const item = await waitForPersistedPopupItem(page, configured, targetSchedule, timezone);
     lastConfiguredItem = item;
-    for (const ticketIndex of entry.ticketIndexes || []) ticketItems.set(ticketIndex, item);
+    for (const ticketIndex of [ticketEntry.ticketIndex]) ticketItems.set(ticketIndex, item);
+
+    try {
+      const { items: afterItems } = await readPopupListItems(page);
+      for (let i = afterItems.length - 1; i >= 0; i -= 1) {
+        if (i === duplicateTargetIndex) continue;
+        const it = afterItems[i];
+        const isUnconfigured = !String(it?.time_end || '').trim();
+        const matchesReplacedImage = stableImageUrl(it?.image) === stableImageUrl(duplicateMatch.cms?.sourceImageUrl)
+          || stableImageUrl(it?.image) === stableImageUrl(item.imageUrl)
+          || isEmptyPopupItem(it);
+        if (isUnconfigured && matchesReplacedImage) {
+          progress('popup-cleanup', `Xóa block ảnh trùng lặp chưa cấu hình (Not configured) tại vị trí #${i + 1}`);
+          await deletePopupItemAtIndex(page, i, afterItems.length - 1, 'Unconfigured duplicate popup item');
+          break;
+        }
+      }
+    } catch {
+      // Non-blocking cleanup
+    }
+  } else {
+    for (let index = 0; index < entries.length; index += 1) {
+      const entry = entries[index];
+      const configured = await configurePopupListItem(page, entry.imagePath, entry.schedule, timezone, {
+        forceNewBlock: index > 0 || (index === 0 && configuredItemsBefore.length > 0 && !hasReusablePlaceholder)
+      });
+      await backToPopupSettings(page);
+      const item = await waitForPersistedPopupItem(page, configured, entry.schedule, timezone);
+      lastConfiguredItem = item;
+      for (const ticketIndex of entry.ticketIndexes || []) ticketItems.set(ticketIndex, item);
+    }
   }
   let positionResult = { applied: false, moved: false };
   if ((popupPosition === 'first' || popupPosition === 'last') && ticketItems.size) {
@@ -2222,7 +2305,7 @@ async function configurePopup(page, imagePath, schedule, timezone, {
   // The last exact target is the authoritative count.  This also handles a
   // replacement ticket, where the original single popup was intentionally
   // removed before adding the new one.
-  const expectedItemCount = lastConfiguredItem?.expectedCount ?? after.items.length;
+  const expectedItemCount = duplicateTargetIndex >= 0 ? after.items.length : (lastConfiguredItem?.expectedCount ?? after.items.length);
   const configuredItems = after.items.filter((item) => typeof item?.image === 'string' && item.image.trim());
   const emptyItems = after.items.filter(isEmptyPopupItem);
   const verifiedTicketItems = normalizedTicketEntries.map((ticket) => {
@@ -2230,7 +2313,7 @@ async function configurePopup(page, imagePath, schedule, timezone, {
     const resolved = resolvePopupItemByImageAndSchedule(
       after.items,
       configured?.imageUrl,
-      ticket.schedule,
+      effectiveScheduleForVerification || ticket.schedule,
       timezone
     );
     const target = resolved.item;
@@ -3138,6 +3221,7 @@ async function main() {
             // locally so it can be uploaded again into the fresh section. A
             // ticket that explicitly requests removal remains the exception.
             let legacyPopupSnapshot = { sectionIds: [], items: [], expiredCount: 0 };
+            let matchingDuplicatePairs = [];
             const preserveLegacyPopups = mustCreateFreshSection && plan.ticket.popupAction !== 'replace';
             const scanExistingPopupImages = !repairExistingPopup && stagedTicketEntries.length > 0;
             if (preserveLegacyPopups || scanExistingPopupImages) {
@@ -3161,19 +3245,12 @@ async function main() {
                 }
                 const duplicates = await findDuplicatePopupImagesWithVision(page, downloadedAttachments, legacyPopupSnapshot.scannedItems);
                 if (duplicates.length) {
-                  const duplicate = duplicates[0];
-                  const ticketFilename = duplicate.ticket?.filename || `ticket image #${duplicate.ticketIndex + 1}`;
-                  const methodLabel = duplicate.method === 'visual-similarity'
-                    ? ` (hình ảnh giống ${Math.round((duplicate.similarity || 1) * 100)}% với popup hiện có trên CMS)`
-                    : '';
-                  const error = new Error(`Duplicate popup image: "${ticketFilename}" already exists in CMS${methodLabel}. The image was not added and CMS Build was not started.`);
-                  error.stage = 'popup-image-duplicate';
-                  error.duplicateImage = {
-                    ticketFilename,
-                    cmsImageUrl: duplicate.cms?.sourceImageUrl || null,
-                    method: duplicate.method
-                  };
-                  throw error;
+                  progress(
+                    'popup-replace-match',
+                    `Phát hiện ảnh đính kèm tương ứng với block ảnh trên CMS (độ tương đồng ${Math.round((duplicates[0].similarity || 1) * 100)}%), tiến hành thay thế ảnh vào block cũ.`
+                  );
+                  matchingDuplicatePairs = duplicates;
+                  plan.ticket.popupAction = 'replace';
                 }
                 // Historical URL mapping is a compatibility fallback for
                 // CMS images that were transformed after upload. It must run
@@ -3193,7 +3270,7 @@ async function main() {
                     error.stage = 'popup-image-ambiguous';
                     throw error;
                   }
-                  if (existing.item) {
+                  if (existing.item && matchingDuplicatePairs.length === 0) {
                     const error = new Error(`Duplicate popup image: "${attachment.filename || 'ticket poster'}" already exists in CMS. The image was not added and CMS Build was not started.`);
                     error.stage = 'popup-image-duplicate';
                     error.duplicateImage = {
@@ -3281,7 +3358,8 @@ async function main() {
                 repairOnly: repairExistingPopup,
                 ticketFilename: downloadedAttachment?.filename || null,
                 ticketEntries: stagedTicketEntries,
-                popupPosition: plan.ticket.popupPosition || null
+                popupPosition: plan.ticket.popupPosition || null,
+                duplicateMatches: matchingDuplicatePairs
               });
               plan.popup = {
                 imageConfigured: configuredPopup.imageConfigured !== false,
