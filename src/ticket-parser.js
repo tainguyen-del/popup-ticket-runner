@@ -83,6 +83,30 @@ function hasAffirmativePopupUpdate(text) {
   return false;
 }
 
+function hasAffirmativePopupReplace(text) {
+  const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim();
+  const entity = String.raw`(?:pop[\s-]*ups?|announcements?|posters?|banners?|hinh|anh)`;
+  if (!new RegExp(String.raw`\b${entity}\b`, 'i').test(folded)) return false;
+
+  const patterns = [
+    new RegExp(String.raw`\b(?:update\s*lai|cap\s*nhat\s*lai|thay\s*lai|doi|thay\s*doi|thay\s*the|replace|change|swap)\b[^.;\n]{0,40}\b${entity}\b`, 'gi'),
+    new RegExp(String.raw`\b${entity}\b[^.;\n]{0,40}\b(?:update\s*lai|cap\s*nhat\s*lai|thay\s*lai|doi|thay\s*doi|thay\s*the|replace|change|swap)\b`, 'gi'),
+    new RegExp(String.raw`\bthay\b[^.;\n]{0,30}\b${entity}\b`, 'gi'),
+    /\b(?:update|cap\s*nhat|thay|doi)\s+lai\b/gi
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of folded.matchAll(pattern)) {
+      if (!actionIsNegated(folded, match.index)) return true;
+    }
+  }
+
+  const removesExisting = hasAffirmativePopupRemoval(folded);
+  const addsOrUpdates = hasAffirmativePopupUpdate(folded);
+  const isScheduledRemoval = /\b(?:schedule|lich|hen(?:\s+gio)?)\s+go\b/i.test(folded);
+  return removesExisting && addsOrUpdates && !isScheduledRemoval;
+}
+
 function explicitRemoveAllRequested(text) {
   const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim();
   const patterns = [
@@ -101,6 +125,23 @@ function explicitRemoveAllRequested(text) {
     }
   }
   return false;
+}
+
+function hasMultiPosterIntent(text) {
+  const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim();
+  if (!folded) return false;
+
+  const patterns = [
+    /\b(?:2|3|4|hai|ba|bon|two|three)\s*(?:posters?|pop[\s-]*ups?|banners?)\b/i,
+    /\b(?:ca\s*2|ca\s*hai|both)\s*(?:posters?|pop[\s-]*ups?|banners?|anh|hinh|file)?\b/i,
+    /\b(?:pop(?:\s*up)?|dang|up|them|tao|treo|cai(?:\s+dat)?)\s+(?:ca\s*2|ca\s*hai|2|hai|3|ba)\s*(?:posters?|pop[\s-]*ups?|banners?|anh|hinh|file)?\b/i,
+    /\b(?:pop(?:\s*up)?|dang|up|them|tao|treo)\s+(?:posters|pop[\s-]*ups)\b/i,
+    /\b(?:poster|popup|anh|hinh)\s*(?:1|mot|one)\s*(?:va|and|,|&)\s*(?:poster|popup|anh|hinh)?\s*(?:2|hai|two)\b/i,
+    /\b(?:multiple|several|both)\s+(?:posters?|pop[\s-]*ups?|banners?)\b/i,
+    /\b(?:2|3|two|three)\s+separate\s+pop[\s-]*ups?\b/i
+  ];
+
+  return patterns.some((pattern) => pattern.test(folded));
 }
 
 function requestedPopupPosition(text) {
@@ -306,7 +347,7 @@ function ticketData(body, ticketUrl) {
   const removesExistingPopupPoster = hasAffirmativePopupRemoval(folded);
   const addsOrUpdatesPopup = hasAffirmativePopupUpdate(folded);
   const isScheduledRemoval = /\b(?:schedule|lich|hen(?:\s+gio)?)\s+go\b/i.test(folded);
-  const replaceExistingPopup = removesExistingPopupPoster && addsOrUpdatesPopup && !isScheduledRemoval;
+  const replaceExistingPopup = hasAffirmativePopupReplace(folded) && !isScheduledRemoval;
   const removesAllExistingPopups = removesExistingPopupPoster && explicitRemoveAllRequested(folded);
   return {
     siteId: titleSiteId || labelledSiteId,
@@ -367,7 +408,9 @@ module.exports = {
   foldTicketText,
   hasAffirmativePopupRemoval,
   hasAffirmativePopupUpdate,
+  hasAffirmativePopupReplace,
   explicitRemoveAllRequested,
+  hasMultiPosterIntent,
   requestedPopupPosition,
   normalizeExpiry,
   findTicketDate,

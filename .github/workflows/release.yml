@@ -31,14 +31,24 @@ jobs:
       - name: Build portable executable
         run: npm run dist:portable
 
+      - name: Read package version
+        id: pkg
+        shell: pwsh
+        run: |
+          $ver = (Get-Content package.json | ConvertFrom-Json).version
+          echo "version=$ver" >> $env:GITHUB_OUTPUT
+
       - name: Publish to GitHub Releases
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: v1.0.${{ github.run_number }}
-          name: "Popup Ticket Runner v1.0.${{ github.run_number }}"
+          tag_name: v${{ steps.pkg.outputs.version }}
+          name: "Popup Ticket Runner v${{ steps.pkg.outputs.version }}"
           body: |
-            ## Bản cập nhật tự động (Build #${{ github.run_number }})
+            ## Popup Ticket Runner v${{ steps.pkg.outputs.version }}
             - Commit: `${{ github.sha }}`
+            - Cập nhật phân biệt 1 poster vs nhiều poster (Ticket 1594040).
+            - Nhận diện tự động hành động thay thế (Replace: update lại, đổi, thay) cho Ticket 1594214.
+            - Bổ sung cơ chế check trùng ảnh thông minh bằng thị giác điểm ảnh (Visual Similarity >= 90%).
             - Tải file **`Popup Ticket Runner Final.exe`** ở mục Assets bên dưới để sử dụng trực tiếp không cần cài đặt.
           files: dist/Popup Ticket Runner Final.exe
           draft: false

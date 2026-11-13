@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { planPopupPosition, verifyPopupPosition } = require('../src/cms/popup-order-policy');
-const { findDuplicatePopupImages } = require('../src/cms/popup-image-policy');
+const { findDuplicatePopupImages, findDuplicatePopupImagesWithVision } = require('../src/cms/popup-image-policy');
 
 function item(image, end = '') {
   return { image, time_start: '', time_end: end, image_alt: '', link: '', html_code: '' };
@@ -67,4 +67,14 @@ test('recognizes a transformed CMS upload by the hash embedded in its sanitized 
   );
   assert.equal(matches.length, 1);
   assert.equal(matches[0].method, 'upload-hash-suffix');
+});
+
+test('findDuplicatePopupImagesWithVision returns direct matches when hash or filename matches', async () => {
+  const hash = 'a'.repeat(64);
+  const matches = await findDuplicatePopupImagesWithVision(null,
+    [{ filename: 'test.png', sha256: hash }],
+    [{ sourceImageUrl: 'https://cdn.example/test.webp', sha256: hash }]
+  );
+  assert.equal(matches.length, 1);
+  assert.equal(matches[0].method, 'sha256');
 });

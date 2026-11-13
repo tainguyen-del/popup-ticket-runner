@@ -648,3 +648,49 @@ test('reads bare Website ID from ticket header without ID prefix', () => {
   assert.equal(ticket.expiryDate, '2026-12-31');
   assert.equal(ticket.popupRequested, true);
 });
+
+test('distinguishes singular popup requests from explicit multi-poster intent', () => {
+  const { hasMultiPosterIntent } = require('../src/ticket-parser');
+
+  // Singular or generic requests (should NOT be multi-poster)
+  assert.equal(hasMultiPosterIntent('Hi team / Nhờ team pop up poster / Thanks team'), false);
+  assert.equal(hasMultiPosterIntent('Nhờ team update website'), false);
+  assert.equal(hasMultiPosterIntent('Nhờ team pop poster đính kèm nha'), false);
+  assert.equal(hasMultiPosterIntent('Please upload this popup until 11.30.26'), false);
+  assert.equal(hasMultiPosterIntent('ID# 11194 - Website Support - [Popup]\nHi team, nhờ team popup EXP: 12/31/2026\nAttachments (2)'), false);
+  assert.equal(hasMultiPosterIntent('Team hỗ trợ gỡ popup cũ và pop poster mới đính kèm'), false);
+
+  // Explicit multi-poster / plural requests
+  assert.equal(hasMultiPosterIntent('Nhờ team pop up 2 poster đính kèm'), true);
+  assert.equal(hasMultiPosterIntent('Team hỗ trợ popup cả 2 ảnh giúp mình'), true);
+  assert.equal(hasMultiPosterIntent('Nhờ team pop 2 ảnh này lên web'), true);
+  assert.equal(hasMultiPosterIntent('Pop up cả hai hình'), true);
+  assert.equal(hasMultiPosterIntent('Please popup 2 posters'), true);
+  assert.equal(hasMultiPosterIntent('Popup poster 1 và poster 2'), true);
+  assert.equal(hasMultiPosterIntent('Please pop up both posters'), true);
+  assert.equal(hasMultiPosterIntent('Nhờ team pop up cả 2 giúp mình'), true);
+  assert.equal(hasMultiPosterIntent('Nhờ team treo 2 poster'), true);
+  assert.equal(hasMultiPosterIntent('Treo cả 2 poster lên web'), true);
+  assert.equal(hasMultiPosterIntent('Please add 2 separate popups'), true);
+});
+
+test('identifies replacement actions from direct replacement phrasing (update lai, thay, doi)', () => {
+  const { hasAffirmativePopupReplace } = require('../src/ticket-parser');
+
+  // Ticket 1594214 case: "Team update lại poster giúp tiệm nha."
+  assert.equal(hasAffirmativePopupReplace('Team update lại poster giúp tiệm nha.'), true);
+  assert.equal(parsed('ID#70 - Website Support\nTeam update lại poster giúp tiệm nha.', 1594214).popupAction, 'replace');
+
+  // Other common replacement phrasings:
+  assert.equal(hasAffirmativePopupReplace('Nhờ team cập nhật lại poster'), true);
+  assert.equal(hasAffirmativePopupReplace('Nhờ team đổi poster này thành poster đính kèm'), true);
+  assert.equal(hasAffirmativePopupReplace('Team thay poster giúp tiệm'), true);
+  assert.equal(hasAffirmativePopupReplace('Nhờ team thay thế poster cũ'), true);
+  assert.equal(hasAffirmativePopupReplace('Please replace the popup poster with the attached one'), true);
+  assert.equal(hasAffirmativePopupReplace('Gỡ popup cũ và add popup mới'), true);
+
+  // Pure create / add (should NOT be replace)
+  assert.equal(hasAffirmativePopupReplace('Hi team / Nhờ team pop up poster / Thanks team'), false);
+  assert.equal(hasAffirmativePopupReplace('Nhờ team đăng poster đính kèm'), false);
+  assert.equal(hasAffirmativePopupReplace('Nhờ team update website'), false);
+});

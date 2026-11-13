@@ -19,6 +19,7 @@ const {
   ticketData,
   isPopupRemovalAction,
   popupActionNeedsTicketImage,
+  hasMultiPosterIntent,
   resolveRemovalScopeFromAttachments,
   popupScheduleFromTicket
 } = require('./ticket-parser');
@@ -71,7 +72,8 @@ const {
 } = require('./cms/popup-order-policy');
 const {
   popupImageIdentity,
-  findDuplicatePopupImages
+  findDuplicatePopupImages,
+  findDuplicatePopupImagesWithVision
 } = require('./cms/popup-image-policy');
 
 function progress(stage, message, details = {}) {
@@ -2814,20 +2816,32 @@ async function main() {
               error.stage = 'attachment-selection';
               throw error;
             }
-            plan.ticket.popupAttachmentIndexes = visionResolution.selection.indices;
+            const multiIntent = hasMultiPosterIntent(body);
+            if (!multiIntent && textSelection && visionResolution.selection.indices.includes(textSelection)) {
+              progress('attachment-selection-refined', `Ticket chỉ yêu cầu 1 popup; ưu tiên poster #${textSelection} từ ngữ cảnh/comment`);
+              plan.ticket.popupAttachmentIndexes = [textSelection];
+            } else if (!multiIntent && visionResolution.selection.indices.length > 1) {
+              const latestIndex = Math.max(...visionResolution.selection.indices);
+              progress('attachment-selection-refined', `Ticket không yêu cầu nhiều popup; ưu tiên ảnh đính kèm mới nhất #${latestIndex}`);
+              plan.ticket.popupAttachmentIndexes = [latestIndex];
+            } else {
+              plan.ticket.popupAttachmentIndexes = visionResolution.selection.indices;
+            }
             plan.ticket.popupAttachmentSelection = 'gemini-vision-set';
-            visionPosterSchedules = visionResolution.selection.posterSchedules || [];
+            visionPosterSchedules = (visionResolution.selection.posterSchedules || [])
+              .filter((schedule) => plan.ticket.popupAttachmentIndexes.includes(schedule.attachmentIndex));
             plan.ticket.popupVisionSchedules = visionPosterSchedules;
             attachmentDecision = attachmentPlanForTicket({
               popupAction: plan.ticket.popupAction,
               attachmentCount: ticketContext.attachmentCandidates.length,
+              popupAttachmentIndex: plan.ticket.popupAttachmentIndexes.length === 1 ? plan.ticket.popupAttachmentIndexes[0] : null,
               popupAttachmentIndexes: plan.ticket.popupAttachmentIndexes
             });
             plan.attachmentPlan = attachmentDecision;
-            downloadedAttachments = visionResolution.selection.indices.map((candidateIndex) => (
+            downloadedAttachments = plan.ticket.popupAttachmentIndexes.map((candidateIndex) => (
               visionCandidateDownloads.find((candidate) => candidate.candidateIndex === candidateIndex) || null
             ));
-            if (downloadedAttachments.some((attachment) => !attachment) || downloadedAttachments.length !== visionResolution.selection.indices.length) {
+            if (downloadedAttachments.some((attachment) => !attachment) || downloadedAttachments.length !== plan.ticket.popupAttachmentIndexes.length) {
               const error = new Error('Gemini Vision selected a poster that was not present in the locally downloaded ticket images.');
               error.stage = 'attachment-selection';
               throw error;
@@ -3145,11 +3159,14 @@ async function main() {
                     expiredCount: legacyPopupSnapshot.expiredCount
                   };
                 }
-                const duplicates = findDuplicatePopupImages(downloadedAttachments, legacyPopupSnapshot.scannedItems);
+                const duplicates = await findDuplicatePopupImagesWithVision(page, downloadedAttachments, legacyPopupSnapshot.scannedItems);
                 if (duplicates.length) {
                   const duplicate = duplicates[0];
                   const ticketFilename = duplicate.ticket?.filename || `ticket image #${duplicate.ticketIndex + 1}`;
-                  const error = new Error(`Duplicate popup image: "${ticketFilename}" already exists in CMS. The image was not added and CMS Build was not started.`);
+                  const methodLabel = duplicate.method === 'visual-similarity'
+                    ? ` (hình ảnh giống ${Math.round((duplicate.similarity || 1) * 100)}% với popup hiện có trên CMS)`
+                    : '';
+                  const error = new Error(`Duplicate popup image: "${ticketFilename}" already exists in CMS${methodLabel}. The image was not added and CMS Build was not started.`);
                   error.stage = 'popup-image-duplicate';
                   error.duplicateImage = {
                     ticketFilename,
@@ -3387,6 +3404,7 @@ module.exports = {
   findTicketDate,
   isPopupRemovalAction,
   popupActionNeedsTicketImage,
+  hasMultiPosterIntent,
   resolveRemovalScopeFromAttachments,
   popupScheduleFromTicket,
   popupTicketEntriesFromDownloads,

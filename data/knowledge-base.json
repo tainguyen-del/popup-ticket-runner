@@ -70,5 +70,18 @@
       "expiry": null,
       "popupPosition": "first"
     }
+  },
+  {
+    "id": "case-comment-attachment-supersedes",
+    "title": "Ảnh đính kèm trong comment cập nhật/thay thế ảnh đính kèm ban đầu",
+    "ticketSample": "ID: 7372 - VENUS NAIL LOUNGE\nHi team\nNhờ team pop up poster\nThanks team\n[Comment] Hi team\nNhờ team pop up poster\nThanks team",
+    "explanation": "Khi ticket chỉ yêu cầu 'pop up poster' (số ít) nhưng có nhiều ảnh đính kèm và ảnh ở comment sau gửi lại poster đúng/mới hơn, tool chỉ chọn poster mới nhất trong comment (index 2), không pop cả 2 ảnh.",
+    "expected": {
+      "siteId": "7372",
+      "operation": "create",
+      "expiry": null,
+      "popupPosition": null,
+      "popupAttachmentIndex": 2
+    }
   }
 ]
