@@ -1,0 +1,16 @@
+# Dependencies
+node_modules/
+
+# Build artifacts & packages
+dist/
+*.exe
+
+# User session, credentials & runtime profiles
+*.state.json
+storage-state.json
+.user-data/
+*.log
+
+# OS metadata
+Thumbs.db
+.DS_Store

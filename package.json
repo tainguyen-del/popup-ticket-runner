@@ -1,0 +1,49 @@
+{
+  "name": "popup-ticket-runner",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Safe CRM-to-CMS popup workflow assistant",
+  "main": "electron/main.js",
+  "scripts": {
+    "ui": "node src/server.js",
+    "desktop": "electron .",
+    "dist": "electron-builder --win portable --x64",
+    "dist:portable": "electron-builder --win portable --x64",
+    "test": "node --test test/*.test.js"
+  },
+  "dependencies": {
+    "playwright": "^1.58.0"
+  },
+  "devDependencies": {
+    "electron": "^37.2.6",
+    "electron-builder": "^26.0.12"
+  },
+  "build": {
+    "appId": "dev.fastboy.popup-ticket-runner.app",
+    "productName": "Popup Ticket Runner",
+    "asar": false,
+    "files": [
+      "electron/**/*",
+      "src/**/*",
+      "public/**/*",
+      "package.json"
+    ],
+    "afterPack": "build/after-pack.js",
+    "win": {
+      "icon": "build/app-icon.ico",
+      "signAndEditExecutable": false,
+      "target": [
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        }
+      ]
+    },
+    "portable": {
+      "artifactName": "Popup Ticket Runner Final.${ext}",
+      "requestExecutionLevel": "user"
+    }
+  }
+}

@@ -1,0 +1,103 @@
+<!doctype html>
+<html lang="vi">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="description" content="Giao diện local để kiểm tra ticket popup Fastboy.">
+    <title>Popup Ticket Runner</title>
+    <link rel="icon" type="image/x-icon" href="/app-icon.ico">
+    <link rel="shortcut icon" href="/app-icon.ico">
+    <link rel="stylesheet" href="/styles.css">
+  </head>
+  <body>
+    <main class="shell">
+      <section class="hero">
+        <p class="eyebrow">FASTBOY · LOCAL WORKFLOW</p>
+        <h1>Popup Ticket Runner</h1>
+        <p class="intro">Dán link ticket để kiểm tra CRM, tìm đúng Website ID trong <strong>fastboy</strong>, và xem tool đã hoàn tất tới bước nào.</p>
+      </section>
+
+      <section id="login-card" class="card login-card" aria-labelledby="login-heading">
+        <div class="section-heading">
+          <div>
+            <p class="step-number">01</p>
+            <h2 id="login-heading">Đăng nhập CRM và CMS</h2>
+          </div>
+          <span id="session-badge" class="status-badge status-idle">Chưa đăng nhập</span>
+        </div>
+          <p class="login-copy">Khi mở tool, đăng nhập một lần trong cửa sổ Chrome riêng với hai tab Fastboy CRM và NewZenSite. Mọi ticket tiếp theo dùng lại phiên đó. Khi chạy ticket, cửa sổ riêng sẽ hiện thao tác CRM/CMS để bạn theo dõi; app không dùng hoặc thay đổi các tab Chrome đang mở sẵn.</p>
+        <div class="login-actions">
+          <button id="login-open" type="button">Mở Chrome để đăng nhập</button>
+          <button id="login-check" type="button" class="secondary-button" disabled>Tôi đã đăng nhập — Kiểm tra</button>
+        </div>
+        <p id="login-message" class="form-message" role="status"></p>
+      </section>
+
+      <section id="gemini-card" class="card gemini-card" aria-labelledby="gemini-heading">
+        <div class="section-heading">
+          <div>
+            <p class="step-number">02</p>
+            <h2 id="gemini-heading">Gemini cho ticket và poster</h2>
+          </div>
+          <span id="gemini-badge" class="status-badge status-idle">Đang kiểm tra</span>
+        </div>
+        <p class="gemini-copy">Nhập Gemini API key một lần trên mỗi máy. Bản portable mã hóa key bằng kho bảo mật Windows và chỉ dùng trong bộ nhớ khi đọc ticket; key không xuất hiện trong log hay báo cáo.</p>
+        <form id="gemini-form" novalidate>
+          <label for="gemini-key">Gemini API key</label>
+          <div class="input-row">
+            <input id="gemini-key" name="apiKey" type="password" autocomplete="new-password" spellcheck="false" placeholder="Dán API key để cấu hình máy này">
+            <button id="gemini-save" type="submit">Lưu mã hóa</button>
+          </div>
+          <p id="gemini-message" class="form-message" role="status"></p>
+        </form>
+      </section>
+
+      <section id="ticket-card" class="card form-card" aria-labelledby="ticket-heading" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="step-number">03</p>
+            <h2 id="ticket-heading">Link ticket CRM</h2>
+          </div>
+          <span class="local-badge">Chạy trên máy này</span>
+        </div>
+        <form id="ticket-form" novalidate>
+          <label for="ticket-url">Ví dụ: https://crm.fastboy.dev/tickets/detail/1579195</label>
+          <div class="input-row">
+            <input id="ticket-url" name="ticketUrl" type="url" inputmode="url" autocomplete="off" placeholder="Dán link ticket Fastboy" required>
+            <button id="run-button" type="submit">Tạo popup &amp; Build <span aria-hidden="true">→</span></button>
+          </div>
+          <p id="form-message" class="form-message" role="alert"></p>
+        </form>
+        <p class="safety-note">Mỗi lần bấm chạy sẽ tải poster về máy, cập nhật CMS, lưu popup và Build/publish website khi các kiểm tra an toàn thành công.</p>
+      </section>
+
+      <section class="card status-card" aria-live="polite" aria-labelledby="progress-heading">
+        <div class="section-heading">
+          <div>
+            <p class="step-number">04</p>
+            <h2 id="progress-heading">Tiến độ xử lý</h2>
+          </div>
+          <span id="status-badge" class="status-badge status-idle">Đang chờ</span>
+        </div>
+        <ol id="timeline" class="timeline"></ol>
+        <div id="result-panel" class="result-panel" hidden>
+          <p class="result-kicker">BÁO CÁO CUỐI</p>
+          <h3 id="result-heading"></h3>
+          <p id="result-summary" class="result-summary"></p>
+          <dl id="result-list" class="result-list"></dl>
+          <p id="next-action" class="next-action"></p>
+        </div>
+      </section>
+
+      <footer class="brand-footer">
+        <img
+          src="/fastboy-team-footer.png"
+          alt="Developed by website Team Fastboy marketing"
+          loading="lazy"
+          decoding="async"
+        >
+      </footer>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
