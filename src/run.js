@@ -790,14 +790,20 @@ async function openPopupSection(page, sectionId = null) {
 
 async function openPopupSettings(page, sectionId = null) {
   await openPopupSection(page, sectionId);
-  const isAddBlockVisible = async () => page.getByRole('button', { name: 'Add block', exact: true }).isVisible().catch(() => false);
+  const isAddBlockVisible = async () => page.locator('button:has-text("Add block")').isVisible().catch(() => false);
   if (await isAddBlockVisible()) return;
 
-  const popupSetting = await visibleMatch(page.getByText('Popup_setting', { exact: true }), 'Popup setting control');
+  const popupSetting = await visibleMatch(page.getByText('Popup_setting', { exact: true }), null)
+    || await visibleMatch(page.getByText(/Popup[\s_]setting/i), 'Popup setting control');
   await popupSetting.click();
 
   const appeared = await waitForVisibleMatch(
-    page.getByRole('button', { name: 'Add block', exact: true }),
+    page.getByRole('button', { name: /Add\s*block/i }),
+    null,
+    true,
+    4000
+  ).catch(() => null) || await waitForVisibleMatch(
+    page.locator('button:has-text("Add block")'),
     null,
     true,
     4000
@@ -808,7 +814,7 @@ async function openPopupSettings(page, sectionId = null) {
     // retry clicking Popup_setting once to re-open the panel.
     await popupSetting.click().catch(() => {});
     await waitForVisibleMatch(
-      page.getByRole('button', { name: 'Add block', exact: true }),
+      page.locator('button:has-text("Add block")'),
       'Popup Add block control',
       true,
       8000
@@ -1438,6 +1444,7 @@ async function removeSingleExistingPopup(page) {
   const confirm = await visibleMatch(page.getByRole('button', { name: 'Confirm', exact: true }), 'Popup delete Confirm control', true);
   await confirm.click();
   await waitForPopupListItemCount(page, 0);
+  await page.waitForTimeout(600);
   return { removed: true, previous };
 }
 
@@ -1659,11 +1666,21 @@ async function openPopupListItem(page, { forceNewBlock = false } = {}) {
   let target = planPopupItemTarget(before.items, { forceNewBlock });
   let items = before.items;
   if (target.addBlock) {
-    const panel = await popupListItemsPanel(page);
-    const addBlock = await visibleMatch(
-      panel.getByRole('button', { name: 'Add block', exact: true }),
+    const panel = await waitForPopupListItemsPanel(page, 6000).catch(() => null);
+    const addBlockLocator = panel
+      ? panel.getByRole('button', { name: /Add\s*block/i })
+      : page.getByRole('button', { name: /Add\s*block/i });
+
+    const addBlock = await waitForVisibleMatch(
+      addBlockLocator,
+      null,
+      true,
+      6000
+    ).catch(() => null) || await waitForVisibleMatch(
+      page.locator('button:has-text("Add block")'),
       'Popup Add block control',
-      true
+      true,
+      8000
     );
     await addBlock.click();
     // CMS sometimes auto-opens the last card, and sometimes leaves the
