@@ -1,0 +1,22 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "🚀 Push to GitHub (Tự động build Release)",
+      "type": "shell",
+      "command": "git add . && git commit -m \"Update code\" && git push origin main",
+      "group": {
+        "kind": "build",
+        "isDefault": true
+      },
+      "problemMatcher": []
+    },
+    {
+      "label": "👀 Bật chế độ Tự Động Push khi Lưu (Auto-Push Watcher)",
+      "type": "shell",
+      "command": "node scripts/watch-push.js",
+      "isBackground": true,
+      "problemMatcher": []
+    }
+  ]
+}

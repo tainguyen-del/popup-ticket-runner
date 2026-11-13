@@ -9,14 +9,16 @@
     "desktop": "electron .",
     "dist": "electron-builder --win portable --x64",
     "dist:portable": "electron-builder --win portable --x64",
-    "test": "node --test test/*.test.js"
+    "test": "node --test test/*.test.js",
+    "watch:push": "node scripts/watch-push.js"
   },
   "dependencies": {
     "playwright": "^1.58.0"
   },
   "devDependencies": {
     "electron": "^37.2.6",
-    "electron-builder": "^26.0.12"
+    "electron-builder": "^26.0.12",
+    "resedit": "^1.7.2"
   },
   "build": {
     "appId": "dev.fastboy.popup-ticket-runner.app",
