@@ -40,3 +40,19 @@ test('opens the two-tab login flow even after a session is already ready', async
   assert.equal(session.state, 'awaiting-login');
   assert.equal(session.ready, false);
 });
+
+test('exposes CMS credential status without returning account secrets', async () => {
+  const info = await startServer({ port: 0, host: '127.0.0.1', restoreSession: false });
+  try {
+    const response = await fetch(`http://${info.host}:${info.port}/api/cms-account`);
+    assert.equal(response.status, 200);
+    const status = await response.json();
+    assert.equal(typeof status.configured, 'boolean');
+    assert.equal(typeof status.canSave, 'boolean');
+    assert.equal(typeof status.identifier === 'string' || status.identifier === null, true);
+    assert.equal(Object.hasOwn(status, 'password'), false);
+    assert.equal(typeof status.hasPassword, 'boolean');
+  } finally {
+    await stopServer({ closeSession: false });
+  }
+});

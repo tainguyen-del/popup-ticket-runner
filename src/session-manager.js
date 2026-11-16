@@ -10,6 +10,7 @@ const {
   focusLoginBrowser,
   closeToolBrowser
 } = require('./browser-session');
+const { getCmsCredentials } = require('./cms/credential-store');
 
 const CRM_CHECK_URL = 'https://crm.fastboy.dev/tickets/views/technical';
 const CMS_CHECK_URL = 'https://apps.newzensite.com/organizations';
@@ -160,7 +161,11 @@ class SessionManager {
       void Promise.allSettled([
         this.crmPage.goto(CRM_CHECK_URL, { waitUntil: 'domcontentloaded', timeout: 45000 }),
         this.cmsPage.goto(CMS_CHECK_URL, { waitUntil: 'domcontentloaded', timeout: 45000 })
-      ]).then(() => this.revealLoginWindow());
+      ]).then(async () => {
+        const didAutoLoginCms = await this.autoLoginCmsIfConfigured();
+        if (didAutoLoginCms) this.cmsReady = await cmsAuthenticated(this.cmsPage);
+        await this.revealLoginWindow();
+      });
       void this.revealLoginWindow();
       return this.snapshot();
     } catch (error) {
@@ -191,6 +196,112 @@ class SessionManager {
     }).catch(() => false);
   }
 
+  async autoLoginCmsIfConfigured() {
+    if (!this.context || !this.cmsPage) return false;
+
+    let credentials;
+    try {
+      credentials = getCmsCredentials(this.root);
+    } catch {
+      this.error = 'Không thể đọc credential CMS đã lưu. Hãy cấu hình lại bằng lệnh node .\\src\\cms\\configure-login.js.';
+      return false;
+    }
+    if (!credentials) return false;
+
+    let stage = 'opening-cms-login';
+    try {
+      await this.cmsPage.goto('https://apps.newzensite.com/login', {
+        waitUntil: 'domcontentloaded',
+        timeout: 45000
+      });
+
+      stage = 'fetching-csrf';
+      const csrfResult = await this.cmsPage.evaluate(async () => {
+        const response = await fetch('/api/auth/csrf', { credentials: 'include' });
+        const payload = await response.json().catch(() => ({}));
+        return {
+          ok: response.ok,
+          csrfToken: payload?.csrfToken || null
+        };
+      });
+
+      if (!csrfResult.ok || !csrfResult.csrfToken) {
+        this.error = 'Không lấy được CSRF token từ NewZenSite; đăng nhập CMS tự động đã dừng.';
+        return false;
+      }
+
+      stage = 'submitting-cms-credentials';
+      const loginResult = await this.cmsPage.evaluate(async ({ emailValue, passwordValue, csrfToken }) => {
+        const formBody = new URLSearchParams({
+          attribute: emailValue,
+          password: passwordValue,
+          redirect: 'false',
+          csrfToken,
+          callbackUrl: 'https://apps.newzensite.com/login',
+          json: 'true'
+        }).toString();
+
+        const response = await fetch('/api/auth/callback/credentials', {
+          method: 'POST',
+          credentials: 'include',
+          headers: {
+            'Content-Type': 'application/x-www-form-urlencoded',
+            Accept: 'application/json'
+          },
+          body: formBody
+        });
+
+        const rawText = await response.text();
+        let payload = null;
+        try {
+          payload = rawText ? JSON.parse(rawText) : null;
+        } catch {
+          payload = rawText;
+        }
+
+        return {
+          ok: response.ok,
+          status: response.status,
+          location: response.headers.get('location') || '',
+          payload
+        };
+      }, {
+        emailValue: credentials.email,
+        passwordValue: credentials.password,
+        csrfToken: csrfResult.csrfToken
+      });
+
+      const loginFailureText = `${loginResult.location || ''} ${JSON.stringify(loginResult.payload || '')}`;
+      if (!loginResult.ok || /CredentialsSignin|error=|invalid/i.test(loginFailureText)) {
+        this.error = `NewZenSite từ chối đăng nhập tự động (HTTP ${loginResult.status}). Kiểm tra credential hoặc tiếp tục đăng nhập thủ công.`;
+        return false;
+      }
+
+      stage = 'verifying-cms-session';
+      const sessionResult = await this.cmsPage.evaluate(async () => {
+        const response = await fetch('/api/auth/session', { credentials: 'include' });
+        const payload = await response.json().catch(() => null);
+        return {
+          ok: response.ok,
+          payload
+        };
+      });
+
+      if (!sessionResult.ok || !sessionResult.payload || !sessionResult.payload.user) {
+        this.error = 'NewZenSite chưa tạo session sau khi gửi thông tin đăng nhập; hãy tiếp tục đăng nhập thủ công.';
+        return false;
+      }
+
+      stage = 'saving-cms-session';
+      await persistStoredSession(this.context, this.root);
+      persistActiveLoginProfile(this.root, this.loginProfileDirectory);
+      return true;
+    } catch (error) {
+      this.error = `Tự động đăng nhập CMS thất bại ở bước ${stage}: ${error?.message || 'lỗi không xác định'}`;
+      return false;
+    }
+  }
+
   async verifyLogin() {
     // A visible login context takes precedence over an older headless restore
     // probe. Otherwise the operator can sign in and press Check yet receive
@@ -207,6 +318,14 @@ class SessionManager {
       crmAuthenticated(this.crmPage),
       cmsAuthenticated(this.cmsPage)
     ]);
+
+    if (!this.cmsReady) {
+      const didAutoLoginCms = await this.autoLoginCmsIfConfigured();
+      if (didAutoLoginCms) {
+        this.cmsReady = await cmsAuthenticated(this.cmsPage);
+      }
+    }
+
     if (this.crmReady && this.cmsReady) {
       try {
         await persistStoredSession(this.context, this.root);

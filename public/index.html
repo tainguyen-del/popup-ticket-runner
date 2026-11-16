@@ -17,6 +17,12 @@
         <p class="intro">Dán link ticket để kiểm tra CRM, tìm đúng Website ID trong <strong>fastboy</strong>, và xem tool đã hoàn tất tới bước nào.</p>
       </section>
 
+      <nav class="app-tabs" role="tablist" aria-label="Các khu vực ứng dụng">
+        <button id="runner-tab" class="app-tab is-active" type="button" role="tab" aria-selected="true" aria-controls="runner-view">Popup Runner</button>
+        <button id="cms-account-tab" class="app-tab" type="button" role="tab" aria-selected="false" aria-controls="cms-account-view">Tài khoản CMS</button>
+      </nav>
+
+      <div id="runner-view" data-app-view="runner" role="tabpanel" aria-labelledby="runner-tab">
       <section id="login-card" class="card login-card" aria-labelledby="login-heading">
         <div class="section-heading">
           <div>
@@ -87,6 +93,45 @@
           <dl id="result-list" class="result-list"></dl>
           <p id="next-action" class="next-action"></p>
         </div>
+      </section>
+      </div>
+
+      <section id="cms-account-view" class="card cms-account-card" data-app-view="cms-account" role="tabpanel" aria-labelledby="cms-account-tab" hidden>
+        <div class="section-heading">
+          <div>
+            <p class="step-number">01</p>
+            <h2 id="cms-account-heading">Tài khoản NewZenSite CMS</h2>
+          </div>
+          <span id="cms-account-badge" class="status-badge status-idle">Đang kiểm tra</span>
+        </div>
+        <p class="account-copy">Tài khoản được lưu mã hóa theo Windows user hiện tại. Mật khẩu luôn được che trên giao diện; bấm Sửa để thay tài khoản hoặc cập nhật mật khẩu. CRM vẫn đăng nhập riêng.</p>
+        <div id="cms-account-summary" class="account-summary" hidden>
+          <dl class="account-details">
+            <div>
+              <dt>Tài khoản đang lưu</dt>
+              <dd id="cms-account-current-identifier"></dd>
+            </div>
+            <div>
+              <dt>Mật khẩu</dt>
+              <dd id="cms-account-current-password" aria-label="Mật khẩu đã lưu, được che">••••••••</dd>
+            </div>
+          </dl>
+          <div class="account-actions">
+            <button id="cms-account-edit" type="button">Sửa</button>
+            <button id="cms-account-delete" class="danger-button" type="button">Xóa tài khoản đã lưu</button>
+          </div>
+        </div>
+        <form id="cms-account-form" novalidate hidden>
+          <label for="cms-account-identifier">Email hoặc tài khoản CMS</label>
+          <input id="cms-account-identifier" name="identifier" type="text" autocomplete="username" maxlength="254" placeholder="Nhập email hoặc username">
+          <label for="cms-account-password">Mật khẩu CMS <span id="cms-account-password-optional"></span></label>
+          <input id="cms-account-password" name="password" type="password" autocomplete="new-password" maxlength="1024" placeholder="Nhập mật khẩu">
+          <div class="account-actions">
+            <button id="cms-account-save" type="submit">Lưu mã hóa</button>
+            <button id="cms-account-cancel" class="secondary-button" type="button" hidden>Hủy</button>
+          </div>
+          <p id="cms-account-message" class="form-message" role="status"></p>
+        </form>
       </section>
 
       <footer class="brand-footer">

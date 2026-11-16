@@ -8,6 +8,12 @@ const { spawn } = require('node:child_process');
 const { SessionManager } = require('./session-manager');
 const { appDataDirectory, runDirectoryRoots } = require('./app-paths');
 const { GeminiKeyStore } = require('./gemini-key-store');
+const {
+  clearStoredCredentials,
+  cmsCredentialStatus,
+  getCmsCredentials,
+  saveStoredCredentials
+} = require('./cms/credential-store');
 
 const ROOT = path.resolve(__dirname, '..');
 const PUBLIC = path.join(ROOT, 'public');
@@ -22,6 +28,19 @@ let geminiKeyStore = new GeminiKeyStore({ dataDirectory: appDataDirectory(ROOT) 
 function json(response, status, value) {
   response.writeHead(status, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
   response.end(JSON.stringify(value));
+}
+
+function isLocalRequestOrigin(request) {
+  const origin = request.headers.origin;
+  if (!origin) return true;
+  try {
+    const parsed = new URL(origin);
+    return parsed.protocol === 'http:'
+      && ['127.0.0.1', 'localhost'].includes(parsed.hostname)
+      && parsed.host === request.headers.host;
+  } catch {
+    return false;
+  }
 }
 
 function publicJob(job) {
@@ -390,6 +409,40 @@ const server = http.createServer(async (request, response) => {
     } catch (error) {
       const status = ['gemini-key-invalid', 'gemini-secure-storage-unavailable'].includes(error?.code) ? 422 : 400;
       return json(response, status, { error: error?.message || 'Không thể lưu Gemini API key.' });
+    }
+  }
+  if (url.pathname === '/api/cms-account' && !isLocalRequestOrigin(request)) {
+    return json(response, 403, { error: 'Forbidden' });
+  }
+  if (request.method === 'GET' && url.pathname === '/api/cms-account') {
+    try {
+      return json(response, 200, cmsCredentialStatus(ROOT));
+    } catch (error) {
+      return json(response, 500, { error: error?.message || 'Không thể đọc trạng thái tài khoản CMS.' });
+    }
+  }
+  if (request.method === 'POST' && url.pathname === '/api/cms-account') {
+    if (activeJobId) return json(response, 409, { error: 'Một ticket đang chạy. Hãy chờ hoàn tất trước khi đổi tài khoản CMS.' });
+    try {
+      const payload = JSON.parse(await readBody(request));
+      const currentCredentials = getCmsCredentials(ROOT);
+      saveStoredCredentials(ROOT, {
+        email: payload.identifier,
+        password: payload.password || currentCredentials?.password
+      });
+      return json(response, 200, cmsCredentialStatus(ROOT));
+    } catch (error) {
+      const status = ['cms-credential-invalid', 'cms-credential-platform'].includes(error?.code) ? 422 : 400;
+      return json(response, status, { error: error?.message || 'Không thể lưu tài khoản CMS.' });
+    }
+  }
+  if (request.method === 'DELETE' && url.pathname === '/api/cms-account') {
+    if (activeJobId) return json(response, 409, { error: 'Một ticket đang chạy. Hãy chờ hoàn tất trước khi đổi tài khoản CMS.' });
+    try {
+      clearStoredCredentials(ROOT);
+      return json(response, 200, cmsCredentialStatus(ROOT));
+    } catch {
+      return json(response, 500, { error: 'Không thể xóa tài khoản CMS đã lưu.' });
     }
   }
   if (request.method === 'GET' && url.pathname === '/api/session') return json(response, 200, sessionManager.snapshot());
