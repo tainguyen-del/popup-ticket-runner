@@ -6,7 +6,9 @@ Chạy trực tiếp `Popup Ticket Runner Final.exe`; không cần cài đặt, 
 
 Ở lần dùng đầu tiên trên mỗi máy, nhập Gemini API key trong thẻ **Gemini cho ticket và poster**. Bản portable mã hóa key bằng kho bảo mật Windows, chỉ lưu bản mã hóa trong AppData của người dùng và không đưa key vào log hoặc báo cáo. Không chia sẻ thư mục AppData hay Chrome profile; chỉ gửi file portable.
 
-Lần đầu, app mở Chrome riêng để đăng nhập CRM và NewZenSite. Những lần sau app tự khôi phục phiên đã lưu; chỉ yêu cầu đăng nhập lại khi CRM hoặc CMS hết phiên. Dán link ticket vào app để chạy workflow.
+Lần đầu, app mở Chrome riêng để xác thực CRM; CMS sẽ tự đăng nhập nếu đã cấu hình credential. Những lần sau app tự khôi phục phiên đã lưu và chỉ yêu cầu đăng nhập lại khi CRM hoặc CMS hết phiên. Dán link ticket vào app để chạy workflow.
+
+Mở tab **Tài khoản CMS** trong app để lưu, thay đổi hoặc xóa credential NewZenSite. Mật khẩu được mã hóa bằng Windows DPAPI trong AppData của Windows user hiện tại, không ghi vào source hoặc log. Credential không chuyển giữa các Windows user/máy; mỗi user cấu hình riêng một lần.
 
 Tool chỉ đọc **ngày** bắt đầu/kết thúc popup. Nó nhận các dạng ghi phổ biến như `từ ... đến ...`, `from ... through ...`, `start/end`, `expiry/remove`; một khoảng qua năm mới như `11/19/2026 → 01/02/2026` được hiểu là kết thúc `2027-01-02`. Nếu lịch mâu thuẫn, app dừng trước khi sửa CMS.
 

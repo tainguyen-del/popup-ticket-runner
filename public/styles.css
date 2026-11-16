@@ -33,6 +33,28 @@ body {
     margin: 0 0 32px;
 }
 
+.app-tabs {
+    display: flex;
+    gap: 8px;
+    padding: 6px;
+    margin-bottom: 18px;
+    border: 1px solid rgba(255, 255, 255, .9);
+    border-radius: 16px;
+    background: rgba(255, 255, 255, .7);
+}
+
+.app-tab {
+    min-height: 44px;
+    padding: 0 18px;
+    color: var(--muted);
+    background: transparent;
+}
+
+.app-tab.is-active {
+    color: #fff;
+    background: var(--blue);
+}
+
 .eyebrow,
 .step-number {
     margin: 0 0 9px;
@@ -203,6 +225,79 @@ button:disabled {
     margin: 0 0 17px;
     color: var(--muted);
     line-height: 1.55;
+}
+
+.account-copy {
+    max-width: 740px;
+    margin: 0 0 22px;
+    color: var(--muted);
+    line-height: 1.55;
+}
+
+.account-summary {
+    display: grid;
+    gap: 18px;
+}
+
+.account-details {
+    display: grid;
+    gap: 12px;
+    margin: 0;
+}
+
+.account-details > div {
+    display: grid;
+    grid-template-columns: minmax(150px, 210px) minmax(0, 1fr);
+    gap: 14px;
+    padding: 14px 16px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: #f8fbfc;
+}
+
+.account-details dt {
+    color: var(--muted);
+    font-size: .86rem;
+}
+
+.account-details dd {
+    min-width: 0;
+    margin: 0;
+    overflow-wrap: anywhere;
+    font-weight: 700;
+}
+
+.account-details dd[aria-label] {
+    letter-spacing: .16em;
+}
+
+.cms-account-card form {
+    display: grid;
+    gap: 10px;
+}
+
+.cms-account-card label {
+    margin: 4px 0 0;
+}
+
+.cms-account-card input[type="password"] {
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+}
+
+.account-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 10px;
+    margin-top: 8px;
+}
+
+.account-actions button {
+    min-height: 46px;
+}
+
+.danger-button {
+    color: #92243c;
+    background: #ffe5ea;
 }
 
 .gemini-card input[type="password"] {
@@ -468,6 +563,16 @@ button:disabled {
 
     .input-row {
         flex-direction: column;
+    }
+
+    .app-tab {
+        flex: 1;
+        padding: 0 10px;
+    }
+
+    .account-details > div {
+        grid-template-columns: 1fr;
+        gap: 6px;
     }
 
     .login-actions {

@@ -11,6 +11,20 @@ const geminiInput = document.querySelector('#gemini-key');
 const geminiSave = document.querySelector('#gemini-save');
 const geminiMessage = document.querySelector('#gemini-message');
 const geminiBadge = document.querySelector('#gemini-badge');
+const runnerTab = document.querySelector('#runner-tab');
+const cmsAccountTab = document.querySelector('#cms-account-tab');
+const cmsAccountForm = document.querySelector('#cms-account-form');
+const cmsAccountIdentifier = document.querySelector('#cms-account-identifier');
+const cmsAccountPassword = document.querySelector('#cms-account-password');
+const cmsAccountSave = document.querySelector('#cms-account-save');
+const cmsAccountDelete = document.querySelector('#cms-account-delete');
+const cmsAccountEdit = document.querySelector('#cms-account-edit');
+const cmsAccountCancel = document.querySelector('#cms-account-cancel');
+const cmsAccountBadge = document.querySelector('#cms-account-badge');
+const cmsAccountMessage = document.querySelector('#cms-account-message');
+const cmsAccountSummary = document.querySelector('#cms-account-summary');
+const cmsAccountCurrentIdentifier = document.querySelector('#cms-account-current-identifier');
+const cmsAccountPasswordOptional = document.querySelector('#cms-account-password-optional');
 const message = document.querySelector('#form-message');
 const timeline = document.querySelector('#timeline');
 const badge = document.querySelector('#status-badge');
@@ -22,6 +36,8 @@ const resultSummary = document.querySelector('#result-summary');
 const storedJobKey = 'popup-ticket-runner:last-job';
 let sessionState = null;
 let geminiState = null;
+let cmsAccountState = null;
+let cmsAccountEditing = false;
 let sessionRefreshTimer = null;
 // A fresh local launch should immediately show the two isolated login tabs.
 // Keep the one-shot marker in the browser tab so a refresh never opens an
@@ -101,6 +117,136 @@ function updateTicketGate() {
 function setGeminiMessage(text = '', isError = false) {
   geminiMessage.textContent = text;
   geminiMessage.className = `form-message${isError ? ' is-error' : ''}`;
+}
+
+function setCmsAccountMessage(text = '', isError = false) {
+  cmsAccountMessage.textContent = text;
+  cmsAccountMessage.className = `form-message${isError ? ' is-error' : ''}`;
+}
+
+function showAppView(view) {
+  document.querySelectorAll('[data-app-view]').forEach((panelElement) => {
+    panelElement.hidden = panelElement.dataset.appView !== view;
+  });
+  const isRunner = view === 'runner';
+  runnerTab.classList.toggle('is-active', isRunner);
+  cmsAccountTab.classList.toggle('is-active', !isRunner);
+  runnerTab.setAttribute('aria-selected', String(isRunner));
+  cmsAccountTab.setAttribute('aria-selected', String(!isRunner));
+  if (!isRunner) refreshCmsAccount();
+}
+
+async function requestCmsAccount(options = {}) {
+  const response = await fetch('/api/cms-account', { cache: 'no-store', ...options });
+  const data = await response.json().catch(() => null);
+  if (!data) throw new Error('Không đọc được trạng thái tài khoản CMS.');
+  if (!response.ok) throw new Error(data.error || 'Không thể cập nhật tài khoản CMS.');
+  return data;
+}
+
+function renderCmsAccount(status) {
+  cmsAccountState = status || null;
+  const configured = Boolean(status?.configured);
+  const canSave = Boolean(status?.canSave);
+  cmsAccountBadge.textContent = configured ? 'Đã lưu' : 'Chưa cấu hình';
+  cmsAccountBadge.className = `status-badge status-${configured ? 'success' : 'warning'}`;
+  cmsAccountIdentifier.disabled = !canSave;
+  cmsAccountPassword.disabled = !canSave;
+  cmsAccountSave.disabled = !canSave;
+  cmsAccountDelete.hidden = status?.source === 'environment';
+  cmsAccountDelete.disabled = !canSave;
+  cmsAccountSave.textContent = configured ? 'Lưu thay đổi' : 'Lưu mã hóa';
+  cmsAccountSummary.hidden = !configured || cmsAccountEditing;
+  cmsAccountCurrentIdentifier.textContent = status?.identifier || '(không có tài khoản)';
+  cmsAccountPasswordOptional.textContent = configured ? '(để trống nếu giữ mật khẩu hiện tại)' : '';
+  cmsAccountPassword.placeholder = configured ? 'Để trống để giữ mật khẩu hiện tại' : 'Nhập mật khẩu';
+  cmsAccountForm.hidden = configured && !cmsAccountEditing;
+  cmsAccountCancel.hidden = !configured;
+  cmsAccountEdit.hidden = !configured || !canSave;
+  if (configured && !cmsAccountEditing) {
+    cmsAccountIdentifier.value = status?.identifier || '';
+    cmsAccountPassword.value = '';
+  }
+  if (status?.source === 'environment') {
+    setCmsAccountMessage('Đang dùng credential từ biến môi trường. Bạn vẫn có thể lưu tài khoản khác tại đây; tài khoản đã lưu sẽ được ưu tiên.');
+  } else if (configured) {
+    setCmsAccountMessage(cmsAccountEditing
+      ? 'Nhập tài khoản mới. Để trống mật khẩu nếu muốn giữ mật khẩu hiện tại.'
+      : 'Tài khoản đã được mã hóa cho Windows user hiện tại; mật khẩu chỉ hiển thị dưới dạng che.');
+  } else if (!canSave) {
+    setCmsAccountMessage('Lưu tài khoản CMS bằng giao diện chỉ được hỗ trợ trên Windows.', true);
+  } else {
+    cmsAccountForm.hidden = false;
+    setCmsAccountMessage('Nhập tài khoản và mật khẩu CMS để lưu mã hóa trên máy này.');
+  }
+}
+
+async function refreshCmsAccount() {
+  try {
+    renderCmsAccount(await requestCmsAccount());
+  } catch (error) {
+    cmsAccountBadge.textContent = 'Lỗi kết nối';
+    cmsAccountBadge.className = 'status-badge status-error';
+    setCmsAccountMessage(error.message, true);
+  }
+}
+
+async function saveCmsAccount() {
+  const identifier = cmsAccountIdentifier.value.trim();
+  const password = cmsAccountPassword.value;
+  if (!identifier || (!password && !cmsAccountState?.configured)) {
+    setCmsAccountMessage('Hãy nhập tài khoản CMS và mật khẩu khi cấu hình lần đầu.', true);
+    return;
+  }
+  cmsAccountSave.disabled = true;
+  cmsAccountCancel.disabled = true;
+  setCmsAccountMessage('Đang mã hóa và lưu credential trên máy này…');
+  try {
+    const status = await requestCmsAccount({
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ identifier, password })
+    });
+    cmsAccountIdentifier.value = '';
+    cmsAccountPassword.value = '';
+    cmsAccountEditing = false;
+    renderCmsAccount(status);
+  } catch (error) {
+    setCmsAccountMessage(error.message, true);
+    cmsAccountSave.disabled = false;
+    cmsAccountCancel.disabled = false;
+  }
+}
+
+function editCmsAccount() {
+  cmsAccountEditing = true;
+  cmsAccountIdentifier.value = cmsAccountState?.identifier || '';
+  cmsAccountPassword.value = '';
+  renderCmsAccount(cmsAccountState);
+  cmsAccountIdentifier.focus();
+}
+
+function cancelCmsAccountEdit() {
+  cmsAccountEditing = false;
+  cmsAccountIdentifier.value = '';
+  cmsAccountPassword.value = '';
+  renderCmsAccount(cmsAccountState);
+}
+
+async function deleteCmsAccount() {
+  if (!window.confirm('Xóa credential CMS đã mã hóa khỏi máy này?')) return;
+  cmsAccountDelete.disabled = true;
+  cmsAccountSave.disabled = true;
+  try {
+    renderCmsAccount(await requestCmsAccount({ method: 'DELETE' }));
+    cmsAccountIdentifier.value = '';
+    cmsAccountPassword.value = '';
+    cmsAccountEditing = false;
+  } catch (error) {
+    setCmsAccountMessage(error.message, true);
+    cmsAccountDelete.disabled = false;
+    cmsAccountSave.disabled = false;
+  }
 }
 
 function renderGemini(status) {
@@ -186,6 +332,13 @@ function renderSession(session) {
   const waiting = session?.state === 'awaiting-login';
   const restoring = session?.state === 'checking-login' && !session?.loginWindowOpen;
   const blocksLoginOpen = busy && !restoring;
+  const cmsAutoLoggedIn = Boolean(session?.cms?.ready);
+  const crmLoggedIn = Boolean(session?.crm?.ready);
+  const loginInstructions = cmsAutoLoggedIn && !crmLoggedIn
+    ? 'CMS đã tự đăng nhập thành công. Hãy đăng nhập CRM trong tab Fastboy CRM, rồi quay lại bấm “Tôi đã đăng nhập — Kiểm tra”.'
+    : crmLoggedIn && !cmsAutoLoggedIn
+      ? 'CRM đã đăng nhập. CMS chưa xác thực được; kiểm tra credential CMS đã lưu hoặc đăng nhập thủ công trong tab NewZenSite, rồi bấm kiểm tra.'
+      : 'Trong Chrome riêng, đăng nhập CRM nếu cần. CMS sẽ tự đăng nhập nếu credential đã được cấu hình; sau đó quay lại bấm “Tôi đã đăng nhập — Kiểm tra”.';
   sessionBadge.textContent = busy ? 'Đang kiểm tra' : (waiting ? 'Chờ đăng nhập' : 'Cần đăng nhập');
   sessionBadge.className = `status-badge status-${busy ? 'running' : (waiting ? 'warning' : 'idle')}`;
   loginOpen.textContent = waiting
@@ -200,9 +353,9 @@ function renderSession(session) {
       ? 'Đang khôi phục phiên đăng nhập CRM và CMS đã lưu…'
       : waiting
       ? (session?.loginWindowOpen
-        ? 'Cửa sổ Chrome riêng với 2 tab CRM và CMS vẫn đang mở. Đăng nhập trong cả hai tab một lần, rồi quay lại bấm “Tôi đã đăng nhập — Kiểm tra”.'
-        : 'Cửa sổ đăng nhập trước đã đóng. Bấm “Mở lại 2 tab đăng nhập” để tool khôi phục lại trang Technical của CRM và CMS.')
-      : 'Bạn cần đăng nhập CRM và CMS trước khi app được phép đọc ticket hoặc Website ID.'),
+        ? `Cửa sổ Chrome riêng với 2 tab CRM và CMS vẫn đang mở. ${loginInstructions}`
+        : `${cmsAutoLoggedIn ? 'CMS đã đăng nhập tự động. ' : ''}Cửa sổ Chrome đã đóng. Bấm “Mở lại 2 tab đăng nhập” để tiếp tục${crmLoggedIn ? '.' : ' đăng nhập CRM.'}`)
+      : `Bạn cần xác nhận CRM và CMS trước khi app được phép đọc ticket hoặc Website ID. ${loginInstructions}`),
     Boolean(session?.error)
   );
 }
@@ -598,6 +751,15 @@ form.addEventListener('submit', (event) => {
 
 loginOpen.addEventListener('click', openLogin);
 loginCheck.addEventListener('click', checkLogin);
+runnerTab.addEventListener('click', () => showAppView('runner'));
+cmsAccountTab.addEventListener('click', () => showAppView('cms-account'));
+cmsAccountEdit.addEventListener('click', editCmsAccount);
+cmsAccountCancel.addEventListener('click', cancelCmsAccountEdit);
+cmsAccountForm.addEventListener('submit', (event) => {
+  event.preventDefault();
+  saveCmsAccount();
+});
+cmsAccountDelete.addEventListener('click', deleteCmsAccount);
 geminiForm.addEventListener('submit', (event) => {
   event.preventDefault();
   saveGemini();
