@@ -46,9 +46,11 @@ jobs:
           body: |
             ## Popup Ticket Runner v${{ steps.pkg.outputs.version }}
             - Commit: `${{ github.sha }}`
-            - Cập nhật phân biệt 1 poster vs nhiều poster (Ticket 1594040).
-            - Nhận diện tự động hành động thay thế (Replace: update lại, đổi, thay) cho Ticket 1594214.
-            - Bổ sung cơ chế check trùng ảnh thông minh bằng thị giác điểm ảnh (Visual Similarity >= 90%).
+            - Bổ sung tính năng gắn link ảnh popup (`Image link`) từ ghi chú trong ticket (Ticket 1575574).
+            - Xử lý workflow đa poster: tải các poster mới lên trước, sau đó mới gỡ poster cũ để tránh CMS nhân bản ảnh cũ (Ticket 1595897).
+            - Nhận diện linh hoạt dải ngày khuyến mãi in trên banner poster (như `NOV 16 – DEC 7`, `NOV 15 – DEC 31, 2026`) (Ticket 1595897).
+            - Bảo toàn đầy đủ cả ngày bắt đầu (`time_start`) và ngày kết thúc (`time_end`) của các popup cũ còn hiệu lực khi migrate sang block Announcement mới (Ticket 1596219).
+            - Nhận diện chính xác block trống khi CMS tự động điền `time_start`.
             - Tải file **`Popup Ticket Runner Final.exe`** ở mục Assets bên dưới để sử dụng trực tiếp không cần cài đặt.
           files: dist/Popup Ticket Runner Final.exe
           draft: false

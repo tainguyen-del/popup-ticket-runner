@@ -58,27 +58,191 @@ function cmsSafeUploadFilename(filename, sha256, extension = null) {
   return `popup-${base}-${suffix}.${imageExtension}`;
 }
 
-function stageCmsUploadImage(attachment, runDir) {
+const CMS_MAX_UPLOAD_BYTES = 2.8 * 1024 * 1024; // 2.8MB threshold to strictly stay below CMS 3MB limit
+const TARGET_OPTIMIZED_BYTES = 2.5 * 1024 * 1024; // 2.5MB target max for compressed images
+
+async function compressImageForUpload(page, inputPath, { maxBytes = TARGET_OPTIMIZED_BYTES, maxDimension = 2048 } = {}) {
+  if (!page || typeof page.evaluate !== 'function') return null;
+  const inputBuffer = fs.readFileSync(inputPath);
+  const inputExt = path.extname(inputPath).toLowerCase();
+  const inputMime = inputExt === '.png' ? 'image/png' : (inputExt === '.webp' ? 'image/webp' : 'image/jpeg');
+  const base64 = inputBuffer.toString('base64');
+
+  const result = await page.evaluate(async ({ b64, mime, maxBytesTarget, maxDim }) => {
+    function load(src) {
+      return new Promise((resolve, reject) => {
+        const img = new Image();
+        img.onload = () => resolve(img);
+        img.onerror = () => reject(new Error('Failed to load image in canvas'));
+        img.src = src;
+      });
+    }
+    const img = await load(`data:${mime};base64,${b64}`);
+    let width = img.naturalWidth || img.width;
+    let height = img.naturalHeight || img.height;
+
+    if (width > maxDim || height > maxDim) {
+      const ratio = Math.min(maxDim / width, maxDim / height);
+      width = Math.round(width * ratio);
+      height = Math.round(height * ratio);
+    }
+
+    const canvas = document.createElement('canvas');
+    canvas.width = width;
+    canvas.height = height;
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, width, height);
+
+    let hasAlpha = false;
+    try {
+      const sample = ctx.getImageData(0, 0, width, height).data;
+      for (let i = 3; i < sample.length; i += 16) {
+        if (sample[i] < 250) { hasAlpha = true; break; }
+      }
+    } catch {
+      hasAlpha = false;
+    }
+
+    const targetFormat = hasAlpha ? 'image/webp' : 'image/jpeg';
+    const targetExtension = hasAlpha ? 'webp' : 'jpg';
+
+    let quality = 0.90;
+    let dataUrl = canvas.toDataURL(targetFormat, quality);
+    function b64Size(url) {
+      return Math.round((url.length - url.indexOf(',') - 1) * 3 / 4);
+    }
+
+    while (b64Size(dataUrl) > maxBytesTarget && quality > 0.4) {
+      quality -= 0.1;
+      dataUrl = canvas.toDataURL(targetFormat, quality);
+    }
+
+    while (b64Size(dataUrl) > maxBytesTarget && (width > 800 || height > 800)) {
+      width = Math.round(width * 0.85);
+      height = Math.round(height * 0.85);
+      canvas.width = width;
+      canvas.height = height;
+      ctx.drawImage(img, 0, 0, width, height);
+      dataUrl = canvas.toDataURL(targetFormat, 0.80);
+    }
+
+    return {
+      base64: dataUrl.split(',')[1],
+      extension: targetExtension,
+      mime: targetFormat,
+      width,
+      height
+    };
+  }, { b64: base64, mime: inputMime, maxBytesTarget: maxBytes, maxDim: maxDimension });
+
+  return result;
+}
+
+async function createVisionPreview(page, inputPath, { maxDimension = 1920 } = {}) {
+  if (!page || typeof page.evaluate !== 'function') return null;
+  try {
+    const inputBuffer = fs.readFileSync(inputPath);
+    const inputExt = path.extname(inputPath).toLowerCase();
+    const inputMime = inputExt === '.png' ? 'image/png' : (inputExt === '.webp' ? 'image/webp' : 'image/jpeg');
+    const base64 = inputBuffer.toString('base64');
+
+    const result = await page.evaluate(async ({ b64, mime, maxDim }) => {
+      const img = new Image();
+      await new Promise((resolve, reject) => {
+        img.onload = resolve;
+        img.onerror = reject;
+        img.src = `data:${mime};base64,${b64}`;
+      });
+      let width = img.naturalWidth || img.width;
+      let height = img.naturalHeight || img.height;
+      if (width > maxDim || height > maxDim) {
+        const ratio = Math.min(maxDim / width, maxDim / height);
+        width = Math.round(width * ratio);
+        height = Math.round(height * ratio);
+      }
+      const canvas = document.createElement('canvas');
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext('2d');
+      ctx.drawImage(img, 0, 0, width, height);
+      const dataUrl = canvas.toDataURL('image/jpeg', 0.85);
+      return {
+        base64: dataUrl.split(',')[1],
+        mimeType: 'image/jpeg'
+      };
+    }, { b64: base64, mime: inputMime, maxDim: maxDimension });
+
+    return result;
+  } catch {
+    return null;
+  }
+}
+
+async function stageCmsUploadImage(attachment, runDir, { page = null, progress = null } = {}) {
   if (!attachment?.path) throw new Error('The ticket poster has no local file to stage for CMS upload.');
   const original = validateDownloadedImage(attachment.path);
-  const uploadFilename = cmsSafeUploadFilename(
-    attachment.filename || original.filename,
-    attachment.sha256 || original.sha256,
-    attachment.extension || original.extension
-  );
   const uploadDirectory = path.join(runDir, 'attachment', 'cms-upload');
   fs.mkdirSync(uploadDirectory, { recursive: true });
-  const uploadPath = path.join(uploadDirectory, uploadFilename);
-  fs.copyFileSync(attachment.path, uploadPath);
-  const staged = validateDownloadedImage(uploadPath);
-  if (staged.sha256 !== original.sha256) {
+
+  const originalBytes = attachment.bytes || original.bytes;
+  const needsCompression = originalBytes > CMS_MAX_UPLOAD_BYTES;
+  let stagedPath = null;
+  let detectedExtension = attachment.extension || original.extension;
+  let optimized = false;
+
+  if (needsCompression && page) {
+    if (typeof progress === 'function') {
+      const mb = (originalBytes / 1024 / 1024).toFixed(2);
+      progress('image-optimize', `Ảnh đính kèm ${mb}MB vượt quá giới hạn 3MB của CMS. Đang tự động nén tối ưu...`);
+    }
+    try {
+      const compressed = await compressImageForUpload(page, attachment.path, { maxBytes: TARGET_OPTIMIZED_BYTES });
+      if (compressed && compressed.base64) {
+        detectedExtension = compressed.extension;
+        const uploadFilename = cmsSafeUploadFilename(
+          attachment.filename || original.filename,
+          attachment.sha256 || original.sha256,
+          detectedExtension
+        );
+        stagedPath = path.join(uploadDirectory, uploadFilename);
+        fs.writeFileSync(stagedPath, Buffer.from(compressed.base64, 'base64'));
+        optimized = true;
+      }
+    } catch {
+      stagedPath = null;
+    }
+  }
+
+  if (!stagedPath) {
+    const uploadFilename = cmsSafeUploadFilename(
+      attachment.filename || original.filename,
+      attachment.sha256 || original.sha256,
+      detectedExtension
+    );
+    stagedPath = path.join(uploadDirectory, uploadFilename);
+    fs.copyFileSync(attachment.path, stagedPath);
+  }
+
+  const staged = validateDownloadedImage(stagedPath);
+  if (!optimized && staged.sha256 !== original.sha256) {
     throw new Error('The CMS-safe poster copy did not match the downloaded ticket image. CMS upload was stopped.');
   }
+
+  if (optimized && typeof progress === 'function') {
+    const origMb = (original.bytes / 1024 / 1024).toFixed(2);
+    const newMb = (staged.bytes / 1024 / 1024).toFixed(2);
+    progress('image-optimized', `Đã nén tối ưu poster từ ${origMb}MB xuống ${newMb}MB (chất lượng 90%) để upload CMS thành công.`);
+  }
+
   return {
     ...attachment,
-    extension: attachment.extension || original.extension,
-    uploadPath,
-    uploadFilename
+    extension: staged.extension,
+    bytes: staged.bytes,
+    sha256: staged.sha256,
+    uploadPath: stagedPath,
+    uploadFilename: path.basename(stagedPath),
+    optimized,
+    originalBytes
   };
 }
 
@@ -90,30 +254,48 @@ function geminiVisionMimeType(imagePath) {
   return null;
 }
 
-function visionCandidatesFromDownloads(downloads, attachmentCandidates) {
+async function visionCandidatesFromDownloads(downloads, attachmentCandidates, { page = null } = {}) {
   const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
   const MAX_TOTAL_BYTES = 15 * 1024 * 1024;
   let totalBytes = 0;
   const warnings = [];
   const candidates = [];
   for (const download of downloads) {
-    const mimeType = geminiVisionMimeType(download.path);
+    let mimeType = geminiVisionMimeType(download.path);
     if (!mimeType) {
       warnings.push(`Attachment #${download.candidateIndex} is not a PNG, JPEG, or WebP Vision input.`);
       continue;
     }
+    let base64 = null;
+    let candidateBytes = download.bytes;
     if (download.bytes > MAX_IMAGE_BYTES || totalBytes + download.bytes > MAX_TOTAL_BYTES) {
-      warnings.push(`Attachment #${download.candidateIndex} was too large for the inline Vision request.`);
-      continue;
+      if (page) {
+        const preview = await createVisionPreview(page, download.path);
+        if (preview && preview.base64) {
+          base64 = preview.base64;
+          mimeType = preview.mimeType;
+          candidateBytes = Math.round(base64.length * 3 / 4);
+        }
+      }
+      if (!base64 || (totalBytes + candidateBytes > MAX_TOTAL_BYTES)) {
+        warnings.push(`Attachment #${download.candidateIndex} was too large for the inline Vision request.`);
+        continue;
+      }
     }
-    totalBytes += download.bytes;
+    if (!base64) {
+      base64 = fs.readFileSync(download.path).toString('base64');
+    }
+    totalBytes += candidateBytes;
     const context = attachmentCandidates.find((candidate) => candidate.index === download.candidateIndex) || {};
     candidates.push({
       index: download.candidateIndex,
       filename: download.filename,
       context: context.context || '',
+      precedingText: context.precedingText || '',
+      kind: context.kind || 'unknown',
+      isRemovalReference: context.isRemovalReference === true,
       mimeType,
-      base64: fs.readFileSync(download.path).toString('base64')
+      base64
     });
   }
   return { candidates, warnings };
@@ -164,6 +346,9 @@ function preparePopupRemovalVision(referenceImage, popupImages) {
 }
 
 module.exports = {
+  CMS_MAX_UPLOAD_BYTES,
+  compressImageForUpload,
+  createVisionPreview,
   imageFiles,
   validateDownloadedImage,
   cmsSafeUploadFilename,

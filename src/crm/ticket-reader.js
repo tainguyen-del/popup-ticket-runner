@@ -196,7 +196,27 @@ async function ticketAttachmentDescriptors(root, items = null) {
   for (let index = 0; index < candidates.length; index += 1) {
     const candidate = candidates[index];
     const descriptor = await candidate.locator.evaluate((element, { candidateIndex, kind, sourceUrl }) => {
+      let precedingText = '';
+      let isRemovalReference = false;
       if (kind === 'inline-image') {
+        let block = element.closest('p, div, li, tr') || element;
+        let prev = block.previousElementSibling;
+        while (prev && !precedingText) {
+          const t = (prev.innerText || '').trim();
+          if (t) precedingText = t;
+          prev = prev.previousElementSibling;
+        }
+        if (!precedingText && block.parentElement) {
+          let parentPrev = block.parentElement.previousElementSibling;
+          while (parentPrev && !precedingText) {
+            const t = (parentPrev.innerText || '').trim();
+            if (t) precedingText = t;
+            parentPrev = parentPrev.previousElementSibling;
+          }
+        }
+        if (/(?:gỡ|xóa|remove|delete|take\s*down)\s+(?:poster|hình|ảnh|popup)/i.test(precedingText) || /^[0-9]+[./)]\s*(?:gỡ|xóa|remove)/i.test(precedingText)) {
+          isRemovalReference = true;
+        }
         let context = element.parentElement?.innerText || '';
         let parent = element.parentElement;
         for (let depth = 0; parent && depth < 5; depth += 1, parent = parent.parentElement) {
@@ -207,7 +227,9 @@ async function ticketAttachmentDescriptors(root, items = null) {
           index: candidateIndex,
           filename: sourceUrl ? sourceUrl.split('/').at(-1)?.split('?')[0] || null : null,
           context: context.replace(/\s+/g, ' ').trim().slice(0, 2200),
-          kind
+          precedingText: precedingText.replace(/\s+/g, ' ').trim().slice(0, 300),
+          kind,
+          isRemovalReference
         };
       }
       const image = element.querySelector('img');
@@ -235,10 +257,12 @@ async function ticketAttachmentDescriptors(root, items = null) {
         index: candidateIndex,
         filename,
         context: context.replace(/\s+/g, ' ').trim().slice(0, 2200),
-        kind
+        precedingText: '',
+        kind,
+        isRemovalReference: false
       };
     }, { candidateIndex: index + 1, kind: candidate.kind, sourceUrl: candidate.sourceUrl })
-      .catch(() => ({ index: index + 1, filename: null, context: '', kind: candidate.kind }));
+      .catch(() => ({ index: index + 1, filename: null, context: '', precedingText: '', kind: candidate.kind, isRemovalReference: false }));
     descriptors.push(descriptor);
   }
   return descriptors;

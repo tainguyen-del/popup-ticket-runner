@@ -20,6 +20,7 @@ const {
   mustCreateFreshAnnouncementSection
 } = require('../src/run');
 const { hasWebsiteIdHeader } = require('../src/crm/ticket-reader');
+const { extractPopupLink } = require('../src/ticket-parser');
 
 function parsed(text, ticketNumber) {
   return ticketData(text, `https://crm.fastboy.dev/tickets/detail/${ticketNumber}`);
@@ -333,6 +334,27 @@ test('adds a second block only after the first popup entry', () => {
   assert.equal(entries[2].isTicket, true);
 });
 
+test('preserves the start date of an unmatched active legacy popup when migrating to a new section', () => {
+  const { entries, matchingLegacyIndex } = buildPopupEntries(
+    'C:/tmp/Oasis Loyalty Celebration.png',
+    { start: null, end: { date: '2027-02-01' } },
+    [{
+      imagePath: 'C:/tmp/legacy-popup-1.webp',
+      sourceImageUrl: 'https://cdn.example/Thanksgiving-Poster.webp',
+      start: { date: '2026-11-22' },
+      end: { date: '2026-11-26' }
+    }]
+  );
+  assert.equal(matchingLegacyIndex, -1);
+  assert.equal(entries.length, 2);
+  assert.equal(entries[0].isTicket, false);
+  assert.equal(entries[0].schedule.start?.date, '2026-11-22');
+  assert.equal(entries[0].schedule.end?.date, '2026-11-26');
+  assert.equal(entries[1].isTicket, true);
+  assert.equal(entries[1].schedule.start, null);
+  assert.equal(entries[1].schedule.end?.date, '2027-02-01');
+});
+
 test('replaces matching legacy block in-place when duplicateMatches is provided', () => {
   const tickets = [{
     ticketIndex: 0,
@@ -475,6 +497,15 @@ test('resolves the actual blank card after NewZen prepends or appends Add block'
     reason: null
   });
   assert.deepEqual(resolveAddedPopupItemTarget([legacy], [legacy, blank]), {
+    targetIndex: 1,
+    expectedCount: 2,
+    method: 'serialized-delta',
+    reason: null
+  });
+
+  // CMS auto-fills time_start with today's date when Add block is clicked
+  const blankWithCmsDefaultDate = { time_start: '2026-11-16 00:00', time_end: '', image: '', image_alt: '', link: '', html_code: '', open_new_tab: false };
+  assert.deepEqual(resolveAddedPopupItemTarget([legacy], [legacy, blankWithCmsDefaultDate]), {
     targetIndex: 1,
     expectedCount: 2,
     method: 'serialized-delta',
@@ -720,4 +751,76 @@ test('identifies replacement actions from direct replacement phrasing (update la
   assert.equal(hasAffirmativePopupReplace('Hi team / Nhờ team pop up poster / Thanks team'), false);
   assert.equal(hasAffirmativePopupReplace('Nhờ team đăng poster đính kèm'), false);
   assert.equal(hasAffirmativePopupReplace('Nhờ team update website'), false);
+});
+
+// ─── Mixed-action case (ticket 1595897) ─────────────────────────────────────
+
+test('mixed add+remove ticket sets popupAction to create, not remove-one', () => {
+  const ticket = parsed([
+    'ID#5342 - Website Support',
+    '#1595897',
+    'popup 2 promo sau len web + tam remove poster sau'
+  ].join('\n'), 1595897);
+  assert.equal(ticket.popupAction, 'create', 'should be create, not remove-one');
+  assert.equal(ticket.hasInlineRemovalRequest, true);
+});
+
+test('pure remove without add still sets popupAction to remove-one', () => {
+  const ticket = parsed([
+    'ID#5342 - Website Support',
+    '#1591001',
+    'Please remove the attached poster from the website.'
+  ].join('\n'), 1591001);
+  assert.equal(ticket.popupAction, 'remove-one');
+  assert.equal(ticket.hasInlineRemovalRequest, false);
+});
+
+test('pure remove-all without add still sets popupAction to remove-all', () => {
+  const ticket = parsed([
+    'ID#5342 - Website Support',
+    '#1591002',
+    'Please remove every existing popup from the website.'
+  ].join('\n'), 1591002);
+  assert.equal(ticket.popupAction, 'remove-all');
+  assert.equal(ticket.hasInlineRemovalRequest, false);
+});
+
+// ─── Popup link extraction ───────────────────────────────────────────────────
+
+test('extractPopupLink returns URL after a "link" keyword', () => {
+  const url = extractPopupLink('Nhowf team pop up poster va direct toi link booking http://booking.gocheckin.net/v2/16675');
+  assert.equal(url, 'http://booking.gocheckin.net/v2/16675');
+});
+
+test('extractPopupLink returns a bare https URL in the ticket', () => {
+  const url = extractPopupLink('Pop up poster này và link https://example.com/page');
+  assert.equal(url, 'https://example.com/page');
+});
+
+test('extractPopupLink strips trailing punctuation from URL', () => {
+  const url = extractPopupLink('direct to link: http://booking.example.com/path.');
+  assert.equal(url, 'http://booking.example.com/path');
+});
+
+test('extractPopupLink returns null when ticket has no URL', () => {
+  const url = extractPopupLink('Nhờ team pop up poster đính kèm đến 12/31/2026');
+  assert.equal(url, null);
+});
+
+test('ticketData includes popupLink from ticket text', () => {
+  const ticket = parsed([
+    'ID#9876 - Website Support',
+    '#1575574',
+    'Nhowf team pop up poster va direct toi link booking http://booking.gocheckin.net/v2/16675'
+  ].join('\n'), 1575574);
+  assert.equal(ticket.popupLink, 'http://booking.gocheckin.net/v2/16675');
+});
+
+test('ticketData popupLink is null when no URL in ticket', () => {
+  const ticket = parsed([
+    'ID#9876 - Website Support',
+    '#1575575',
+    'Nho team pop up poster dinh kem'
+  ].join('\n'), 1575575);
+  assert.equal(ticket.popupLink, null);
 });

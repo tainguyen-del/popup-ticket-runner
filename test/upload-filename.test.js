@@ -20,13 +20,13 @@ test('creates an ASCII-safe CMS upload filename for special-character posters', 
   assert.equal(/[\s#%?&/\\'"<>:|]/.test(filename), false);
 });
 
-test('stages a CMS-safe copy without modifying the downloaded ticket poster', (t) => {
+test('stages a CMS-safe copy without modifying the downloaded ticket poster', async (t) => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'popup-ticket-runner-upload-test-'));
   t.after(() => fs.rmSync(directory, { recursive: true, force: true }));
   const originalPath = path.join(directory, 'Poster #50% (Final).PNG');
   fs.writeFileSync(originalPath, PNG);
   const attachment = validateDownloadedImage(originalPath);
-  const staged = stageCmsUploadImage(attachment, directory);
+  const staged = await stageCmsUploadImage(attachment, directory);
 
   assert.equal(fs.existsSync(originalPath), true);
   assert.equal(fs.existsSync(staged.uploadPath), true);

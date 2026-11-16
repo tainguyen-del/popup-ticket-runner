@@ -65,7 +65,7 @@ function hasAffirmativePopupRemoval(text) {
 function hasAffirmativePopupUpdate(text) {
   const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim();
   const entityPattern = /\b(?:pop[\s-]*ups?|announcements?|posters?|banners?)\b/i;
-  const actionPattern = /\b(?:add(?:ed)?|creat(?:e|ed)|updat(?:e|ed)|replac(?:e|ed)|upload(?:ed)?|publish(?:ed)?|launch(?:ed)?|setup|set\s+up|them|tao|cap\s*nhat|thay|dang|cai(?:\s+dat)?)\b/gi;
+  const actionPattern = /\b(?:add(?:ed)?|creat(?:e|ed)|updat(?:e|ed)|replac(?:e|ed)|upload(?:ed)?|publish(?:ed)?|launch(?:ed)?|setup|set\s+up|them|tao|cap\s*nhat|thay|dang|cai(?:\s+dat)?|len(?:\s+web)?)\b/gi;
   for (const match of folded.matchAll(actionPattern)) {
     if (actionIsNegated(folded, match.index)) continue;
     const { start, end } = clauseBounds(folded, match.index);
@@ -104,7 +104,11 @@ function hasAffirmativePopupReplace(text) {
   const removesExisting = hasAffirmativePopupRemoval(folded);
   const addsOrUpdates = hasAffirmativePopupUpdate(folded);
   const isScheduledRemoval = /\b(?:schedule|lich|hen(?:\s+gio)?)\s+go\b/i.test(folded);
-  return removesExisting && addsOrUpdates && !isScheduledRemoval;
+  // "tam remove" (tạm = temporary) is a separate inline removal, not a replace.
+  // Also treat "add X + remove Y" with an explicit separator as independent actions.
+  const isTemporaryRemoval = /\btam\s+(?:remove|go|xoa|tat)\b/i.test(folded);
+  const isSeparatedAction = /\b(?:popup|poster|banner)\b[^.;\n]{0,80}[+&]\s*(?:tam\s+)?(?:remove|go|xoa|tat)\b/i.test(folded);
+  return removesExisting && addsOrUpdates && !isScheduledRemoval && !isTemporaryRemoval && !isSeparatedAction;
 }
 
 function explicitRemoveAllRequested(text) {
@@ -305,6 +309,27 @@ function endOfMonthExpiryFromTicket(text) {
   return date ? { date, evidence: (numeric || named)[0] } : null;
 }
 
+function extractPopupLink(text) {
+  const raw = String(text || '');
+  const isCrmUrl = (url) => /^(?:https?:\/\/)?(?:crm|jira|api)\.fastboy\./i.test(url);
+
+  // Look for a URL following an explicit "link" or similar keyword within 160 chars
+  const nearKeyword = /\b(?:link|direct|booking|website|url|href|toi\s+link|den\s+link)\b[^.;\n]{0,160}?(https?:\/\/[^\s<>"']+)/i.exec(raw);
+  if (nearKeyword) {
+    const candidate = nearKeyword[1].replace(/[.,;)]+$/, '');
+    if (!isCrmUrl(candidate)) return candidate;
+  }
+
+  // Look for any external http/https URL in the ticket text
+  const matches = [...raw.matchAll(/(https?:\/\/[^\s<>"']+)/gi)];
+  for (const match of matches) {
+    const candidate = match[1].replace(/[.,;)]+$/, '');
+    if (!isCrmUrl(candidate)) return candidate;
+  }
+
+  return null;
+}
+
 function ticketData(body, ticketUrl) {
   const raw = String(body || '');
   const text = raw.replace(/\s+/g, ' ').trim();
@@ -349,6 +374,20 @@ function ticketData(body, ticketUrl) {
   const isScheduledRemoval = /\b(?:schedule|lich|hen(?:\s+gio)?)\s+go\b/i.test(folded);
   const replaceExistingPopup = hasAffirmativePopupReplace(folded) && !isScheduledRemoval;
   const removesAllExistingPopups = removesExistingPopupPoster && explicitRemoveAllRequested(folded);
+  // Mixed-action case: ticket adds new poster(s) AND removes an existing one.
+  // In this case the dominant action is 'create'; the removal is handled
+  // in-line via isRemovalReference attachment candidates. Only fall back to
+  // 'remove-one'/'remove-all' when no new poster is being added.
+  const hasInlineRemovalRequest = removesExistingPopupPoster && addsOrUpdatesPopup && !replaceExistingPopup && !isScheduledRemoval;
+  let popupAction;
+  if (replaceExistingPopup) {
+    popupAction = 'replace';
+  } else if (removesExistingPopupPoster && !isScheduledRemoval && !addsOrUpdatesPopup) {
+    popupAction = removesAllExistingPopups ? 'remove-all' : 'remove-one';
+  } else {
+    popupAction = 'create';
+  }
+  const popupLink = extractPopupLink(raw);
   return {
     siteId: titleSiteId || labelledSiteId,
     start: popupStart,
@@ -361,11 +400,9 @@ function ticketData(body, ticketUrl) {
     scheduleError: rangeState.error,
     popupRequested,
     popupPosition,
-    popupAction: replaceExistingPopup
-      ? 'replace'
-      : (removesExistingPopupPoster && !isScheduledRemoval
-        ? (removesAllExistingPopups ? 'remove-all' : 'remove-one')
-        : 'create')
+    popupAction,
+    hasInlineRemovalRequest,
+    popupLink
   };
 }
 
@@ -417,6 +454,7 @@ module.exports = {
   popupRangeFromText,
   reconcilePopupRange,
   endOfMonthExpiryFromTicket,
+  extractPopupLink,
   ticketData,
   isPopupRemovalAction,
   popupActionNeedsTicketImage,

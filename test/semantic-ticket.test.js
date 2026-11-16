@@ -12,7 +12,9 @@ const {
   posterSchedulesFromResponse,
   requestGeminiTicketJson,
   SEMANTIC_SCHEMA,
-  geminiResponseSchema
+  geminiResponseSchema,
+  multiVisionPrompt,
+  visionPrompt
 } = require('../src/semantic-ticket');
 
 const baseTicket = {
@@ -431,6 +433,37 @@ test('poster artwork schedules reject reversed ranges, closure dates, and unknow
   assert.match(result.warnings.join(' '), /unknown or unselected/i);
 });
 
+test('poster artwork schedules accept promotional date ranges such as NOV 16 - DEC 7 and NOV 15 - DEC 31, 2026', () => {
+  const candidates = [{ index: 1 }, { index: 2 }];
+  const result = posterSchedulesFromResponse([
+    {
+      attachmentIndex: 1,
+      startDate: '2026-11-16',
+      endDate: '2026-12-07',
+      evidence: 'NOV 16 – DEC 7',
+      confidence: 0.95
+    },
+    {
+      attachmentIndex: 2,
+      startDate: '2026-11-15',
+      endDate: '2026-12-31',
+      evidence: 'NOV 15 – DEC 31, 2026',
+      confidence: 0.96
+    }
+  ], candidates, [1, 2]);
+
+  assert.deepEqual(result.schedules.map(({ attachmentIndex, startDate, endDate, evidence }) => ({
+    attachmentIndex,
+    startDate,
+    endDate,
+    evidence
+  })), [
+    { attachmentIndex: 1, startDate: '2026-11-16', endDate: '2026-12-07', evidence: 'NOV 16 – DEC 7' },
+    { attachmentIndex: 2, startDate: '2026-11-15', endDate: '2026-12-31', evidence: 'NOV 15 – DEC 31, 2026' }
+  ]);
+  assert.equal(result.warnings.length, 0);
+});
+
 test('Gemini Vision refuses an incomplete or duplicate multi-poster set', async () => {
   const candidates = [
     { index: 1, filename: 'first.png', mimeType: 'image/png', base64: 'MQ==' },
@@ -586,4 +619,33 @@ test('unsafe or contradictory removal Vision decisions are never accepted as a m
     confidence: 0.99,
     rationale: 'Missing outcome.'
   }, candidates), null);
+});
+
+test('multiVisionPrompt and visionPrompt clearly distinguish file upload posters from removal reference screenshots', () => {
+  const candidates = [
+    {
+      index: 1,
+      filename: 'artwork.jpg',
+      kind: 'upload-card',
+      context: 'Attached flyer'
+    },
+    {
+      index: 2,
+      filename: 'old-screenshot.png',
+      kind: 'inline-image',
+      precedingText: '1/ gỡ poster này xuống',
+      isRemovalReference: true,
+      context: '1/ gỡ poster này xuống'
+    }
+  ];
+  const ticket = 'Hi team\n1/ gỡ poster này xuống\nThay bằng hình mới đính kèm';
+  const prompt = multiVisionPrompt(ticket, candidates);
+  assert.match(prompt, /EXCLUDE SCREENSHOTS/i);
+  assert.match(prompt, /gỡ poster này xuống/i);
+  assert.match(prompt, /REMOVAL REFERENCE/i);
+  assert.match(prompt, /File upload attachment \/ "hình mới đính kèm"/i);
+
+  const singlePrompt = visionPrompt(ticket, candidates);
+  assert.match(singlePrompt, /EXCLUDE SCREENSHOTS/i);
+  assert.match(singlePrompt, /REMOVAL REFERENCE/i);
 });
