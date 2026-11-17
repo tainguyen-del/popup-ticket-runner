@@ -680,43 +680,76 @@ async function popupSectionCardForVersion(cards, expectedToken) {
   return null;
 }
 
-async function deleteLegacyPopupSections(page) {
-  let cards = await popupSectionCards(page);
+async function deleteSectionCard(page, card) {
+  const menuButton = await visibleMatch(card.locator('button.button-drag'), 'Section menu', true);
+  if (!menuButton) return false;
+  await menuButton.click();
+  const menu = await waitForVisibleMatch(page.getByRole('menu'), 'Section menu', true, 3000);
+  const remove = await visibleMatch(
+    menu.getByRole('menuitem', { name: 'Delete item', exact: true }),
+    'Section Delete item control',
+    true
+  );
+  if (!remove) return false;
+  await remove.click();
+  const confirm = await waitForVisibleMatch(
+    page.getByRole('button', { name: /^(?:Confirm|Delete|Yes)$/i }),
+    'Section delete confirmation',
+    true,
+    1800
+  ).catch(() => null);
+  if (confirm) await confirm.click();
+  await card.waitFor({ state: 'detached', timeout: 4000 }).catch(() => {});
+  await page.waitForTimeout(300);
+  return true;
+}
+
+async function deleteLegacyPopupSections(page, targetSectionIds = []) {
   let removedCount = 0;
+  const targetIds = new Set((Array.isArray(targetSectionIds) ? targetSectionIds : []).filter(Boolean));
+
+  // 1. Delete sections by target ID recorded before plugin update (even if CMS renamed them to N/A)
+  for (const id of targetIds) {
+    const card = page.locator(`div#${id}`);
+    if (await card.isVisible().catch(() => false)) {
+      const deleted = await deleteSectionCard(page, card).catch(() => false);
+      if (deleted) removedCount += 1;
+    }
+  }
+
+  // 2. Delete any sections that still match Announcement popup cards
+  let cards = await popupSectionCards(page);
   while (cards.length) {
-    const before = cards.length;
     const card = cards.at(-1);
-    const menuButton = await visibleMatch(card.locator('button.button-drag'), 'Announcement section menu', true);
-    await menuButton.click();
-    const menu = await waitForVisibleMatch(page.getByRole('menu'), 'Announcement section menu', true, 3000);
-    const remove = await visibleMatch(
-      menu.getByRole('menuitem', { name: 'Delete item', exact: true }),
-      'Announcement section Delete item control',
-      true
-    );
-    await remove.click();
-    const confirm = await waitForVisibleMatch(
-      page.getByRole('button', { name: /^(?:Confirm|Delete|Yes)$/i }),
-      'Announcement section delete confirmation',
-      true,
-      1800
-    ).catch(() => null);
-    if (confirm) await confirm.click();
-    await waitForPopupSectionCardCount(page, before - 1);
+    const deleted = await deleteSectionCard(page, card).catch(() => false);
+    if (!deleted) break;
     removedCount += 1;
     cards = await popupSectionCards(page);
   }
+
+  // 3. Delete any orphaned N/A section cards in the editor left behind by plugin upgrade
+  const allCards = page.locator('div[id^="item_block_section#"]');
+  for (let i = (await allCards.count()) - 1; i >= 0; i -= 1) {
+    const card = allCards.nth(i);
+    if (!await card.isVisible().catch(() => false)) continue;
+    const text = (await card.innerText().catch(() => '')).trim();
+    if (/^N\/A\s+N\/A$/i.test(text) || text === 'N/A') {
+      const deleted = await deleteSectionCard(page, card).catch(() => false);
+      if (deleted) removedCount += 1;
+    }
+  }
+
   return removedCount;
 }
 
-async function ensurePopupSection(page, baseUrl, { replaceExisting = false, expectedPluginVersion = null } = {}) {
+async function ensurePopupSection(page, baseUrl, { replaceExisting = false, expectedPluginVersion = null, targetSectionIds = [] } = {}) {
   await openPageEditor(page, baseUrl);
   // This checks the active editor UI only. index.yml is written by CMS Build,
   // so it is not used as a source of truth for the popup workflow.
   const expectedToken = announcementSectionVersionToken(expectedPluginVersion);
   const existing = await popupSectionCards(page);
   let removedCount = 0;
-  if (replaceExisting) removedCount = await deleteLegacyPopupSections(page);
+  if (replaceExisting) removedCount = await deleteLegacyPopupSections(page, targetSectionIds);
   else if (existing.length) {
     const currentCard = await popupSectionCardForVersion(existing, expectedToken);
     if (!currentCard) {
@@ -768,7 +801,7 @@ async function openPopupSection(page, sectionId = null) {
   // page-editor card is still visible in the DOM but is behind the overlay,
   // so clicking it would time out.  Prefer the already-open editor.
   const alreadyOpen = await waitForVisibleMatch(
-    page.getByText('Popup setting', { exact: true }),
+    page.getByText(/Popup[\s_]setting/i),
     null,
     true,
     1200
@@ -783,7 +816,7 @@ async function openPopupSection(page, sectionId = null) {
     await page.waitForTimeout(250);
   }
   for (let attempt = 0; attempt < 20; attempt += 1) {
-    const settingsCard = await visibleMatch(page.getByText('Popup setting', { exact: true }), null);
+    const settingsCard = await visibleMatch(page.getByText(/Popup[\s_]setting/i), null);
     if (settingsCard) return settingsCard;
     const section = await visiblePopupSection(page, null);
     if (section) await section.click();
@@ -794,12 +827,27 @@ async function openPopupSection(page, sectionId = null) {
 
 async function openPopupSettings(page, sectionId = null) {
   await openPopupSection(page, sectionId);
-  const isAddBlockVisible = async () => page.locator('button:has-text("Add block")').isVisible().catch(() => false);
+  const isAddBlockVisible = async () => {
+    return (await page.getByRole('button', { name: /Add\s*block/i }).isVisible().catch(() => false))
+      || (await page.locator('button:has-text("Add block")').isVisible().catch(() => false))
+      || (await page.locator('[role="button"]:has-text("Add block")').isVisible().catch(() => false));
+  };
   if (await isAddBlockVisible()) return;
 
   const popupSetting = await visibleMatch(page.getByText('Popup_setting', { exact: true }), null)
     || await visibleMatch(page.getByText(/Popup[\s_]setting/i), 'Popup setting control');
-  await popupSetting.click();
+
+  // Check if the accordion item is already expanded/active before clicking
+  const isExpanded = await popupSetting.evaluate((el) => {
+    const item = el.closest('.el-collapse-item') || el.closest('[role="tab"]') || el.parentElement;
+    if (item && (item.classList.contains('is-active') || item.classList.contains('active'))) return true;
+    if (el.getAttribute('aria-expanded') === 'true' || el.closest('[aria-expanded="true"]')) return true;
+    return false;
+  }).catch(() => false);
+
+  if (!isExpanded) {
+    await popupSetting.click();
+  }
 
   const appeared = await waitForVisibleMatch(
     page.getByRole('button', { name: /Add\s*block/i }),
@@ -807,7 +855,7 @@ async function openPopupSettings(page, sectionId = null) {
     true,
     4000
   ).catch(() => null) || await waitForVisibleMatch(
-    page.locator('button:has-text("Add block")'),
+    page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")'),
     null,
     true,
     4000
@@ -818,7 +866,7 @@ async function openPopupSettings(page, sectionId = null) {
     // retry clicking Popup_setting once to re-open the panel.
     await popupSetting.click().catch(() => {});
     await waitForVisibleMatch(
-      page.locator('button:has-text("Add block")'),
+      page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")'),
       'Popup Add block control',
       true,
       8000
@@ -2283,7 +2331,7 @@ function normalizeTicketPopupEntries(ticketEntries, imagePath, schedule, ticketF
   });
 }
 
-function buildPopupEntriesForTickets(ticketEntries, legacyPopups = [], duplicateMatches = []) {
+function buildPopupEntriesForTickets(ticketEntries, legacyPopups = [], duplicateMatches = [], { replaceExisting = false } = {}) {
   const normalizedTickets = Array.isArray(ticketEntries) ? ticketEntries : [];
   const matchedTicketIndexes = new Set();
   const matchingLegacyIndexes = [];
@@ -2293,6 +2341,12 @@ function buildPopupEntriesForTickets(ticketEntries, legacyPopups = [], duplicate
     if (match && Number.isInteger(match.cmsIndex) && Number.isInteger(match.ticketIndex)) {
       legacyToTicketMap.set(match.cmsIndex, match.ticketIndex);
     }
+  }
+
+  // When replacing and no specific duplicate match was found, if there is only 1 legacy popup
+  // on CMS, the ticket's first poster directly replaces that single legacy popup instead of adding alongside it.
+  if (replaceExisting && duplicateMatches.length === 0 && legacyPopups.length === 1 && normalizedTickets.length >= 1) {
+    legacyToTicketMap.set(0, normalizedTickets[0].ticketIndex ?? 0);
   }
 
   const entries = legacyPopups.map((legacy, legacyIndex) => {
@@ -2355,9 +2409,9 @@ function buildPopupEntriesForTickets(ticketEntries, legacyPopups = [], duplicate
 
 // Compatibility wrapper for the established one-poster unit tests and call
 // sites. The actual CMS writer accepts an array through `ticketEntries`.
-function buildPopupEntries(imagePath, schedule, legacyPopups, { ticketFilename = null } = {}) {
+function buildPopupEntries(imagePath, schedule, legacyPopups, { ticketFilename = null, replaceExisting = false } = {}) {
   const tickets = normalizeTicketPopupEntries(null, imagePath, schedule, ticketFilename);
-  return buildPopupEntriesForTickets(tickets, legacyPopups);
+  return buildPopupEntriesForTickets(tickets, legacyPopups, [], { replaceExisting });
 }
 
 async function configurePopup(page, imagePath, schedule, timezone, {
@@ -2402,7 +2456,12 @@ async function configurePopup(page, imagePath, schedule, timezone, {
 
   const shouldRemoveSingle = replaceExisting && duplicateMatches.length === 0 && before.items.length === 1;
   const replacement = shouldRemoveSingle ? await removeSingleExistingPopup(page) : { removed: false, previous: null };
-  const { entries, matchingLegacyIndex, matchingLegacyIndexes } = buildPopupEntriesForTickets(normalizedTicketEntries, legacyPopups, duplicateMatches);
+  const { entries, matchingLegacyIndex, matchingLegacyIndexes } = buildPopupEntriesForTickets(
+    normalizedTicketEntries,
+    legacyPopups,
+    duplicateMatches,
+    { replaceExisting }
+  );
   const emptyItemsBefore = before.items.filter(isEmptyPopupItem);
   const configuredItemsBefore = before.items.filter((item) => !isEmptyPopupItem(item));
   const hasReusablePlaceholder = emptyItemsBefore.length > 0;
@@ -3622,7 +3681,11 @@ async function main() {
             try {
               plan.popupSection = await ensurePopupSection(page, baseUrl, {
                 replaceExisting: replaceSectionAfterPluginUpdate,
-                expectedPluginVersion: plan.plugin.version
+                expectedPluginVersion: plan.plugin.version,
+                targetSectionIds: [
+                  ...(legacyPopupSnapshot?.sectionIds || []),
+                  ...(sectionVersionInfo?.legacySectionIds || [])
+                ]
               });
             } catch (error) {
               error.stage = 'section-apply';

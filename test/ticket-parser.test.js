@@ -381,6 +381,28 @@ test('replaces matching legacy block in-place when duplicateMatches is provided'
   assert.equal(entries[1].schedule.end.date, '2026-12-31');
 });
 
+test('replaces single legacy popup directly when replaceExisting is true and duplicateMatches is empty', () => {
+  const tickets = [{
+    ticketIndex: 0,
+    uploadPath: 'C:/tmp/new-special-offer.png',
+    filename: 'new-special-offer.png',
+    schedule: { start: { date: '2026-11-14' }, end: { date: '2026-12-11' } }
+  }];
+  const legacy = [{
+    imagePath: 'C:/tmp/old-grand-opening.webp',
+    sourceImageUrl: 'https://cdn.example/old-grand-opening.webp',
+    start: null,
+    end: { date: '2026-12-11' }
+  }];
+  const { entries, matchingLegacyIndex } = buildPopupEntriesForTickets(tickets, legacy, [], { replaceExisting: true });
+  assert.equal(matchingLegacyIndex, 0);
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].imagePath, 'C:/tmp/new-special-offer.png');
+  assert.equal(entries[0].isTicket, true);
+  assert.equal(entries[0].schedule.start.date, '2026-11-14');
+  assert.equal(entries[0].schedule.end.date, '2026-12-11');
+});
+
 test('keeps two staged ticket posters as distinct popup entries with the shared schedule', () => {
   const schedule = { start: null, end: { date: '2026-11-30' } };
   const entries = popupTicketEntriesFromDownloads([
