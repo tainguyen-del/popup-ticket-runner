@@ -216,8 +216,10 @@ function safePlan(plan) {
     build: plan.build ? {
       status: plan.build.status || null,
       evidence: plan.build.evidence || null,
-      completedAt: plan.build.completedAt || null
+      completedAt: plan.build.completedAt || null,
+      cmsStatus: plan.build.cmsStatus || plan.cmsStatus || null
     } : null,
+    cmsStatus: plan.build?.cmsStatus || plan.cmsStatus || null,
     website: plan.website ? {
       liveUrl: plan.website.liveUrl || null,
       previewUrl: plan.website.previewUrl || null

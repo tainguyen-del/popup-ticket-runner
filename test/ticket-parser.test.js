@@ -7,6 +7,7 @@ const {
   buildPopupEntriesForTickets,
   isInlineTicketImageUrl,
   resolveRemovalScopeFromAttachments,
+  popupScheduleFromTicket,
   popupTicketEntriesFromDownloads,
   shouldUseTicketVision,
   planPopupItemTarget,
@@ -20,7 +21,7 @@ const {
   mustCreateFreshAnnouncementSection
 } = require('../src/run');
 const { hasWebsiteIdHeader } = require('../src/crm/ticket-reader');
-const { extractPopupLink } = require('../src/ticket-parser');
+const { extractPopupLink, normalizeExpiry } = require('../src/ticket-parser');
 
 function parsed(text, ticketNumber) {
   return ticketData(text, `https://crm.fastboy.dev/tickets/detail/${ticketNumber}`);
@@ -401,6 +402,61 @@ test('replaces single legacy popup directly when replaceExisting is true and dup
   assert.equal(entries[0].isTicket, true);
   assert.equal(entries[0].schedule.start.date, '2026-11-14');
   assert.equal(entries[0].schedule.end.date, '2026-12-11');
+});
+
+test('recognizes "Đến khi khách tắt" as an indefinite schedule without start/end dates', () => {
+  const ticket = parsed('ID#18781 - Creating pop-ups\nNhờ team hỗ trợ tạo pop-ups cho website. Đến  khi khách tắt\nThank team.', 18781);
+  assert.equal(ticket.isIndefinite, true);
+  assert.equal(ticket.startDate, null);
+  assert.equal(ticket.expiryDate, null);
+  assert.equal(ticket.start, null);
+  assert.equal(ticket.expiry, null);
+  assert.equal(ticket.scheduleSource, 'ticket-indefinite');
+});
+
+test('does not use artwork Vision dates when ticket instruction is indefinite (đến khi khách tắt)', () => {
+  const ticket = parsed('ID#18781 - Creating pop-ups\nNhờ team hỗ trợ tạo pop-ups cho website. Đến khi khách tắt\nThank team.', 18781);
+  const schedule = popupScheduleFromTicket(ticket);
+  assert.equal(schedule.isIndefinite, true);
+  assert.equal(schedule.start, null);
+  assert.equal(schedule.end, null);
+
+  const posterSchedules = [{
+    attachmentIndex: 1,
+    startDate: '2026-11-23',
+    endDate: '2026-11-27',
+    evidence: 'NOVEMBER 23-27, 2026 ONLY'
+  }];
+
+  const entries = popupTicketEntriesFromDownloads([
+    { candidateIndex: 1, filename: 'promo.png', sha256: 'abc', uploadPath: 'C:/tmp/promo.png' }
+  ], schedule, posterSchedules);
+
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].schedule.start, null);
+  assert.equal(entries[0].schedule.end, null);
+});
+
+test('does not mistake "from <store name>" in holiday greetings as a popup start date (ticket 1597915)', () => {
+  const text = [
+    'ID#2928 - SM SP [Design poster] THANKSGIVING NOTICE',
+    'Nhờ team popup poster.',
+    'EXP: 11/26/2026',
+    'HAPPY THANKSGIVING FROM RADIANCE NAILS & SPA! ❤️',
+    'Dear Valued Clients,',
+    'Please be advised that our salon will be CLOSED on Thursday, November 26, 2026.'
+  ].join('\n');
+  const ticket = parsed(text, 2928);
+  assert.equal(ticket.start, null);
+  assert.equal(ticket.startDate, null);
+  assert.equal(ticket.expiry, '11/26/2026');
+  assert.equal(ticket.expiryDate, '2026-11-26');
+});
+
+test('normalizes named month dates without year to the current calendar year', () => {
+  const currentYear = new Date().getUTCFullYear();
+  assert.equal(normalizeExpiry('November 26'), `${currentYear}-11-26`);
+  assert.equal(normalizeExpiry('26 Nov'), `${currentYear}-11-26`);
 });
 
 test('keeps two staged ticket posters as distinct popup entries with the shared schedule', () => {

@@ -131,6 +131,23 @@ function explicitRemoveAllRequested(text) {
   return false;
 }
 
+function hasIndefiniteScheduleInstruction(text) {
+  const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim().toLowerCase();
+  if (!folded) return false;
+
+  const patterns = [
+    /\b(?:den|toi|cho\s+den|cho\s+toi|chay\s+den)\s+(?:khi|nao|luc)?\s*(?:khach|client|customer)\s*(?:bao|yeu\s*cau\s*)?(?:tat|go|stop|remove|turn\s*off)\b/i,
+    /\b(?:khi\s*nao|chung\s*nao)\s+(?:khach|client|customer)\s*(?:bao|yeu\s*cau\s*)?(?:tat|go|stop|remove|turn\s*off)\b/i,
+    /\b(?:den|cho\s+den)\s+khi\s+co\s+thong\s*bao\s+moi\b/i,
+    /\b(?:khong\s+(?:co\s+)?(?:han|ngay\s*(?:het\s*han|ket\s*thuc))|khong\s*(?:set|cai|de)\s*han)\b/i,
+    /\bchay\s+(?:lien\s*tuc|vo\s+thoi\s+han)\b/i,
+    /\buntil\s+(?:client|customer)\s+(?:asks?\s+to\s+)?(?:turn\s*off|remove|stop)\b/i,
+    /\b(?:no\s+exp(?:iry|iration)?|no\s+end\s*date|indefinite|run\s+continuously)\b/i
+  ];
+
+  return patterns.some((pattern) => pattern.test(folded));
+}
+
 function hasMultiPosterIntent(text) {
   const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim();
   if (!folded) return false;
@@ -220,6 +237,16 @@ function normalizeExpiry(raw) {
   if (namedReverse && MONTH_NUMBERS[namedReverse[2].toLowerCase()]) {
     return calendarDate(Number(namedReverse[3]), MONTH_NUMBERS[namedReverse[2].toLowerCase()], Number(namedReverse[1]));
   }
+  const namedWithoutYear = raw.match(/\b([a-z]+)\s+(\d{1,2})\b/i);
+  if (namedWithoutYear && MONTH_NUMBERS[namedWithoutYear[1].toLowerCase()]) {
+    const year = new Date().getUTCFullYear();
+    return calendarDate(year, MONTH_NUMBERS[namedWithoutYear[1].toLowerCase()], Number(namedWithoutYear[2]));
+  }
+  const namedReverseWithoutYear = raw.match(/\b(\d{1,2})\s+([a-z]+)\b/i);
+  if (namedReverseWithoutYear && MONTH_NUMBERS[namedReverseWithoutYear[2].toLowerCase()]) {
+    const year = new Date().getUTCFullYear();
+    return calendarDate(year, MONTH_NUMBERS[namedReverseWithoutYear[2].toLowerCase()], Number(namedReverseWithoutYear[1]));
+  }
   const mmdd = raw.match(/\b(\d{1,2})[/.](\d{1,2})\b/);
   if (mmdd) {
     const first = Number(mmdd[1]);
@@ -243,6 +270,10 @@ function findTicketDate(text, labelPatterns, stopLabelPatterns = []) {
       const tail = folded.slice(marker.index + marker[0].length, marker.index + marker[0].length + 120);
       const date = new RegExp(DATE_TOKEN_SOURCE, 'i').exec(tail);
       if (!date) continue;
+      // Date must be directly associated with the label, not arbitrary text in a subsequent clause
+      if (date.index > 40) continue;
+      const intervening = tail.slice(0, date.index);
+      if (/[.!?;]/.test(intervening)) continue;
       const stopBeforeDate = stopLabelPatterns.some((stopPattern) => {
         const stop = new RegExp(stopPattern, 'i').exec(tail);
         return stop && stop.index < date.index;
@@ -348,20 +379,25 @@ function ticketData(body, ticketUrl) {
     /(?:website|site|project)\s*(?:id|#)\s*[:#-]?\s*(\d{2,})/i,
     /(?:id\s*(?:website|site|project))\s*[:#-]?\s*(\d{2,})/i
   ].map((rule) => text.match(rule)?.[1]).find(Boolean) || null;
-  const expiry = /(?:exp(?:iry|iration)?|expires?|end\s*date)\s*[:\-]?\s*([^|\n]{3,50})/i.exec(text)?.[1]?.trim() || null;
-  const start = findTicketDate(text, [
-    String.raw`\b(?:time\s*start|start\s*(?:date|time)?|popup\s*start|ngay\s*(?:bat\s*dau|dang|hien)|thoi\s*gian\s*(?:bat\s*dau|hien)|tu\s+ngay|from)\b`
+  const isIndefinite = hasIndefiniteScheduleInstruction(raw);
+  const expiry = isIndefinite ? null : (/(?:exp(?:iry|iration)?|expires?|end\s*date)\s*[:\-]?\s*([^|\n]{3,50})/i.exec(text)?.[1]?.trim() || null);
+  const fromPattern = String.raw`\bfrom\s*(?:date|time)?\s*[:=-]|\bfrom\s+(?:date|time)\b|\bfrom(?=\s+(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s*)?(?:${DATE_TOKEN_SOURCE}))`;
+  const start = isIndefinite ? null : findTicketDate(text, [
+    String.raw`\b(?:time\s*start|start\s*(?:date|time)?|popup\s*start|ngay\s*(?:bat\s*dau|dang|hien)|thoi\s*gian\s*(?:bat\s*dau|hien)|tu\s+ngay)\b`,
+    fromPattern
   ], [String.raw`\b(?:time\s*end|end\s*(?:date|time)?|exp(?:iry|iration)?|expires?|ngay\s*(?:het\s*han|ket\s*thuc)|den\s*(?:het|ngay)|toi\s*het|until)\b`]);
-  const parsedExpiry = findTicketDate(text, [
+  const parsedExpiry = isIndefinite ? null : (findTicketDate(text, [
     String.raw`\b(?:time\s*end|end\s*(?:date|time)?|exp(?:iry|iration)?|expires?|popup\s*(?:end|expiry)|ngay\s*(?:het\s*han|ket\s*thuc)|thoi\s*gian\s*(?:het\s*han|ket\s*thuc)|den\s*(?:het|ngay)|toi\s*het|until|through|schedule\s*(?:go|remove|end)|lich\s*go|hen\s*(?:gio\s*)?go|go\s*(?:pop\s*up\s*)?vao(?:\s+cuoi)?\s*ngay|remove(?:\s+popup)?\s+on)\b`
-  ]) || expiry;
-  const range = popupRangeFromText(text);
+  ]) || expiry);
+  const range = isIndefinite ? null : popupRangeFromText(text);
   const popupStart = range?.start || start;
-  const inferredMonthEnd = endOfMonthExpiryFromTicket(text);
+  const inferredMonthEnd = isIndefinite ? null : endOfMonthExpiryFromTicket(text);
   const popupEnd = range?.end || parsedExpiry || inferredMonthEnd?.date || null;
   const popupStartDate = normalizeExpiry(popupStart);
   const popupEndDate = normalizeExpiry(popupEnd) || inferredMonthEnd?.date || null;
-  const rangeState = reconcilePopupRange(popupStartDate, popupEndDate, Boolean(range || (start && parsedExpiry)));
+  const rangeState = isIndefinite
+    ? { startDate: null, endDate: null, yearRolledOver: false, error: null }
+    : reconcilePopupRange(popupStartDate, popupEndDate, Boolean(range || (start && parsedExpiry)));
   // Keep ticket line/clause boundaries for action parsing. CRM headers such
   // as "Update website" must not be joined to a later popup-removal sentence.
   const folded = foldTicketText(raw);
@@ -394,15 +430,16 @@ function ticketData(body, ticketUrl) {
     startDate: popupStartDate,
     expiry: popupEnd,
     expiryDate: rangeState.endDate,
-    scheduleSource: range ? 'explicit-range' : (inferredMonthEnd ? 'ticket-month-end' : (popupStart || popupEnd ? 'labels' : null)),
-    scheduleEvidence: range?.evidence || inferredMonthEnd?.evidence || null,
+    scheduleSource: isIndefinite ? 'ticket-indefinite' : (range ? 'explicit-range' : (inferredMonthEnd ? 'ticket-month-end' : (popupStart || popupEnd ? 'labels' : null))),
+    scheduleEvidence: isIndefinite ? 'Đến khi khách tắt / Không cài hạn' : (range?.evidence || inferredMonthEnd?.evidence || null),
     endYearRolledOver: rangeState.yearRolledOver,
     scheduleError: rangeState.error,
     popupRequested,
     popupPosition,
     popupAction,
     hasInlineRemovalRequest,
-    popupLink
+    popupLink,
+    isIndefinite
   };
 }
 
@@ -430,11 +467,13 @@ function resolveRemovalScopeFromAttachments(ticket, attachmentCandidates) {
 }
 
 function popupScheduleFromTicket(ticket, expiryOverride = null) {
-  const startDate = ticket?.startDate || null;
-  const endDate = expiryOverride || ticket?.expiryDate || null;
+  const isIndefinite = Boolean(ticket?.isIndefinite);
+  const startDate = isIndefinite ? null : (ticket?.startDate || null);
+  const endDate = isIndefinite ? null : (expiryOverride || ticket?.expiryDate || null);
   return {
     start: startDate ? { date: startDate } : null,
-    end: endDate ? { date: endDate } : null
+    end: endDate ? { date: endDate } : null,
+    isIndefinite
   };
 }
 
@@ -448,6 +487,7 @@ module.exports = {
   hasAffirmativePopupReplace,
   explicitRemoveAllRequested,
   hasMultiPosterIntent,
+  hasIndefiniteScheduleInstruction,
   requestedPopupPosition,
   normalizeExpiry,
   findTicketDate,

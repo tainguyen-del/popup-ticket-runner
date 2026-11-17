@@ -822,19 +822,21 @@ function mergeSemanticTicket(baseTicket, semantic, ticketText, model = DEFAULT_G
     audit.warnings.push('Gemini siteId conflicts with the ticket header.');
   }
 
-  const semanticStart = validIsoDate(semantic.startDate) ? semantic.startDate : null;
-  const semanticEnd = validIsoDate(semantic.endDate) ? semantic.endDate : null;
-  applyMissing('startDate', semanticStart, 'startDate', dateEvidenceLooksRelevant);
-  applyMissing('expiryDate', semanticEnd, 'endDate', dateEvidenceLooksRelevant);
-  if (!ticket.start && ticket.startDate) ticket.start = ticket.startDate;
-  if (!ticket.expiry && ticket.expiryDate) ticket.expiry = ticket.expiryDate;
-  if (ticket.startDate && ticket.expiryDate && ticket.expiryDate < ticket.startDate) {
-    if (audit.appliedFields.includes('expiryDate')) {
-      ticket.expiryDate = baseTicket.expiryDate || null;
-      ticket.expiry = baseTicket.expiry || null;
-      audit.appliedFields = audit.appliedFields.filter((field) => field !== 'expiryDate');
+  if (!ticket.isIndefinite) {
+    const semanticStart = validIsoDate(semantic.startDate) ? semantic.startDate : null;
+    const semanticEnd = validIsoDate(semantic.endDate) ? semantic.endDate : null;
+    applyMissing('startDate', semanticStart, 'startDate', dateEvidenceLooksRelevant);
+    applyMissing('expiryDate', semanticEnd, 'endDate', dateEvidenceLooksRelevant);
+    if (!ticket.start && ticket.startDate) ticket.start = ticket.startDate;
+    if (!ticket.expiry && ticket.expiryDate) ticket.expiry = ticket.expiryDate;
+    if (ticket.startDate && ticket.expiryDate && ticket.expiryDate < ticket.startDate) {
+      if (audit.appliedFields.includes('expiryDate')) {
+        ticket.expiryDate = baseTicket.expiryDate || null;
+        ticket.expiry = baseTicket.expiry || null;
+        audit.appliedFields = audit.appliedFields.filter((field) => field !== 'expiryDate');
+      }
+      audit.warnings.push('Gemini dates form an invalid reversed range.');
     }
-    audit.warnings.push('Gemini dates form an invalid reversed range.');
   }
 
   if (ticket.popupAction === 'create' && semantic.operation === 'replace' && canUseEvidence('operation', replaceEvidenceIsExplicit)) {

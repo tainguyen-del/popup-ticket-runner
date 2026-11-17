@@ -96,6 +96,8 @@ const stages = [
   ['build-confirm', 'Xác nhận Build'],
   ['build-wait', 'Chờ CMS Build hoàn tất'],
   ['build-progress', 'CMS đang Build'],
+  ['cms-status-check', 'Đang kiểm tra trạng thái cuối cùng của CMS'],
+  ['cms-status-verified', 'Đã xác nhận trạng thái cuối cùng của CMS'],
   ['build-complete', 'Popup đã lên website'],
   ['complete', 'Hoàn tất']
 ];
@@ -650,6 +652,10 @@ function renderResult(result) {
   if (result.build) {
     field('CMS Build', result.build.status === 'success' ? 'Thành công' : result.build.status || 'Chưa xác nhận');
     if (result.build.evidence) field('Xác nhận từ CMS', result.build.evidence);
+  }
+  if (result.cmsStatus || result.build?.cmsStatus) {
+    const cs = result.cmsStatus || result.build.cmsStatus;
+    field('Trạng thái CMS cuối cùng', cs.summary || cs.statusBuildLabel || 'Đã kiểm tra');
   }
   if (result.website) {
     const websiteUrl = result.website.liveUrl || result.website.previewUrl || null;

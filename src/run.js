@@ -117,11 +117,13 @@ function popupTicketEntriesFromDownloads(downloadedAttachments, schedule, poster
     }
     seenCandidates.add(candidateIndex);
     if (attachment.sha256) seenHashes.add(attachment.sha256);
-    const artworkSchedule = artworkSchedules.get(candidateIndex) || null;
+    const isIndefinite = Boolean(schedule?.isIndefinite);
+    const artworkSchedule = !isIndefinite ? (artworkSchedules.get(candidateIndex) || null) : null;
     // Ticket/comment dates and the explicit CLI expiry override are stronger
-    // evidence than poster OCR. Fall back to the validated artwork schedule
-    // independently for each missing field, so two posters can have different
-    // validity windows without sharing dates accidentally.
+    // evidence than poster OCR. When the ticket requests an indefinite / open-ended schedule
+    // ("đến khi khách tắt"), poster OCR must not invent dates. Otherwise, fall back to
+    // the validated artwork schedule independently for each missing field, so two posters
+    // can have different validity windows without sharing dates accidentally.
     const startDate = schedule?.start?.date || artworkSchedule?.startDate || null;
     const endDate = schedule?.end?.date || artworkSchedule?.endDate || null;
     entries.push({
@@ -1953,8 +1955,19 @@ async function configurePopupListItem(page, imagePath, schedule, timezone, { for
   // calendar date: only a date written in the ticket is allowed to populate
   // Time start. The blank-card assertion above happens first so a stale
   // editor can never alter a legacy popup's dates.
-  const start = schedule?.start ? await setPopupStart(page, schedule.start, timezone) : null;
-  const end = schedule?.end ? await setPopupExpiry(page, schedule.end) : null;
+  let start = null;
+  if (schedule?.start) {
+    start = await setPopupStart(page, schedule.start, timezone);
+  } else if (schedule?.isIndefinite || isReplacement) {
+    await clearPopupStartDate(page).catch(() => {});
+  }
+
+  let end = null;
+  if (schedule?.end) {
+    end = await setPopupExpiry(page, schedule.end);
+  } else if (schedule?.isIndefinite || isReplacement) {
+    await clearPopupEndDate(page).catch(() => {});
+  }
   await imageInput.setInputFiles(imagePath);
   await page.waitForFunction((before) => {
     const labels = [...document.querySelectorAll('label')].filter((label) => {
@@ -2223,16 +2236,32 @@ async function openConfiguredPopupListItem(page, imageUrl = null) {
   await openPopupListCard(page, targetIndex, 'Configured popup item');
 }
 
-async function clearPopupStartDate(page) {
-  const { control, id } = await controlForLabel(page, 'Time start (optional)', true);
+async function clearPopupDateControl(page, labelText) {
+  const controlInfo = await controlForLabel(page, labelText, false).catch(() => null);
+  if (!controlInfo) return false;
+  const { control, id } = controlInfo;
   const existing = await control.inputValue().catch(() => '');
   if (!existing) return false;
   await control.click();
-  const calendar = await popupCalendar(page);
-  const clear = await visibleMatch(calendar.getByText('Clear', { exact: true }), 'Popup start Clear control', true);
-  await clear.click();
-  await page.waitForFunction((fieldId) => !(document.getElementById(fieldId)?.value || '').trim(), id, { timeout: 5000 });
+  const calendar = await popupCalendar(page).catch(() => null);
+  if (calendar) {
+    const clear = await visibleMatch(calendar.getByText('Clear', { exact: true }), `${labelText} Clear control`, false).catch(() => null);
+    if (clear) await clear.click().catch(() => {});
+  }
+  const stillHasValue = await control.inputValue().catch(() => '');
+  if (stillHasValue) {
+    await control.fill('').catch(() => {});
+  }
+  await page.waitForFunction((fieldId) => !(document.getElementById(fieldId)?.value || '').trim(), id, { timeout: 3000 }).catch(() => {});
   return true;
+}
+
+async function clearPopupStartDate(page) {
+  return clearPopupDateControl(page, 'Time start (optional)');
+}
+
+async function clearPopupEndDate(page) {
+  return clearPopupDateControl(page, 'Time end (optional)');
 }
 
 async function deletePopupItemAtIndex(page, targetIndex, expectedRemaining, description = 'Popup item') {
@@ -2471,12 +2500,18 @@ async function configurePopup(page, imagePath, schedule, timezone, {
   if (duplicateTargetIndex >= 0 && duplicateMatch) {
     const targetItem = before.items[duplicateTargetIndex];
     const ticketEntry = normalizedTicketEntries.find((t) => t.ticketIndex === duplicateMatch.ticketIndex) || normalizedTicketEntries[0];
-    const targetSchedule = {
-      start: ticketEntry?.schedule?.start || (targetItem?.time_start ? { date: popupDateFromCmsValue(targetItem.time_start, timezone) } : null),
-      end: ticketEntry?.schedule?.end || (targetItem?.time_end ? { date: popupDateFromCmsValue(targetItem.time_end, timezone) } : null)
-    };
+    const isIndefinite = Boolean(ticketEntry?.schedule?.isIndefinite);
+    const targetSchedule = isIndefinite
+      ? { start: null, end: null, isIndefinite: true }
+      : {
+          start: ticketEntry?.schedule?.start || (targetItem?.time_start ? { date: popupDateFromCmsValue(targetItem.time_start, timezone) } : null),
+          end: ticketEntry?.schedule?.end || (targetItem?.time_end ? { date: popupDateFromCmsValue(targetItem.time_end, timezone) } : null)
+        };
     if (ticketEntry) ticketEntry.schedule = targetSchedule;
-    progress('popup-replace', `Thay thế poster vào block hiện có tại vị trí #${duplicateTargetIndex + 1} (giữ nguyên lịch hiển thị cũ nếu ticket không đổi)`);
+    progress('popup-replace', isIndefinite
+      ? `Thay thế poster vào block hiện có tại vị trí #${duplicateTargetIndex + 1} (xóa lịch cũ, hiển thị ngay đến khi khách tắt)`
+      : `Thay thế poster vào block hiện có tại vị trí #${duplicateTargetIndex + 1} (giữ nguyên lịch hiển thị cũ nếu ticket không đổi)`
+    );
     const configured = await configurePopupListItem(
       page,
       ticketEntry.uploadPath || ticketEntry.path || ticketEntry.imagePath,
@@ -2683,17 +2718,20 @@ function readBuildState(text, baseline = '') {
   const current = String(text || '').replace(/\s+/g, ' ').trim();
   const before = String(baseline || '').replace(/\s+/g, ' ').trim();
   const values = [...current.matchAll(/\b(\d{1,3})\s*%/g)].map((match) => Number(match[1])).filter((value) => value >= 0 && value <= 100);
-  const success = current.match(/(?:build|publish|deploy).{0,100}(?:success(?:ful(?:ly)?)?|completed|complete|finished)|(?:success(?:ful(?:ly)?)?|completed|complete|finished).{0,100}(?:build|publish|deploy)|(?:build|xuất bản).{0,100}thành công|thành công.{0,100}(?:build|xuất bản)/i)?.[0] || null;
-  const failure = current.match(/(?:build|publish|deploy).{0,100}(?:failed|failure|error|cancelled|canceled)|(?:failed|failure|error|cancelled|canceled).{0,100}(?:build|publish|deploy)|(?:build|xuất bản).{0,100}(?:lỗi|thất bại)|(?:lỗi|thất bại).{0,100}(?:build|xuất bản)/i)?.[0] || null;
+  const highestPercent = values.length ? Math.max(...values) : null;
+  const isActivelyBuilding = (highestPercent === null || highestPercent < 100) && /\b(?:building|deploying|publishing|(?:dang|đang)\s*build)\b/i.test(current);
+  const successMatch = current.match(/\b(?:build|publish|deploy|(?:xuat|xuất)\s*(?:ban|bản))\s*(?:is\s*)?(?:success(?:ful(?:ly)?)?|completed|complete|finished|(?:thanh|thành)\s*(?:cong|công))\b|\b(?:success(?:ful(?:ly)?)?|completed|complete|(?:thanh|thành)\s*(?:cong|công))\s*(?:build|publish|deploy|(?:xuat|xuất)\s*(?:ban|bản))\b/i)?.[0] || null;
+  const failure = current.match(/(?:build|publish|deploy).{0,100}(?:failed|failure|error|cancelled|canceled)|(?:failed|failure|error|cancelled|canceled).{0,100}(?:build|publish|deploy)|(?:build|(?:xuat|xuất)\s*(?:ban|bản)).{0,100}(?:(?:loi|lỗi)|(?:that|thất)\s*(?:bai|bại))|(?:(?:loi|lỗi)|(?:that|thất)\s*(?:bai|bại)).{0,100}(?:build|(?:xuat|xuất)\s*(?:ban|bản))/i)?.[0] || null;
   return {
-    percent: values.length ? Math.max(...values) : null,
-    success: success && !before.toLowerCase().includes(success.toLowerCase()) ? success : null,
+    percent: highestPercent,
+    isActivelyBuilding,
+    success: (!isActivelyBuilding && successMatch && !before.toLowerCase().includes(successMatch.toLowerCase())) ? successMatch : null,
     failure: failure && !before.toLowerCase().includes(failure.toLowerCase()) ? failure : null
   };
 }
 
 async function readCmsBuildStatus(page, projectId) {
-  if (!projectId) return { ok: false, statusBuild: null, logIdLast: null };
+  if (!projectId) return { ok: false, statusBuild: null, logIdLast: null, projectStatus: null, domain: null, name: null };
   try {
     // Use the already-authenticated CMS page to ask its authoritative project
     // endpoint. The token stays inside the browser context and is never logged.
@@ -2710,15 +2748,84 @@ async function readCmsBuildStatus(page, projectId) {
       return {
         ok: response.ok && project !== null,
         statusBuild: project?.status_build ?? null,
-        logIdLast: project?.log_id_last ?? project?.logIdLast ?? null
+        logIdLast: project?.log_id_last ?? project?.logIdLast ?? null,
+        projectStatus: project?.status ?? project?.status_text ?? null,
+        domain: project?.domain || project?.custom_domain || null,
+        name: project?.name || null
       };
     }, projectId);
   } catch {
-    return { ok: false, statusBuild: null, logIdLast: null };
+    return { ok: false, statusBuild: null, logIdLast: null, projectStatus: null, domain: null, name: null };
   }
 }
 
-async function buildWebsite(page, baseUrl) {
+async function verifyFinalCmsStatus(page, baseUrl, projectId, fallbackDomain = null, progress = () => {}) {
+  progress('cms-status-check', 'Đang kiểm tra trạng thái cuối cùng của CMS...');
+  let cmsBuild = await readCmsBuildStatus(page, projectId);
+  // If CMS build is still in progress (statusBuild = 0), wait briefly for it to settle
+  if (cmsBuild.ok && Number(cmsBuild.statusBuild) === 0) {
+    const settleDeadline = Date.now() + 30000;
+    while (Date.now() < settleDeadline) {
+      await page.waitForTimeout(2000);
+      cmsBuild = await readCmsBuildStatus(page, projectId);
+      if (Number(cmsBuild.statusBuild) !== 0) break;
+    }
+  }
+
+  const website = await websiteInfo(page, baseUrl);
+  const rawLiveUrl = website.liveUrl
+    || (cmsBuild.domain ? `https://${cmsBuild.domain.replace(/^https?:\/\//, '')}` : null)
+    || (fallbackDomain ? `https://${fallbackDomain.replace(/^https?:\/\//, '')}` : null);
+  const liveUrl = rawLiveUrl ? rawLiveUrl.replace(/\/+$/, '') : null;
+  const previewUrl = website.previewUrl ? website.previewUrl.replace(/\/+$/, '') : null;
+
+  let httpStatus = null;
+  let websiteHealthy = false;
+  const targetProbe = liveUrl || previewUrl;
+  if (targetProbe) {
+    try {
+      const probeResponse = await page.request.get(targetProbe, { timeout: 10000, ignoreHTTPSErrors: true }).catch(() => null);
+      if (probeResponse) {
+        httpStatus = probeResponse.status();
+        websiteHealthy = httpStatus >= 200 && httpStatus < 400;
+      }
+    } catch {}
+  }
+
+  const statusBuildNum = Number.isFinite(Number(cmsBuild.statusBuild)) ? Number(cmsBuild.statusBuild) : null;
+  const statusBuildLabel = statusBuildNum === 1
+    ? 'COMPLETE (Thành công)'
+    : (statusBuildNum === 0 ? 'PROCESSING (Đang chạy)' : (statusBuildNum === 2 ? 'ERROR (Lỗi)' : 'Chưa xác nhận'));
+
+  const projectStatusLabel = cmsBuild.projectStatus !== null && cmsBuild.projectStatus !== undefined
+    ? String(cmsBuild.projectStatus)
+    : 'Active';
+
+  const parts = [`Build: ${statusBuildLabel}`, `Project: ${projectStatusLabel}`];
+  if (httpStatus) {
+    parts.push(`Website: HTTP ${httpStatus} ${websiteHealthy ? 'OK' : 'Error'}`);
+  } else if (liveUrl || previewUrl) {
+    parts.push(`Website: ${liveUrl || previewUrl}`);
+  }
+  const summary = parts.join(' · ');
+
+  return {
+    ok: statusBuildNum === 1 || websiteHealthy,
+    statusBuild: statusBuildNum,
+    statusBuildLabel,
+    projectStatus: projectStatusLabel,
+    projectName: cmsBuild.name || null,
+    domain: cmsBuild.domain || fallbackDomain || null,
+    liveUrl,
+    previewUrl,
+    httpStatus,
+    websiteHealthy,
+    summary,
+    verifiedAt: new Date().toISOString()
+  };
+}
+
+async function buildWebsite(page, baseUrl, { fallbackDomain = null, progress = () => {} } = {}) {
   const projectId = baseUrl.match(/\/projects\/(\d+)/)?.[1] || null;
   const buildControl = page.getByRole('button', { name: /^Build(?:\.\.\.)?$/i });
   // The editor has the global Build action in its upper-right corner. Use it
@@ -2797,10 +2904,16 @@ async function buildWebsite(page, baseUrl) {
           throw new BuildWorkflowError('CMS Build thất bại theo trạng thái dự án.');
         }
         if (statusBuild === 1 && (sawCmsProcessing || (sawNewCmsLog && sawBuildProgress))) {
+          const cmsStatus = await verifyFinalCmsStatus(page, baseUrl, projectId, fallbackDomain, progress);
+          progress('cms-status-verified', `Xác nhận trạng thái CMS: ${cmsStatus.summary}`, cmsStatus);
           return {
-            status: 'success',
-            website: await websiteInfo(page, baseUrl),
-            evidence: 'CMS reported status_build=COMPLETE.',
+            status: cmsStatus.statusBuild === 2 ? 'failed' : (cmsStatus.ok ? 'success' : 'unconfirmed'),
+            website: {
+              liveUrl: cmsStatus.liveUrl,
+              previewUrl: cmsStatus.previewUrl
+            },
+            cmsStatus,
+            evidence: `Trạng thái CMS: ${cmsStatus.summary}`,
             completedAt: new Date().toISOString(),
             progress: highest >= 0 ? highest : null
           };
@@ -2812,21 +2925,32 @@ async function buildWebsite(page, baseUrl) {
     // Either newly-observed completion signal is sufficient after Build began.
     const completed = Boolean(state.success) || (sawBuildProgress && highest >= 100);
     if (completed) {
+      const cmsStatus = await verifyFinalCmsStatus(page, baseUrl, projectId, fallbackDomain, progress);
+      progress('cms-status-verified', `Xác nhận trạng thái CMS: ${cmsStatus.summary}`, cmsStatus);
       return {
-        status: 'success',
-        website: await websiteInfo(page, baseUrl),
-        evidence: state.success || 'CMS reported 100% Build progress.',
+        status: cmsStatus.statusBuild === 2 ? 'failed' : (cmsStatus.ok ? 'success' : 'unconfirmed'),
+        website: {
+          liveUrl: cmsStatus.liveUrl,
+          previewUrl: cmsStatus.previewUrl
+        },
+        cmsStatus,
+        evidence: `Trạng thái CMS: ${cmsStatus.summary}`,
         completedAt: new Date().toISOString(),
         progress: highest
       };
     }
     await page.waitForTimeout(1000);
   }
+  const cmsStatus = await verifyFinalCmsStatus(page, baseUrl, projectId, fallbackDomain, progress);
   return {
-    status: 'unconfirmed',
-    website: await websiteInfo(page, baseUrl),
-    evidence: null,
-    completedAt: null,
+    status: cmsStatus.statusBuild === 1 ? 'success' : 'unconfirmed',
+    website: {
+      liveUrl: cmsStatus.liveUrl,
+      previewUrl: cmsStatus.previewUrl
+    },
+    cmsStatus,
+    evidence: `Trạng thái CMS: ${cmsStatus.summary}`,
+    completedAt: cmsStatus.statusBuild === 1 ? new Date().toISOString() : null,
     progress: highest >= 0 ? highest : null
   };
 }
@@ -3432,19 +3556,24 @@ async function main() {
                 plan.nextAction = 'No configured popup existed to remove. CMS Build was not started because no CMS change was needed.';
               } else if (buildRequested) {
                 progress('build-start', 'Starting CMS Build after verified popup removal');
-                plan.build = await buildWebsite(page, baseUrl);
+                plan.build = await buildWebsite(page, baseUrl, {
+                  fallbackDomain: plan.cms?.selectedDomain || null,
+                  progress
+                });
                 plan.website = plan.build.website;
+                plan.cmsStatus = plan.build.cmsStatus || null;
                 if (plan.build.status === 'success') {
                   const websiteUrl = plan.website.liveUrl || plan.website.previewUrl || null;
                   plan.status = 'popup-removed';
+                  const statusNote = plan.cmsStatus?.summary ? ` · [${plan.cmsStatus.summary}]` : '';
                   plan.nextAction = websiteUrl
-                    ? `Popup removal completed successfully on website: ${websiteUrl}`
-                    : 'Popup removal completed successfully; CMS Build confirmed completion.';
-                  progress('build-complete', plan.nextAction, { websiteUrl });
+                    ? `Popup removal completed successfully on website: ${websiteUrl}${statusNote}`
+                    : `Popup removal completed successfully; CMS confirmed: ${plan.cmsStatus?.summary || 'Build COMPLETE'}`;
+                  progress('build-complete', plan.nextAction, { websiteUrl, cmsStatus: plan.cmsStatus });
                 } else {
                   plan.status = 'build-unconfirmed';
                   plan.nextAction = 'Popup removal was verified and CMS Build was started, but completion was not observed. Check CMS before declaring it live.';
-                  progress('build-unconfirmed', plan.nextAction, { websiteUrl: plan.website.liveUrl || plan.website.previewUrl || null });
+                  progress('build-unconfirmed', plan.nextAction, { websiteUrl: plan.website.liveUrl || plan.website.previewUrl || null, cmsStatus: plan.cmsStatus });
                 }
               } else {
                 plan.status = 'popup-removal-awaiting-build';
@@ -3755,21 +3884,26 @@ async function main() {
             await page.screenshot({ path: path.join(runDir, 'popup-settings.png'), fullPage: true });
             if (buildRequested) {
               progress('build-start', 'Đang bắt đầu Build website');
-              plan.build = await buildWebsite(page, baseUrl);
+              plan.build = await buildWebsite(page, baseUrl, {
+                fallbackDomain: plan.cms?.selectedDomain || null,
+                progress
+              });
               plan.website = plan.build.website;
+              plan.cmsStatus = plan.build.cmsStatus || null;
               if (plan.build.status === 'success') {
                 const websiteUrl = plan.website.liveUrl || plan.website.previewUrl || null;
                 plan.popup.published = true;
                 plan.status = 'popup-live';
+                const statusNote = plan.cmsStatus?.summary ? ` · [${plan.cmsStatus.summary}]` : '';
                 plan.nextAction = websiteUrl
-                  ? `Popup thành công trên website: ${websiteUrl}`
-                  : 'Popup thành công. CMS Build đã xác nhận hoàn tất nhưng không tìm thấy Live URL.';
-                progress('build-complete', plan.nextAction, { websiteUrl });
-                console.log(`Popup thành công: ${websiteUrl || 'CMS Build confirmed; Live URL unavailable'}`);
+                  ? `Popup thành công trên website: ${websiteUrl}${statusNote}`
+                  : `Popup thành công. Trạng thái CMS: ${plan.cmsStatus?.summary || 'Build COMPLETE'}`;
+                progress('build-complete', plan.nextAction, { websiteUrl, cmsStatus: plan.cmsStatus });
+                console.log(`Popup thành công: ${websiteUrl || 'CMS Build confirmed'} ${statusNote}`);
               } else {
                 plan.status = 'build-unconfirmed';
                 plan.nextAction = 'Popup settings were configured and CMS Build was started, but the tool did not observe a completion signal. Check CMS before declaring the popup live.';
-                progress('build-unconfirmed', plan.nextAction, { websiteUrl: plan.website.liveUrl || plan.website.previewUrl || null });
+                progress('build-unconfirmed', plan.nextAction, { websiteUrl: plan.website.liveUrl || plan.website.previewUrl || null, cmsStatus: plan.cmsStatus });
               }
             } else {
               plan.status = 'awaiting-build-approval';
@@ -3862,5 +3996,8 @@ module.exports = {
   repairWrappedJson,
   resolveTimezoneFromData,
   recoverInterruptedLegacyMigration,
-  setPopupImageLink
+  setPopupImageLink,
+  readBuildState,
+  readCmsBuildStatus,
+  verifyFinalCmsStatus
 };
