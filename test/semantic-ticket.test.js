@@ -464,6 +464,37 @@ test('poster artwork schedules accept promotional date ranges such as NOV 16 - D
   assert.equal(result.warnings.length, 0);
 });
 
+test('poster artwork schedules accept standard expiration evidence like EXP: 11/30/26, EXP. 11/30/2026, Expires, and Good Thru', () => {
+  const candidates = [{ index: 1 }, { index: 2 }];
+  const result = posterSchedulesFromResponse([
+    {
+      attachmentIndex: 1,
+      startDate: null,
+      endDate: '2026-11-30',
+      evidence: 'EXP: 11/30/26',
+      confidence: 0.95
+    },
+    {
+      attachmentIndex: 2,
+      startDate: null,
+      endDate: '2026-12-31',
+      evidence: 'EXP. 12/31/2026',
+      confidence: 0.92
+    }
+  ], candidates, [1, 2]);
+
+  assert.deepEqual(result.schedules.map(({ attachmentIndex, startDate, endDate, evidence }) => ({
+    attachmentIndex,
+    startDate,
+    endDate,
+    evidence
+  })), [
+    { attachmentIndex: 1, startDate: null, endDate: '2026-11-30', evidence: 'EXP: 11/30/26' },
+    { attachmentIndex: 2, startDate: null, endDate: '2026-12-31', evidence: 'EXP. 12/31/2026' }
+  ]);
+  assert.equal(result.warnings.length, 0);
+});
+
 test('Gemini Vision refuses an incomplete or duplicate multi-poster set', async () => {
   const candidates = [
     { index: 1, filename: 'first.png', mimeType: 'image/png', base64: 'MQ==' },

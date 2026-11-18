@@ -80,7 +80,13 @@ test('creates an isolated browser context and loads storage state only when requ
         channel: 'chrome',
         headless: false,
         ignoreDefaultArgs: ['--no-startup-window'],
-        args: ['--new-window', '--start-maximized']
+        args: [
+          '--new-window',
+          '--start-maximized',
+          '--disable-background-timer-throttling',
+          '--disable-backgrounding-occluded-windows',
+          '--disable-renderer-backgrounding'
+        ]
       });
       assert.equal(contextOptions.storageState, statePath);
       assert.equal(contextOptions.acceptDownloads, true);
@@ -121,7 +127,13 @@ test('reopens the verified app-owned login profile visibly for a ticket run', as
         headless: false,
         acceptDownloads: true,
         viewport: null,
-        args: ['--new-window', '--start-maximized']
+        args: [
+          '--new-window',
+          '--start-maximized',
+          '--disable-background-timer-throttling',
+          '--disable-backgrounding-occluded-windows',
+          '--disable-renderer-backgrounding'
+        ]
       });
       await closeToolBrowser(launched);
       assert.equal(contextClosed, true);
@@ -168,7 +180,13 @@ test('opens login in a visible temporary persistent Chrome profile', async () =>
       headless: false,
       acceptDownloads: false,
       viewport: null,
-      args: ['--new-window', '--start-maximized']
+      args: [
+        '--new-window',
+        '--start-maximized',
+        '--disable-background-timer-throttling',
+        '--disable-backgrounding-occluded-windows',
+        '--disable-renderer-backgrounding'
+      ]
     });
     await closeToolBrowser({ ...launched, cleanupProfile: true });
     assert.equal(contextClosed, true);

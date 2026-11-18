@@ -28,6 +28,10 @@ test('recognizes a Website ID header separately from the CRM ticket number', () 
 
 test('accepts only CRM storage object images as inline ticket attachments', () => {
   assert.equal(isInlineTicketImageUrl('https://storage.fastboy.dev/crm/storage_objects/im/poster.png'), true);
+  assert.equal(isInlineTicketImageUrl('https://storage.fastboy.dev/crm/storage_objects/an/anh-man-hinh.png'), true);
+  assert.equal(isInlineTicketImageUrl('https://storage.fastboy.dev/crm/storage_objects/16/1611-16714.png'), true);
+  assert.equal(isInlineTicketImageUrl('https://storage.fastboy.dev/crm/storage_objects/c3/test.png'), true);
+  assert.equal(isInlineTicketImageUrl('https://storage.fastboy.dev/crm/storage_objects/av/avatar.png'), false);
   assert.equal(isInlineTicketImageUrl('https://storage.fastboy.dev/avatar/user.png'), false);
   assert.equal(isInlineTicketImageUrl('https://example.com/crm/storage_objects/im/poster.png'), false);
 });

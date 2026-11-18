@@ -430,7 +430,7 @@ async function savePlaywrightDownload(download, assetDir) {
 async function clickAndSaveDownload(page, button, assetDir) {
   const pendingDownload = page.waitForEvent('download', { timeout: 10000 });
   try {
-    await button.click({ force: true });
+    await button.evaluate((el) => el.click()).catch(() => button.click({ force: true }));
     return await savePlaywrightDownload(await pendingDownload, assetDir);
   } catch (error) {
     pendingDownload.catch(() => {});
@@ -470,18 +470,39 @@ async function downloadTicketCandidateImages(page, ticketUrl, runDir, { expected
       const candidateDir = path.join(assetDir, String(index + 1));
       fs.mkdirSync(candidateDir, { recursive: true });
       const item = items[index];
-      let downloadPath;
-      if (item.kind === 'inline-image') {
-        downloadPath = await downloadInlineTicketImage(page, item, candidateDir, index + 1);
-      } else {
-        await item.locator.hover({ force: true, timeout: 5000 });
-        const button = await visibleMatch(item.locator.locator('button[title="Download file"]'), null, true);
-        if (!button) throw new Error(`Attachment #${index + 1} did not expose its Download file control.`);
-        downloadPath = await clickAndSaveDownload(page, button, candidateDir);
+      let downloadPath = null;
+      let downloadSource = item.kind === 'inline-image' ? 'inline-ticket-image' : 'vision-candidate-download';
+
+      const directUrl = item.sourceUrl
+        || await item.locator?.evaluate((card) => {
+          const link = card.querySelector('a.ant-upload-list-item-thumbnail, a[href*="storage.fastboy.dev"], a.ant-upload-list-item-name');
+          if (link && link.href) return link.href;
+          const img = card.querySelector('img[src*="storage.fastboy.dev"]');
+          return img?.currentSrc || img?.src || null;
+        }).catch(() => null);
+
+      if (directUrl && isInlineTicketImageUrl(directUrl)) {
+        try {
+          downloadPath = await downloadInlineTicketImage(page, { ...item, sourceUrl: directUrl }, candidateDir, index + 1);
+          downloadSource = item.kind === 'inline-image' ? 'inline-ticket-image' : 'direct-url-candidate-download';
+        } catch {
+          downloadPath = null;
+        }
+      }
+
+      if (!downloadPath) {
+        if (item.kind === 'inline-image') {
+          downloadPath = await downloadInlineTicketImage(page, item, candidateDir, index + 1);
+        } else {
+          await item.locator.hover({ force: true, timeout: 5000 });
+          const button = await visibleMatch(item.locator.locator('button[title="Download file"]'), null, true);
+          if (!button) throw new Error(`Attachment #${index + 1} did not expose its Download file control.`);
+          downloadPath = await clickAndSaveDownload(page, button, candidateDir);
+        }
       }
       downloads.push({
         ...validateDownloadedImage(downloadPath),
-        source: item.kind === 'inline-image' ? 'inline-ticket-image' : 'vision-candidate-download',
+        source: downloadSource,
         candidateIndex: index + 1
       });
     }
@@ -525,7 +546,23 @@ async function downloadTicketImage(page, ticketUrl, runDir, {
     let downloadSource = 'all-attachments';
     let individualDownloadError = null;
     if (selectedItem) {
-      if (selectedItem.kind === 'inline-image') {
+      const directUrl = selectedItem.sourceUrl
+        || await selectedItem.locator?.evaluate((card) => {
+          const link = card.querySelector('a.ant-upload-list-item-thumbnail, a[href*="storage.fastboy.dev"], a.ant-upload-list-item-name');
+          if (link && link.href) return link.href;
+          const img = card.querySelector('img[src*="storage.fastboy.dev"]');
+          return img?.currentSrc || img?.src || null;
+        }).catch(() => null);
+
+      if (directUrl && isInlineTicketImageUrl(directUrl)) {
+        try {
+          progress('attachment-direct-download', 'Downloading ticket attachment directly from storage');
+          downloadPath = await downloadInlineTicketImage(page, { ...selectedItem, sourceUrl: directUrl }, assetDir, selectedIndex);
+          downloadSource = 'direct-url';
+        } catch (error) {
+          individualDownloadError = error;
+        }
+      } else if (selectedItem.kind === 'inline-image') {
         // Rich-text CRM posts render their attachment as a full inline image
         // instead of a hover card. Fetch it through the authenticated browser
         // context, validate it locally, and never pass the CRM URL to CMS.
@@ -568,7 +605,7 @@ async function downloadTicketImage(page, ticketUrl, runDir, {
         throw new Error(`CRM did not create a poster download.${individualDetail} Download all attachments also failed: ${archiveError.message}`);
       }
     }
-    if (downloadSource === 'hover-file') return { ...validateDownloadedImage(downloadPath), source: downloadSource, candidateIndex: selectedIndex };
+    if (downloadSource === 'hover-file' || downloadSource === 'direct-url') return { ...validateDownloadedImage(downloadPath), source: downloadSource, candidateIndex: selectedIndex };
     if (!/\.zip$/i.test(downloadPath)) return { ...validateDownloadedImage(downloadPath), source: downloadSource, candidateIndex: selectedIndex };
     execFileSync('tar', ['-xf', downloadPath, '-C', assetDir], { windowsHide: true });
     const files = imageFiles(assetDir);
@@ -3085,14 +3122,16 @@ function resolveTimezoneFromData(data) {
 }
 
 async function readProjectDataFile(page, baseUrl, filename) {
-  await page.goto(`${baseUrl}/files`, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  await page.waitForTimeout(2500);
-  const dataFolder = await waitForVisibleMatch(page.getByText('data', { exact: true }), 'data folder', true, 15000);
+  if (!page.url().startsWith(`${baseUrl}/files`)) {
+    await page.goto(`${baseUrl}/files`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+  }
+  const dataFolder = await waitForVisibleMatch(page.getByText('data', { exact: true }), 'data folder', true, 10000).catch(() => null);
+  if (!dataFolder) return null;
   await dataFolder.click();
-  const file = await waitForVisibleMatch(page.getByText(filename, { exact: true }), 'project data file', true, 10000).catch(() => null);
+  const file = await waitForVisibleMatch(page.getByText(filename, { exact: true }), 'project data file', true, 5000).catch(() => null);
   if (!file) return null;
   await file.click();
-  await page.waitForTimeout(1000);
+  await page.locator('.jsoneditor, .ace_editor, pre, code, [class*="editor"]').first().waitFor({ state: 'visible', timeout: 2500 }).catch(() => {});
   const body = await page.locator('body').innerText();
   const marker = body.lastIndexOf(filename);
   const raw = extractJsonObject(marker >= 0 ? body.slice(marker) : body);
@@ -3200,7 +3239,7 @@ async function main() {
     const ticketContext = await readFullTicketContext(page, ticketUrl);
     const body = ticketContext.text;
     fs.writeFileSync(path.join(runDir, 'ticket.txt'), body, 'utf8');
-    await page.screenshot({ path: path.join(runDir, 'ticket.png'), fullPage: true });
+    await page.screenshot({ path: path.join(runDir, 'ticket.png'), fullPage: false });
     plan.ticketPageUrl = page.url();
     const online = await page.evaluate(() => navigator.onLine);
     const problem = browserProblem(body, online);
@@ -3477,8 +3516,8 @@ async function main() {
         await search.waitFor({ state: 'visible', timeout: 10000 });
         await search.click();
         await search.fill('');
-        await search.pressSequentially(plan.ticket.siteId, { delay: 80 });
-        await page.waitForTimeout(1500);
+        await search.pressSequentially(plan.ticket.siteId, { delay: 60 });
+        await page.waitForTimeout(400);
         progress('project-search', `Đang tìm project ${plan.ticket.siteId}`);
         const projectCandidates = await projectSearchCandidates(page, plan.ticket.siteId);
         const projectSelection = chooseProjectCandidate(projectCandidates);
@@ -3494,7 +3533,7 @@ async function main() {
           selectionMethod: projectSelection.method,
           ambiguous: projectSelection.ambiguous
         };
-        await page.screenshot({ path: path.join(runDir, 'cms-search.png'), fullPage: true });
+        await page.screenshot({ path: path.join(runDir, 'cms-search.png'), fullPage: false });
         if (!plan.cms.found) {
           plan.status = 'site-not-found';
           plan.nextAction = 'Verify the Website ID and fastboy access.';
@@ -3505,7 +3544,7 @@ async function main() {
           progress('project-open', 'Opening the matching CMS project');
           const project = page.getByText(plan.ticket.siteId, { exact: true }).nth(projectSelection.candidate.locatorIndex);
           await project.click();
-          await page.waitForTimeout(1200);
+          await page.waitForURL(/\/projects\/\d+/, { timeout: 15000 }).catch(() => page.waitForTimeout(400));
           const baseUrl = projectBaseUrl(page.url());
           plan.cms.projectId = baseUrl.match(/\/projects\/(\d+)/)?.[1] || null;
 
@@ -3513,7 +3552,7 @@ async function main() {
           await page.goto(`${baseUrl}/plugins`, { waitUntil: 'domcontentloaded', timeout: 45000 });
           await page.getByText('Plugins', { exact: true }).last().waitFor({ state: 'visible', timeout: 15000 });
           plan.plugin = await readAnnouncementPlugin(page);
-          await page.screenshot({ path: path.join(runDir, 'plugins.png'), fullPage: true });
+          await page.screenshot({ path: path.join(runDir, 'plugins.png'), fullPage: false });
 
           // CMS applies index.yml during Build, so do not inspect it here.
           plan.popupSection = { exists: null, sectionId: null, checked: false };
@@ -3550,7 +3589,7 @@ async function main() {
                 warnings: removal.warnings || []
               };
               if (removal.vision) plan.removalVision = removal.vision;
-              await page.screenshot({ path: path.join(runDir, 'popup-removal.png'), fullPage: true });
+              await page.screenshot({ path: path.join(runDir, 'popup-removal.png'), fullPage: false });
               if (!removal.changed) {
                 plan.status = 'popup-removal-noop';
                 plan.nextAction = 'No configured popup existed to remove. CMS Build was not started because no CMS change was needed.';
@@ -3881,7 +3920,7 @@ async function main() {
               error.stage = 'popup-ticket-verification';
               throw error;
             }
-            await page.screenshot({ path: path.join(runDir, 'popup-settings.png'), fullPage: true });
+            await page.screenshot({ path: path.join(runDir, 'popup-settings.png'), fullPage: false });
             if (buildRequested) {
               progress('build-start', 'Đang bắt đầu Build website');
               plan.build = await buildWebsite(page, baseUrl, {
@@ -3957,6 +3996,7 @@ if (require.main === module) {
 
 module.exports = {
   downloadTicketImage,
+  downloadTicketCandidateImages,
   validateDownloadedImage,
   cmsSafeUploadFilename,
   stageCmsUploadImage,

@@ -38,7 +38,7 @@ async function firstVisible(locator, fromEnd = false) {
 async function activeTicketTabVisible(page, ticketNumber) {
   const href = `/tickets/detail/${ticketNumber}`;
   return page.locator(`a[href="${href}"]`).evaluateAll((nodes) => {
-    const visible = (element) => Boolean(element.getClientRects().length);
+    const visible = (element) => Boolean(element.offsetWidth || element.offsetHeight || element.getClientRects().length || (window.getComputedStyle(element).display !== 'none'));
     return nodes.some((node) => visible(node) && Boolean(node.closest('.active, [aria-selected="true"], [data-active="true"]')));
   }).catch(() => false);
 }
@@ -47,6 +47,17 @@ async function activeTicketRoot(page, ticketUrl) {
   const ticketNumber = ticketNumberFromUrl(ticketUrl);
   if (!ticketNumber) return null;
   if (ticketNumberFromUrl(page.url()) !== ticketNumber) return null;
+
+  // If another tab was clicked or became active while running, restore the ticket tab
+  const tabLocator = page.locator(`a[href="/tickets/detail/${ticketNumber}"]`).first();
+  if (await tabLocator.count()) {
+    await tabLocator.evaluate((el) => {
+      if (!el.closest('.active, [aria-selected="true"], [data-active="true"]')) {
+        el.click();
+      }
+    }).catch(() => {});
+  }
+
   const marker = ticketMarkerPattern(ticketNumber);
   const candidates = page.locator(ACTIVE_TICKET_ROOT_SELECTOR);
   for (let index = 0; index < await candidates.count(); index += 1) {
@@ -90,7 +101,7 @@ async function revealTicketAttachmentArea(page, root) {
       if (node.scrollHeight > node.clientHeight + 8) node.scrollTop = node.scrollHeight;
     }
   }).catch(() => {});
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(50);
   const conversation = await firstVisible(
     root.locator('button, [role="button"]').filter({ hasText: /^\s*(?:Conversations?|Comments?)\b/i }),
     true
@@ -100,7 +111,7 @@ async function revealTicketAttachmentArea(page, root) {
   if (conversation && expanded !== 'true' && alreadyRevealed !== 'true') {
     const opened = await conversation.click({ force: true }).then(() => true).catch(() => false);
     if (opened) await conversation.evaluate((button) => button.setAttribute('data-popup-ticket-runner-revealed', 'true')).catch(() => {});
-    await page.waitForTimeout(350);
+    await page.waitForTimeout(80);
   }
   await root.evaluate((panel) => {
     const nodes = [panel, ...panel.querySelectorAll('*')];
@@ -108,7 +119,7 @@ async function revealTicketAttachmentArea(page, root) {
       if (node.scrollHeight > node.clientHeight + 8) node.scrollTop = node.scrollHeight;
     }
   }).catch(() => {});
-  await page.waitForTimeout(250);
+  await page.waitForTimeout(50);
 }
 
 async function visibleTicketAttachmentItems(root) {
@@ -128,9 +139,11 @@ function isInlineTicketImageUrl(rawUrl) {
     const url = new URL(rawUrl);
     return url.protocol === 'https:'
       && url.hostname === 'storage.fastboy.dev'
-      // Rich-text ticket images are stored under `im/`; avatars use `av/`
+      // Rich-text ticket images are stored under `im/`; upload attachments
+      // use two-letter prefixes like `an/`, `16/`, `c3/`. Avatars use `av/`
       // and must never be counted as popup attachment candidates.
-      && /^\/crm\/storage_objects\/im(?:\/|$)/i.test(url.pathname);
+      && /^\/crm\/storage_objects\//i.test(url.pathname)
+      && !/^\/crm\/storage_objects\/av(?:\/|$)/i.test(url.pathname);
   } catch {
     return false;
   }
@@ -176,7 +189,7 @@ async function visibleTicketImageCandidates(root) {
   const cardsWithUrl = [];
   for (const card of uploadCards) {
     const sourceUrl = await card.evaluate((el) => {
-      const link = el.querySelector('a.ant-upload-list-item-thumbnail, a[href*="storage.fastboy.dev"]');
+      const link = el.querySelector('a.ant-upload-list-item-thumbnail, a[href*="storage.fastboy.dev"], a.ant-upload-list-item-name');
       if (link && link.href) return link.href;
       const img = el.querySelector('img[src*="storage.fastboy.dev"]');
       return img?.currentSrc || img?.src || null;
@@ -303,19 +316,23 @@ async function waitForTicketDetails(page, ticketUrl, { timeout = 30000 } = {}) {
     ({ ticketNumber: expectedTicketNumber }) => {
       const marker = new RegExp(`(?:^|\\s|\\bID\\s*)#\\s*${expectedTicketNumber}(?=\\s|$|-)`, 'i');
       const selectors = '#fbc-ticket-detail-right, [role="tabpanel"]:not([hidden]), .ant-tabs-tabpane-active, [class*="ticket-detail"], [class*="ticket_detail"]';
-      const visible = (element) => Boolean(element.getClientRects().length);
+      const visible = (element) => Boolean(element.offsetWidth || element.offsetHeight || element.getClientRects().length || (window.getComputedStyle(element).display !== 'none'));
       const directPanelMatch = [...document.querySelectorAll(selectors)]
         .some((element) => visible(element) && marker.test((element.innerText || '').replace(/\s+/g, ' ').trim()));
       if (directPanelMatch) return true;
       const routeMatches = location.pathname === `/tickets/detail/${expectedTicketNumber}`;
-      const activeTab = [...document.querySelectorAll(`a[href="/tickets/detail/${expectedTicketNumber}"]`)]
+      const tabLinks = [...document.querySelectorAll(`a[href="/tickets/detail/${expectedTicketNumber}"]`)];
+      const activeTab = tabLinks
         .some((element) => visible(element) && Boolean(element.closest('.active, [aria-selected="true"], [data-active="true"]')));
+      if (routeMatches && tabLinks.length > 0 && !activeTab) {
+        tabLinks[0].click();
+      }
       const panel = document.querySelector('#fbc-ticket-detail-right');
       const panelReady = Boolean(panel && visible(panel) && /(?:\bID\s*(?:#\s*|[-:]\s*)?\d{2,}\s*-\s*\S|^\s*\d{3,6}\s*-\s*\S)/im.test(panel.innerText || ''));
-      return routeMatches && activeTab && panelReady;
+      return routeMatches && (activeTab || tabLinks.length > 0) && panelReady;
     },
     { ticketNumber },
-    { timeout }
+    { timeout, polling: 150 }
   );
 }
 

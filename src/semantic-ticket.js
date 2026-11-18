@@ -195,7 +195,7 @@ const POSTER_SCHEDULE_DATE_RANGE_PATTERN = new RegExp(
   ')',
   'i'
 );
-const POSTER_SCHEDULE_KEYWORD_PATTERN = /(?:\bvalid(?:ity)?\b|\bexpires?\b|\bexpir(?:y|ation)\b|\buntil\b|\bthrough\b|\bthru\b|\btill\b|\beffective\b|\bends?\b|\bending\b|\bapplies?\s+from\b|\bapplied\s+from\b|\bdisplay(?:ed)?\s+(?:from|until|through)\b|\bshow(?:n|ing)?\s+(?:from|until|through)\b)/i;
+const POSTER_SCHEDULE_KEYWORD_PATTERN = /(?:\bvalid(?:ity)?\b|\bexp(?:ir(?:y|ation)|ires?)?\b|\buntil\b|\bthrough\b|\bthru\b|\btill\b|\beffective\b|\bends?\b|\bending\b|\bapplies?\s+from\b|\bapplied\s+from\b|\bdisplay(?:ed)?\s+(?:from|until|through)\b|\bshow(?:n|ing)?\s+(?:from|until|through)\b|\bgood\s+thr(?:u|ough)\b|\boffer\s+ends?\b|\bhsd\b)/i;
 
 function isValidPosterScheduleEvidence(evidence) {
   if (!evidence || typeof evidence !== 'string') return false;
@@ -390,7 +390,7 @@ function visionPrompt(ticketText, visionCandidates = []) {
     'Use visual content to distinguish seasonal posters (for example Halloween versus a new Holiday or promotion poster) when ticket text is not enough.',
     'A request to remove an old popup refers to the existing CMS popup, not necessarily an attachment in this ticket. Do not select an old CMS popup that is not shown as a candidate image.',
     'For the selected poster, return posterSchedule with the same attachmentIndex.',
-    'Read artwork dates only when the poster itself explicitly defines its promotion/display window, such as a prominent date range (e.g. "NOV 16 – DEC 7", "NOV 15 – DEC 31, 2026") or language such as "Valid ... to ...", "Expires", "Expiry", "Until", "Through", or "Till".',
+    'Read artwork dates only when the poster itself explicitly defines its promotion/display window, such as a prominent date range (e.g. "NOV 16 – DEC 7", "NOV 15 – DEC 31, 2026") or language such as "EXP: ...", "EXP. ...", "Valid ... to ...", "Expires", "Expiry", "Until", "Through", "Till", or "Good Thru".',
     'Dates for closures, holidays, appointments, events, prices, or general promotion copy are not popup schedules. For example, "Closed on November 26" must return null dates.',
     'If explicit validity/expiry artwork omits the year (e.g. "NOV 16 – DEC 7"), use a year only when the ticket/header explicitly supplies the applicable year (or from fine print on the artwork); otherwise return null dates.',
     'Return null dates and null evidence when no explicit artwork display window exists. Copy a short exact artwork phrase into evidence for any non-null date.',
@@ -436,7 +436,7 @@ function multiVisionPrompt(ticketText, visionCandidates = []) {
     'Return an empty array if the full set is uncertain. Never return a partial set merely because one image looks like a poster.',
     'Use image content and nearby ticket/comment text to exclude screenshots, old-popup references, logos, or unrelated attachments.',
     'Return one posterSchedules entry for every selected attachment index, in the same order.',
-    'Read artwork dates only when that poster explicitly defines its promotion/display window, such as a prominent date range (e.g. "NOV 16 – DEC 7", "NOV 15 – DEC 31, 2026") or language such as "Valid ... to ...", "Expires", "Expiry", "Until", "Through", or "Till".',
+    'Read artwork dates only when that poster explicitly defines its promotion/display window, such as a prominent date range (e.g. "NOV 16 – DEC 7", "NOV 15 – DEC 31, 2026") or language such as "EXP: ...", "EXP. ...", "Valid ... to ...", "Expires", "Expiry", "Until", "Through", "Till", or "Good Thru".',
     'Dates for closures, holidays, appointments, events, prices, or general promotion copy are not popup schedules. For example, "Closed on November 26" must return null dates.',
     'If explicit validity/expiry artwork omits the year (e.g. "NOV 16 – DEC 7"), use a year only when the ticket/header explicitly supplies the applicable year (or from fine print on the artwork); otherwise return null dates.',
     'Return null dates and null evidence for a selected poster with no explicit artwork display window. Copy a short exact artwork phrase into evidence for any non-null date.',

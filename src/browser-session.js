@@ -35,6 +35,12 @@ function clearStoredSession(root) {
   }
 }
 
+const BACKGROUND_OPTIMIZATION_ARGS = [
+  '--disable-background-timer-throttling',
+  '--disable-backgrounding-occluded-windows',
+  '--disable-renderer-backgrounding'
+];
+
 async function launchToolBrowser(root, {
   headless = true,
   acceptDownloads = false,
@@ -53,7 +59,7 @@ async function launchToolBrowser(root, {
       headless: false,
       acceptDownloads,
       viewport: null,
-      args: ['--new-window', '--start-maximized']
+      args: ['--new-window', '--start-maximized', ...BACKGROUND_OPTIMIZATION_ARGS]
     });
     return {
       browser: context.browser(),
@@ -69,7 +75,7 @@ async function launchToolBrowser(root, {
     // Removing only that flag makes the fallback window visible while still
     // allowing Playwright storageState to be loaded into its isolated context.
     launchOptions.ignoreDefaultArgs = ['--no-startup-window'];
-    launchOptions.args = ['--new-window', '--start-maximized'];
+    launchOptions.args = ['--new-window', '--start-maximized', ...BACKGROUND_OPTIMIZATION_ARGS];
   }
   const browser = await browserType.launch(launchOptions);
   try {
@@ -232,7 +238,7 @@ async function launchLoginBrowser(root, {
       headless: false,
       acceptDownloads: false,
       viewport: null,
-      args: ['--new-window', '--start-maximized']
+      args: ['--new-window', '--start-maximized', ...BACKGROUND_OPTIMIZATION_ARGS]
     });
     return { browser: context.browser(), context, profileDirectory, cleanupProfile: true, launchedAt };
   } catch (error) {

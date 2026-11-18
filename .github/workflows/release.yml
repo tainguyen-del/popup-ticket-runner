@@ -46,22 +46,19 @@ jobs:
           body: |
             ## Popup Ticket Runner v${{ steps.pkg.outputs.version }}
             - Commit: `${{ github.sha }}`
-            - Bổ sung tính năng xác minh trạng thái CMS cuối cùng sau khi Build: kiểm tra `status_build = COMPLETE`, kiểm tra trạng thái dự án, và kiểm tra phản hồi Live Website HTTP 200 OK.
+            - **Tối ưu hóa tốc độ chạy ticket:**
+              - Cắt giảm các khoảng chờ tĩnh không cần thiết (`waitForTimeout`), chuyển sang chờ có điều kiện DOM (`waitFor`, `waitForURL`).
+              - Giảm debounce search CMS từ 1500ms xuống 400ms.
+              - Tối ưu hóa chụp ảnh màn hình báo cáo trung gian (chuyển sang chụp viewport `fullPage: false`), giảm 8 - 10 giây cho mỗi lượt chạy ticket.
+            - **Khắc phục triệt để lỗi khi ẩn tab / minimize cửa sổ CRM khi tool đang chạy:**
+              - Bổ sung các cờ chống background throttling cho Chromium (`--disable-background-timer-throttling`, `--disable-backgrounding-occluded-windows`, `--disable-renderer-backgrounding`).
+              - Chuyển cơ chế `waitForFunction` sang polling timer cố định 150ms thay vì `requestAnimationFrame` (vốn bị Windows freeze khi cửa sổ bị ẩn/minimize).
+              - Tự động tìm và kích hoạt lại tab Ticket mục tiêu trong CRM nếu người dùng chuyển tab.
+            - Bổ sung tính năng xác minh trạng thái CMS cuối cùng sau khi Build: kiểm tra `status_build = COMPLETE`, trạng thái dự án, và live website HTTP 200 OK.
             - Sửa lỗi nhận diện nhầm thông báo "Saved successfully" (khi lưu nháp ở 1%) thành build hoàn tất, đảm bảo tool luôn chờ đến khi CMS build xong 100%.
-            - Nhận diện ngữ nghĩa lịch vô thời hạn ("Đến khi khách tắt" / "Không set hạn") -> hiển thị ngay và khóa fallback Vision OCR (Ticket 1597987).
-            - Tự động Clear sạch cả 2 ô ngày `Time start` và `Time end` trên CMS khi popup vô thời hạn hoặc thay thế card cũ, tránh mượn lại ngày cũ (Ticket 1597987).
-            - Sửa lỗi nhận diện nhầm từ `FROM` trong tên tiệm / lời chúc thành ngày bắt đầu popup (`start date`) (Ticket 1597915).
-            - Khống chế phạm vi quét ngày tối đa 40 ký tự và không vượt dấu ngắt câu (`.`, `!`, `?`, `;`), tránh nối nhãn với ngày của câu khác (Ticket 1597915).
-            - Hỗ trợ chuẩn hóa tên tháng tiếng Anh dạng chữ không kèm năm (`November 26` / `26 Nov`) về năm hiện tại (Ticket 1597915).
-            - Bổ sung tính năng tự động đăng nhập CMS (CMS Auto-Login).
-            - Sửa lỗi tìm kiếm nút Add block và hỗ trợ mục Popup_setting trên Announcement v1.0.38 (Ticket 1597101).
-            - Xử lý gỡ bỏ / thay thế 1-1 chính xác cho popup cũ khi ticket yêu cầu replace, không đem popup cũ sang block mới (Ticket 1597101).
-            - Tự động xóa sạch các section cũ và section mồ côi (N/A N/A) khi nâng cấp version Announcement plugin.
-            - Bổ sung tính năng gắn link ảnh popup (`Image link`) từ ghi chú trong ticket (Ticket 1575574).
-            - Xử lý workflow đa poster: tải các poster mới lên trước, sau đó mới gỡ poster cũ để tránh CMS nhân bản ảnh cũ (Ticket 1595897).
-            - Nhận diện linh hoạt dải ngày khuyến mãi in trên banner poster (như `NOV 16 – DEC 7`, `NOV 15 – DEC 31, 2026`) (Ticket 1595897).
-            - Bảo toàn đầy đủ cả ngày bắt đầu (`time_start`) và ngày kết thúc (`time_end`) của các popup cũ còn hiệu lực khi migrate sang block Announcement mới (Ticket 1596219).
-            - Nhận diện chính xác block trống khi CMS tự động điền `time_start`.
+            - Nhận diện ngữ nghĩa lịch vô thời hạn ("Đến khi khách tắt" / "Không set hạn") và clear sạch 2 ô ngày `Time start` / `Time end`.
+            - Chuẩn hóa nhận diện ngày tháng tiếng Anh và tránh nhầm lẫn từ khóa `FROM` trong tên tiệm.
+            - Tự động đăng nhập CMS (CMS Auto-Login).
             - Tải file **`Popup Ticket Runner Final.exe`** ở mục Assets bên dưới để sử dụng trực tiếp không cần cài đặt.
           files: dist/Popup Ticket Runner Final.exe
           draft: false
