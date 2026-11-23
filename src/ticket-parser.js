@@ -7,12 +7,80 @@ const MONTH_NUMBERS = {
   october: 10, nov: 11, november: 11, dec: 12, december: 12
 };
 
-const DATE_TOKEN_SOURCE = String.raw`(?:\b20\d{2}[-./]\d{1,2}[-./]\d{1,2}\b|\b\d{1,2}[/.]\d{1,2}[/.](?:20)?\d{2}\b|\b\d{1,2}[/.]\d{1,2}\b|\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2},?\s*(?:20\d{2})?\b|\b\d{1,2}\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+20\d{2})?\b)`;
+const DATE_TOKEN_SOURCE = String.raw`(?:\b20\d{2}[-./]\d{1,2}[-./]\d{1,2}\b|\b\d{1,2}[/.]\d{1,2}[/.](?:20)?\d{2}\b|\b\d{1,2}[/.]\d{1,2}\b|\b(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+\d{1,2},?\s*(?:20\d{2})?\b|\b\d{1,2}\s+(?:jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)(?:\s+20\d{2})?\b|\bthanksgiving(?:\s+day)?\s+\d{1,2}\b|\b\d{1,2}\s+thanksgiving\b)`;
 
 function calendarDate(year, month, day) {
   const value = new Date(Date.UTC(year, month - 1, day));
   if (value.getUTCFullYear() !== year || value.getUTCMonth() !== month - 1 || value.getUTCDate() !== day) return null;
   return value.toISOString().slice(0, 10);
+}
+
+function getThanksgivingDate(year) {
+  const nov1Day = (new Date(Date.UTC(year, 10, 1))).getUTCDay();
+  const firstThursday = ((11 - nov1Day) % 7) + 1;
+  const fourthThursday = firstThursday + 21;
+  return calendarDate(year, 11, fourthThursday);
+}
+
+const POPUP_OPEN_DELAY_SECONDS = 3;
+
+function extractPopupDuration(text) {
+  if (!text) return null;
+  const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ');
+
+  // 1. Explicit slider expression (e.g. "delay slider 13s", "time delay 13", "slider 13s")
+  const sliderMatch = /(?:delay\s*slider|slider\s*delay|time\s*delay|slider)\b[^.;\n]{0,60}?\b(\d{1,3})\s*(?:s|giay|seconds?|sec)?\b/i.exec(folded);
+  if (sliderMatch) {
+    const rawVal = parseInt(sliderMatch[1], 10);
+    if (rawVal > 0 && rawVal <= 120) {
+      return {
+        requestedSeconds: rawVal >= POPUP_OPEN_DELAY_SECONDS ? rawVal - POPUP_OPEN_DELAY_SECONDS : rawVal,
+        delaySliderSeconds: rawVal,
+        isExplicitSlider: true
+      };
+    }
+  }
+
+  // 2. Duration / display time requests for popup
+  const patterns = [
+    /\b(?:pop[\s-]*ups?|announcements?|posters?|banners?)\b[^.;\n]{0,40}?\b(?:hien\s*thi|xuat\s*hien|chay|hien|show|display|duration|thoi\s*gian|delay)\b[^.;\n]{0,30}?\b(\d{1,3})\s*(?:s|giay|seconds?|sec)\b/gi,
+    /\b(?:hien\s*thi|xuat\s*hien|chay|hien|show|display|thoi\s*gian|duration)\b[^.;\n]{0,30}?\b(?:pop[\s-]*ups?|announcements?|posters?|banners?)\b[^.;\n]{0,30}?\b(\d{1,3})\s*(?:s|giay|seconds?|sec)\b/gi,
+    /\b(?:pop[\s-]*ups?|announcements?|posters?|banners?)\b[^.;\n]{0,40}?\b(?:lau\s*hon|dai\s*hon|longer)\b[^.;\n]{0,30}?\b(\d{1,3})\s*(?:s|giay|seconds?|sec)\b/gi,
+    /\b(?:thoi\s*gian|time)\s*(?:cho\s*)?(?:pop[\s-]*ups?|announcements?|posters?|banners?)\b[^.;\n]{0,30}?\b(\d{1,3})\s*(?:s|giay|seconds?|sec)\b/gi,
+    /\b(?:chinh|cai|set|tang|de|cho)\s+(?:pop[\s-]*ups?|announcements?|posters?|banners?)\b[^.;\n]{0,80}?\b(\d{1,3})\s*(?:s|giay|seconds?|sec)\b/gi,
+    /\b(?:pop[\s-]*ups?|announcements?|posters?|banners?)\b[^.;\n]{0,80}?\b(\d{1,3})\s*(?:s|giay|seconds?|sec)\b/gi
+  ];
+
+  for (const pattern of patterns) {
+    for (const match of folded.matchAll(pattern)) {
+      const rawSec = parseInt(match[1], 10);
+      if (rawSec > 0 && rawSec <= 120) {
+        return {
+          requestedSeconds: rawSec,
+          delaySliderSeconds: rawSec + POPUP_OPEN_DELAY_SECONDS,
+          isExplicitSlider: false
+        };
+      }
+    }
+  }
+
+  return null;
+}
+
+function hasAffirmativePosterUpload(text) {
+  const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim();
+  const posterEntity = /\b(?:posters?|banners?|hinh|anh|file|dinh\s*kem|attachment|image)\b/i;
+  const uploadAction = /\b(?:add(?:ed)?|creat(?:e|ed)|upload(?:ed)?|publish(?:ed)?|them|tao|dang|up|len(?:\s+web)?)\b/gi;
+  for (const match of folded.matchAll(uploadAction)) {
+    if (actionIsNegated(folded, match.index)) continue;
+    const { start, end } = clauseBounds(folded, match.index);
+    if (posterEntity.test(folded.slice(start, end))) return true;
+  }
+  const popupAsVerb = /\bpop[\s-]*up\s+(?:cho|giup)?\s*(?:poster|banner|image|anh|hinh|file|dinh\s*kem)\b/gi;
+  for (const match of folded.matchAll(popupAsVerb)) {
+    if (!actionIsNegated(folded, match.index)) return true;
+  }
+  return false;
 }
 
 function foldTicketText(input) {
@@ -259,11 +327,21 @@ function normalizeExpiry(raw) {
       return calendarDate(year, second, first);
     }
   }
+  const tg = raw.match(/\bthanksgiving\s*(?:day|ngay|date)?\s*(\d{1,2})\b/i) || raw.match(/\b(\d{1,2})\s*thanksgiving\b/i);
+  if (tg) {
+    const year = new Date().getUTCFullYear();
+    const day = Number(tg[1]);
+    if (day >= 1 && day <= 30) return calendarDate(year, 11, day);
+  }
+  if (/^\s*thanksgiving(?:\s*day)?\s*$/i.test(raw.trim())) {
+    const year = new Date().getUTCFullYear();
+    return getThanksgivingDate(year);
+  }
   return null;
 }
 
 function findTicketDate(text, labelPatterns, stopLabelPatterns = []) {
-  const folded = foldTicketText(text).replace(/\s+/g, ' ').trim();
+  const folded = foldTicketText(text).replace(/[^\S\r\n]+/g, ' ').trim();
   for (const labelPattern of labelPatterns) {
     const matcher = new RegExp(`${labelPattern}\\s*(?::|=|-|\\bla\\b|\\bis\\b)?\\s*`, 'gi');
     for (const marker of folded.matchAll(matcher)) {
@@ -274,6 +352,7 @@ function findTicketDate(text, labelPatterns, stopLabelPatterns = []) {
       if (date.index > 40) continue;
       const intervening = tail.slice(0, date.index);
       if (/[.!?;]/.test(intervening)) continue;
+      if (/[\n\r]/.test(intervening) && /[a-zA-Z]{3,}/.test(intervening)) continue;
       const stopBeforeDate = stopLabelPatterns.some((stopPattern) => {
         const stop = new RegExp(stopPattern, 'i').exec(tail);
         return stop && stop.index < date.index;
@@ -284,10 +363,67 @@ function findTicketDate(text, labelPatterns, stopLabelPatterns = []) {
   return null;
 }
 
+function findHolidayClosureExpiry(text, year = new Date().getUTCFullYear()) {
+  if (!text) return null;
+  const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim();
+
+  const hasHoliday = /\b(?:thanksgiving|christmas|xmas|new\s*year'?s?|halloween|le\s*ta\s*on)\b/i.test(folded);
+  const closurePattern = /\b(?:thong\s*bao\s*nghi\s*(?:le\s*)?(?:ngay)?|tiem\s*nghi\s*(?:le\s*)?(?:ngay)?|nghi\s*(?:le\s*)?(?:ngay)?|dong\s*cua\s*(?:ngay)?|closed\s*(?:on|for)?|closure\s*(?:on|for)?)\b/i;
+
+  if (!hasHoliday && !closurePattern.test(folded)) return null;
+
+  // Check 1: Thanksgiving with day e.g. "thanksgiving 26", "thanksgiving day 26", "ngay 26 thanksgiving", "nghi ngay thanksgiving 26"
+  const tgDay = folded.match(/\b(?:thanksgiving|le\s*ta\s*on)\s*(?:day|ngay|date)?\s*(\d{1,2})\b/i)
+    || folded.match(/\b(?:ngay\s*)?(\d{1,2})\s*(?:thanksgiving|le\s*ta\s*on)\b/i);
+  if (tgDay) {
+    const day = Number(tgDay[1]);
+    if (day >= 1 && day <= 30) return calendarDate(year, 11, day);
+  }
+
+  // Check 2: Thanksgiving in closure context without explicit day (use 4th Thursday of November)
+  if (/\b(?:thanksgiving|le\s*ta\s*on)\b/i.test(folded) && closurePattern.test(folded)) {
+    const dayNear = folded.match(/(?:nghi|dong\s*cua|closed)[^.;\n]{0,40}\b(?:ngay\s*)?(\d{1,2})\b/i);
+    if (dayNear) {
+      const day = Number(dayNear[1]);
+      if (day >= 1 && day <= 30) return calendarDate(year, 11, day);
+    }
+    return getThanksgivingDate(year);
+  }
+
+  // Check 3: Christmas
+  const xmasDay = folded.match(/\b(?:christmas|xmas)\s*(?:day|ngay)?\s*(\d{1,2})\b/i);
+  if (xmasDay) {
+    const day = Number(xmasDay[1]);
+    if (day >= 1 && day <= 31) return calendarDate(year, 12, day);
+  }
+  if (/\b(?:christmas|xmas)\b/i.test(folded) && closurePattern.test(folded)) {
+    return calendarDate(year, 12, 25);
+  }
+
+  // Check 4: Closure with explicit slash/dash/dot date e.g. "nghi ngay 26/11", "closed on 11/26", "tiem nghi 26/11/2026"
+  const closureDate = folded.match(/(?:thong\s*bao\s*nghi|tiem\s*nghi|nghi\s*le|nghi\s*ngay|dong\s*cua|closed\s*(?:on|for)?|closure\s*(?:on|for)?)[^.;\n]{0,30}\b(\d{1,2}[/.]\d{1,2}(?:[/.]\d{2,4})?)\b/i);
+  if (closureDate) {
+    const parsed = normalizeExpiry(closureDate[1]);
+    if (parsed) return parsed;
+  }
+
+  // Check 5: Closure with month name e.g. "closed on november 26", "nghi ngay 26 thang 11"
+  const closureNamed = folded.match(/(?:thong\s*bao\s*nghi|tiem\s*nghi|nghi\s*le|nghi\s*ngay|dong\s*cua|closed\s*(?:on|for)?|closure\s*(?:on|for)?)[^.;\n]{0,40}\b(?:(nov(?:ember)?|dec(?:ember)?|jan(?:uary)?|oct(?:ober)?)\s+(\d{1,2})|(\d{1,2})\s+(nov(?:ember)?|dec(?:ember)?|jan(?:uary)?|oct(?:ober)?))\b/i);
+  if (closureNamed) {
+    const monthStr = closureNamed[1] || closureNamed[4];
+    const dayStr = closureNamed[2] || closureNamed[3];
+    if (monthStr && dayStr && MONTH_NUMBERS[monthStr.toLowerCase()]) {
+      return calendarDate(year, MONTH_NUMBERS[monthStr.toLowerCase()], Number(dayStr));
+    }
+  }
+
+  return null;
+}
+
 function popupRangeFromText(text) {
   const folded = foldTicketText(text).replace(/\s+/g, ' ').trim();
-  const startLabel = String.raw`(?:tu(?:\s+ngay)?|from|starts?(?:\s+(?:date|time))?|bat\s+dau|popup\s+(?:start|show)|show(?:\s+(?:from|on))?|display(?:\s+(?:from|on))?|dang(?:\s+(?:tu|ngay))?|hien\s+thi(?:\s+(?:tu|from))?)`;
-  const endLabel = String.raw`(?:den(?:\s+(?:ngay|het))?|toi(?:\s+(?:ngay|het))?|to|until|through|thru|till|ends?(?:\s+(?:date|time))?|ket\s+thuc|go(?:\s+xuong)?|remove(?:\s+(?:on|date))?|expires?|exp(?:iry|iration)?)`;
+  const startLabel = String.raw`(?:tu(?:\s+ngay)?|from|starts?(?:\s+(?:date|time))?|bat\s+dau|popup\s+(?:start|show)|show(?:\s+(?:from|on))?|display(?:\s+(?:from|on))?|dang(?:\s+(?:tu|ngay))?|hien\s+thi(?:\s+(?:tu|from))?|nghi\s+tu|dong\s+cua\s+tu|closed\s+from)`;
+  const endLabel = String.raw`(?:den(?:\s+(?:ngay|het))?|toi(?:\s+(?:ngay|het))?|to|until|through|thru|till|ends?(?:\s+(?:date|time))?|ket\s+thuc|go(?:\s+xuong)?|remove(?:\s+(?:on|date))?|expires?|exp(?:iry|iration)?|mo\s+cua\s+lai(?:\s+vao\s+ngay)?|reopen\s+on)`;
   const matcher = new RegExp(`${startLabel}\\s*(?::|=|-)?\\s*(${DATE_TOKEN_SOURCE})([\\s\\S]{0,96}?)${endLabel}\\s*(?::|=|-)?\\s*(${DATE_TOKEN_SOURCE})`, 'gi');
   const range = matcher.exec(folded);
   if (!range) return null;
@@ -344,16 +480,12 @@ function extractPopupLink(text) {
   const raw = String(text || '');
   const isCrmUrl = (url) => /^(?:https?:\/\/)?(?:crm|jira|api)\.fastboy\./i.test(url);
 
-  // Look for a URL following an explicit "link" or similar keyword within 160 chars
-  const nearKeyword = /\b(?:link|direct|booking|website|url|href|toi\s+link|den\s+link)\b[^.;\n]{0,160}?(https?:\/\/[^\s<>"']+)/i.exec(raw);
-  if (nearKeyword) {
-    const candidate = nearKeyword[1].replace(/[.,;)]+$/, '');
-    if (!isCrmUrl(candidate)) return candidate;
-  }
+  // Must explicitly ask to link/direct the popup poster to a URL.
+  // Exclude salon website / domain lines: "Link website:", "Website:", "Domain:", "Web:"
+  const linkActionPattern = /(?:(?:direct\s+(?:to|toi|tới|den|đến)\s*(?:link\b)?)|(?:(?:gắn|gan|chèn|chen|add|attach)\s+(?:link|url)?\s*(?:cho\s+popup|vào\s+popup|booking)?)|(?:(?:bấm|click)\s+vào\s+popup[^.\n]*?)|(?:(?:link\s+(?:booking|popup|poster|image|hinh|ảnh))|(?:(?:booking|popup|poster)\s+link))|(?:(?:pop\s*up|poster)\b[^.\n]*?\bvà\s+link))\s*[:=-]?\s*[^.;\n]{0,100}?(https?:\/\/[^\s<>"']+)/i;
 
-  // Look for any external http/https URL in the ticket text
-  const matches = [...raw.matchAll(/(https?:\/\/[^\s<>"']+)/gi)];
-  for (const match of matches) {
+  const match = linkActionPattern.exec(raw);
+  if (match) {
     const candidate = match[1].replace(/[.,;)]+$/, '');
     if (!isCrmUrl(candidate)) return candidate;
   }
@@ -380,19 +512,22 @@ function ticketData(body, ticketUrl) {
     /(?:id\s*(?:website|site|project))\s*[:#-]?\s*(\d{2,})/i
   ].map((rule) => text.match(rule)?.[1]).find(Boolean) || null;
   const isIndefinite = hasIndefiniteScheduleInstruction(raw);
-  const expiry = isIndefinite ? null : (/(?:exp(?:iry|iration)?|expires?|end\s*date)\s*[:\-]?\s*([^|\n]{3,50})/i.exec(text)?.[1]?.trim() || null);
+  const expiry = isIndefinite ? null : (/\b(?:exp(?:\.|\b)|expiry\b|expiration\b|expires?\b|end\s*date\b)\s*[:\-]?\s*([^|\n]{3,50})/i.exec(text)?.[1]?.trim() || null);
   const fromPattern = String.raw`\bfrom\s*(?:date|time)?\s*[:=-]|\bfrom\s+(?:date|time)\b|\bfrom(?=\s+(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s*)?(?:${DATE_TOKEN_SOURCE}))`;
-  const start = isIndefinite ? null : findTicketDate(text, [
+  const start = isIndefinite ? null : findTicketDate(raw, [
     String.raw`\b(?:time\s*start|start\s*(?:date|time)?|popup\s*start|ngay\s*(?:bat\s*dau|dang|hien)|thoi\s*gian\s*(?:bat\s*dau|hien)|tu\s+ngay)\b`,
     fromPattern
   ], [String.raw`\b(?:time\s*end|end\s*(?:date|time)?|exp(?:iry|iration)?|expires?|ngay\s*(?:het\s*han|ket\s*thuc)|den\s*(?:het|ngay)|toi\s*het|until)\b`]);
-  const parsedExpiry = isIndefinite ? null : (findTicketDate(text, [
-    String.raw`\b(?:time\s*end|end\s*(?:date|time)?|exp(?:iry|iration)?|expires?|popup\s*(?:end|expiry)|ngay\s*(?:het\s*han|ket\s*thuc)|thoi\s*gian\s*(?:het\s*han|ket\s*thuc)|den\s*(?:het|ngay)|toi\s*het|until|through|schedule\s*(?:go|remove|end)|lich\s*go|hen\s*(?:gio\s*)?go|go\s*(?:pop\s*up\s*)?vao(?:\s+cuoi)?\s*ngay|remove(?:\s+popup)?\s+on)\b`
+  const holidayClosureLabel = String.raw`\b(?:thong\s*bao\s*nghi\s*(?:le\s*)?(?:ngay)?|tiem\s*nghi\s*(?:le\s*)?(?:ngay)?|nghi\s*(?:le\s*)?(?:ngay)?|dong\s*cua\s*(?:ngay)?|closed\s*(?:on|for)?|closure\s*(?:on|for)?)\b`;
+  const parsedExpiry = isIndefinite ? null : (findTicketDate(raw, [
+    String.raw`\b(?:time\s*end|end\s*(?:date|time)?|exp(?:iry|iration)?|expires?|popup\s*(?:end|expiry)|ngay\s*(?:het\s*han|ket\s*thuc)|thoi\s*gian\s*(?:het\s*han|ket\s*thuc)|den\s*(?:het|ngay)|toi\s*het|until|through|schedule\s*(?:go|remove|end)|lich\s*go|hen\s*(?:gio\s*)?go|go\s*(?:pop\s*up\s*)?vao(?:\s+cuoi)?\s*ngay|remove(?:\s+popup)?\s+on|(?:an|tat|go)\s*sau(?:\s*ngay)?|sau\s*ngay|(?:an|tat|go)\s*(?:vao\s*ngay|ngay|vao)|(?:hide|turn\s*off|take\s*down)\s*(?:after|on))\b`,
+    holidayClosureLabel
   ]) || expiry);
   const range = isIndefinite ? null : popupRangeFromText(text);
+  const holidayExpiry = isIndefinite ? null : findHolidayClosureExpiry(raw);
   const popupStart = range?.start || start;
   const inferredMonthEnd = isIndefinite ? null : endOfMonthExpiryFromTicket(text);
-  const popupEnd = range?.end || parsedExpiry || inferredMonthEnd?.date || null;
+  const popupEnd = range?.end || parsedExpiry || holidayExpiry || inferredMonthEnd?.date || null;
   const popupStartDate = normalizeExpiry(popupStart);
   const popupEndDate = normalizeExpiry(popupEnd) || inferredMonthEnd?.date || null;
   const rangeState = isIndefinite
@@ -402,11 +537,13 @@ function ticketData(body, ticketUrl) {
   // as "Update website" must not be joined to a later popup-removal sentence.
   const folded = foldTicketText(raw);
   const popupPosition = requestedPopupPosition(raw);
+  const popupDuration = extractPopupDuration(raw);
   const popupRequested = /\b(?:pop[ -]?up|announcement|poster|banner)\b/i.test(text);
   // Vietnamese removal verbs must be adjacent to the entity. This prevents
   // "hoan tat design poster" from being read as "tat poster".
   const removesExistingPopupPoster = hasAffirmativePopupRemoval(folded);
   const addsOrUpdatesPopup = hasAffirmativePopupUpdate(folded);
+  const hasPosterUpload = hasAffirmativePosterUpload(folded);
   const isScheduledRemoval = /\b(?:schedule|lich|hen(?:\s+gio)?)\s+go\b/i.test(folded);
   const replaceExistingPopup = hasAffirmativePopupReplace(folded) && !isScheduledRemoval;
   const removesAllExistingPopups = removesExistingPopupPoster && explicitRemoveAllRequested(folded);
@@ -420,6 +557,8 @@ function ticketData(body, ticketUrl) {
     popupAction = 'replace';
   } else if (removesExistingPopupPoster && !isScheduledRemoval && !addsOrUpdatesPopup) {
     popupAction = removesAllExistingPopups ? 'remove-all' : 'remove-one';
+  } else if (popupDuration && !hasPosterUpload && !replaceExistingPopup && !removesExistingPopupPoster) {
+    popupAction = 'update-duration';
   } else {
     popupAction = 'create';
   }
@@ -439,6 +578,7 @@ function ticketData(body, ticketUrl) {
     popupAction,
     hasInlineRemovalRequest,
     popupLink,
+    popupDuration,
     isIndefinite
   };
 }
@@ -491,6 +631,8 @@ module.exports = {
   requestedPopupPosition,
   normalizeExpiry,
   findTicketDate,
+  findHolidayClosureExpiry,
+  getThanksgivingDate,
   popupRangeFromText,
   reconcilePopupRange,
   endOfMonthExpiryFromTicket,
@@ -499,5 +641,8 @@ module.exports = {
   isPopupRemovalAction,
   popupActionNeedsTicketImage,
   resolveRemovalScopeFromAttachments,
-  popupScheduleFromTicket
+  popupScheduleFromTicket,
+  POPUP_OPEN_DELAY_SECONDS,
+  extractPopupDuration,
+  hasAffirmativePosterUpload
 };

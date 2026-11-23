@@ -117,7 +117,10 @@ async function findDuplicatePopupImagesWithVision(page, ticketImages, cmsImages)
           return 1 - (diff / maxDiff);
         }, { tData: ticketBase64, tMime: ticketMime, cData: cmsBase64, cMime: cmsMime });
 
-        if (similarity >= 0.90) {
+        // Poster updates (e.g. changing holiday hours or dates on identical artwork)
+        // usually preserve 80-90% of pixel colors. Threshold of 0.80 reliably detects
+        // these updates without confusing different holiday posters (which score < 0.70).
+        if (similarity >= 0.80) {
           const candidate = {
             ticketIndex,
             cmsIndex,

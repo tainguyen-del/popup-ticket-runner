@@ -110,19 +110,36 @@ function clearStoredCredentials(root, { dataDirectory } = {}) {
   }
 }
 
-function cmsCredentialStatus(root, { dataDirectory, env = process.env } = {}) {
+function cmsCredentialStatus(root, {
+  dataDirectory,
+  env = process.env,
+  platform = process.platform,
+  execute = execFileSync
+} = {}) {
   const environment = environmentCredentials(env);
   const storedPath = credentialPath(root, dataDirectory);
   const stored = fs.existsSync(storedPath);
-  const credentials = stored
-    ? readStoredCredentials(root, { dataDirectory })
-    : environment;
+  let storedCredentials = null;
+  let needsReconfigure = false;
+  if (stored) {
+    try {
+      storedCredentials = readStoredCredentials(root, { dataDirectory, platform, execute });
+    } catch (error) {
+      if (error?.code !== 'cms-credential-decryption-failed') throw error;
+      // A DPAPI blob is bound to the Windows user that encrypted it. Treat a
+      // blob that cannot be decrypted as recoverable configuration state so
+      // the local UI can replace it instead of returning an HTTP 500.
+      needsReconfigure = true;
+    }
+  }
+  const credentials = storedCredentials || environment;
   return {
-    configured: Boolean(stored || environment),
-    source: stored ? 'secure-storage' : (environment ? 'environment' : null),
+    configured: Boolean(credentials),
+    source: storedCredentials ? 'secure-storage' : (environment ? 'environment' : null),
     identifier: credentials?.email || null,
     hasPassword: Boolean(credentials?.password),
-    canSave: process.platform === 'win32'
+    needsReconfigure,
+    canSave: platform === 'win32'
   };
 }
 
@@ -158,6 +175,7 @@ function readStoredCredentials(root, {
     ], {
       encoding: 'utf8',
       windowsHide: true,
+      stdio: ['ignore', 'pipe', 'pipe'],
       env: { ...process.env, POPUP_TICKET_RUNNER_CREDENTIAL_PATH: filePath }
     });
     const plain = Buffer.from(String(output).trim(), 'base64').toString('utf8');
@@ -177,8 +195,15 @@ function readStoredCredentials(root, {
 
 function getCmsCredentials(root, options = {}) {
   const fromEnvironment = environmentCredentials(options.env || process.env);
-  const stored = readStoredCredentials(root, options);
-  return stored || fromEnvironment;
+  try {
+    const stored = readStoredCredentials(root, options);
+    return stored || fromEnvironment;
+  } catch (error) {
+    if (error?.code === 'cms-credential-decryption-failed' && fromEnvironment) {
+      return fromEnvironment;
+    }
+    throw error;
+  }
 }
 
 function saveCredentialsInteractively(root, {

@@ -25,12 +25,40 @@ function hasWebsiteIdHeader(text) {
   return /(?:\bID\s*(?:#\s*|[-:]\s*)?\d{2,}\s*-\s*\S|^\s*\d{3,6}\s*-\s*\S)/im.test(String(text || ''));
 }
 
+async function isElementDisplayed(locator) {
+  if (!locator) return false;
+  try {
+    const visible = await locator.isVisible().catch(() => false);
+    if (visible) return true;
+    const count = typeof locator.count === 'function' ? await locator.count().catch(() => 0) : 1;
+    if (count === 0) return false;
+    return await locator.evaluate((element) => {
+      if (!element || !(element instanceof Element)) return false;
+      let cur = element;
+      while (cur) {
+        const s = window.getComputedStyle(cur);
+        if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+        if (cur.hidden || cur.getAttribute?.('aria-hidden') === 'true' || cur.hasAttribute?.('inert')) return false;
+        cur = cur.parentElement;
+      }
+      const rect = element.getBoundingClientRect?.();
+      if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+      const viewportWidth = window.innerWidth || document.documentElement?.clientWidth || 0;
+      const viewportHeight = window.innerHeight || document.documentElement?.clientHeight || 0;
+      if (viewportWidth <= 0 || viewportHeight <= 0) return false;
+      return rect.bottom > 0 && rect.right > 0 && rect.top < viewportHeight && rect.left < viewportWidth;
+    }, null, { timeout: 2000 }).catch(() => false);
+  } catch {
+    return false;
+  }
+}
+
 async function firstVisible(locator, fromEnd = false) {
   const count = await locator.count();
   for (let offset = 0; offset < count; offset += 1) {
     const index = fromEnd ? count - offset - 1 : offset;
     const candidate = locator.nth(index);
-    if (await candidate.isVisible().catch(() => false)) return candidate;
+    if (await isElementDisplayed(candidate)) return candidate;
   }
   return null;
 }
@@ -38,7 +66,18 @@ async function firstVisible(locator, fromEnd = false) {
 async function activeTicketTabVisible(page, ticketNumber) {
   const href = `/tickets/detail/${ticketNumber}`;
   return page.locator(`a[href="${href}"]`).evaluateAll((nodes) => {
-    const visible = (element) => Boolean(element.offsetWidth || element.offsetHeight || element.getClientRects().length || (window.getComputedStyle(element).display !== 'none'));
+    const visible = (element) => {
+      if (!element) return false;
+      const style = window.getComputedStyle(element);
+      if (style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0') return false;
+      let cur = element.parentElement;
+      while (cur && cur !== document.body) {
+        const s = window.getComputedStyle(cur);
+        if (s.display === 'none' || s.visibility === 'hidden') return false;
+        cur = cur.parentElement;
+      }
+      return true;
+    };
     return nodes.some((node) => visible(node) && Boolean(node.closest('.active, [aria-selected="true"], [data-active="true"]')));
   }).catch(() => false);
 }
@@ -62,7 +101,7 @@ async function activeTicketRoot(page, ticketUrl) {
   const candidates = page.locator(ACTIVE_TICKET_ROOT_SELECTOR);
   for (let index = 0; index < await candidates.count(); index += 1) {
     const candidate = candidates.nth(index);
-    if (!await candidate.isVisible().catch(() => false)) continue;
+    if (!await isElementDisplayed(candidate)) continue;
     const text = await candidate.innerText().catch(() => '');
     if (marker.test(text.replace(/\s+/g, ' ').trim())) return candidate;
   }
@@ -71,7 +110,7 @@ async function activeTicketRoot(page, ticketUrl) {
   // the active tab so a retained older tab cannot supply data.
   if (await activeTicketTabVisible(page, ticketNumber)) {
     const panel = page.locator('#fbc-ticket-detail-right').first();
-    if (await panel.isVisible().catch(() => false)) {
+    if (await isElementDisplayed(panel)) {
       const text = await panel.innerText().catch(() => '');
       if (hasWebsiteIdHeader(text)) return panel;
     }
@@ -101,7 +140,7 @@ async function revealTicketAttachmentArea(page, root) {
       if (node.scrollHeight > node.clientHeight + 8) node.scrollTop = node.scrollHeight;
     }
   }).catch(() => {});
-  await page.waitForTimeout(50);
+  await page.waitForTimeout(100);
   const conversation = await firstVisible(
     root.locator('button, [role="button"]').filter({ hasText: /^\s*(?:Conversations?|Comments?)\b/i }),
     true
@@ -109,9 +148,14 @@ async function revealTicketAttachmentArea(page, root) {
   const expanded = conversation ? await conversation.getAttribute('aria-expanded').catch(() => null) : null;
   const alreadyRevealed = conversation ? await conversation.getAttribute('data-popup-ticket-runner-revealed').catch(() => null) : null;
   if (conversation && expanded !== 'true' && alreadyRevealed !== 'true') {
-    const opened = await conversation.click({ force: true }).then(() => true).catch(() => false);
+    const opened = await conversation.click({ force: true }).then(() => true).catch(async () => {
+      return conversation.evaluate((button) => {
+        button.click();
+        return true;
+      }).catch(() => false);
+    });
     if (opened) await conversation.evaluate((button) => button.setAttribute('data-popup-ticket-runner-revealed', 'true')).catch(() => {});
-    await page.waitForTimeout(80);
+    await page.waitForTimeout(300);
   }
   await root.evaluate((panel) => {
     const nodes = [panel, ...panel.querySelectorAll('*')];
@@ -119,15 +163,16 @@ async function revealTicketAttachmentArea(page, root) {
       if (node.scrollHeight > node.clientHeight + 8) node.scrollTop = node.scrollHeight;
     }
   }).catch(() => {});
-  await page.waitForTimeout(50);
+  await page.waitForTimeout(100);
 }
 
 async function visibleTicketAttachmentItems(root) {
   const cards = root.locator('.ant-upload-list-item');
   const items = [];
-  for (let index = 0; index < await cards.count(); index += 1) {
+  const count = await cards.count();
+  for (let index = 0; index < count; index += 1) {
     const card = cards.nth(index);
-    if (!await card.isVisible().catch(() => false)) continue;
+    if (!await isElementDisplayed(card)) continue;
     const thumbnail = card.locator('a.ant-upload-list-item-thumbnail, img.ant-upload-list-item-image');
     if (await firstVisible(thumbnail, true)) items.push(card);
   }
@@ -161,23 +206,63 @@ async function visibleInlineTicketAttachmentItems(root) {
   const images = root.locator('img');
   const items = [];
   const seen = new Set();
-  for (let index = 0; index < await images.count(); index += 1) {
+  const count = await images.count();
+  for (let index = 0; index < count; index += 1) {
     const image = images.nth(index);
-    const meta = await image.evaluate((element) => {
+    const meta = await image.evaluate(async (element) => {
+      const src = element.currentSrc || element.getAttribute('src') || '';
+      if (!src) return null;
+      if (!element.complete && typeof element.decode === 'function') {
+        await element.decode().catch(() => {});
+      }
       const rect = element.getBoundingClientRect();
+      const naturalW = element.naturalWidth || 0;
+      const naturalH = element.naturalHeight || 0;
+      const offsetW = element.offsetWidth || 0;
+      const offsetH = element.offsetHeight || 0;
+      const attrW = parseInt(element.getAttribute('width') || '0', 10) || 0;
+      const attrH = parseInt(element.getAttribute('height') || '0', 10) || 0;
+
+      const style = window.getComputedStyle(element);
+      let isHidden = style.display === 'none' || style.visibility === 'hidden' || style.opacity === '0';
+      if (!isHidden) {
+        let cur = element.parentElement;
+        while (cur && cur !== document.body) {
+          const s = window.getComputedStyle(cur);
+          if (s.display === 'none' || s.visibility === 'hidden') {
+            isHidden = true;
+            break;
+          }
+          cur = cur.parentElement;
+        }
+      }
+
+      const effectiveWidth = Math.max(naturalW, offsetW, rect.width || 0, attrW);
+      const effectiveHeight = Math.max(naturalH, offsetH, rect.height || 0, attrH);
+
       return {
-        src: element.currentSrc || element.getAttribute('src') || '',
-        width: rect.width,
-        height: rect.height,
+        src,
+        width: effectiveWidth,
+        height: effectiveHeight,
+        naturalWidth: naturalW,
+        naturalHeight: naturalH,
+        isHidden,
         insideUploadCard: Boolean(element.closest('.ant-upload-list-item'))
       };
     }).catch(() => null);
+
     if (!meta
       || meta.insideUploadCard
-      || meta.width < 100
-      || meta.height < 100
+      || meta.isHidden
       || !isInlineTicketImageUrl(meta.src)
       || seen.has(meta.src)) continue;
+
+    // Filter tiny icons/emojis (e.g. 16x16, 24x24) when dimensions are known.
+    // In background or minimized windows, naturalWidth might be 0 until painted/decoded,
+    // but isInlineTicketImageUrl already verified it is a CRM storage object (not avatar).
+    const hasKnownDimensions = meta.width > 0 && meta.height > 0;
+    if (hasKnownDimensions && (meta.width < 100 || meta.height < 100)) continue;
+
     seen.add(meta.src);
     items.push({ kind: 'inline-image', locator: image, sourceUrl: meta.src });
   }
@@ -227,8 +312,22 @@ async function ticketAttachmentDescriptors(root, items = null) {
             parentPrev = parentPrev.previousElementSibling;
           }
         }
-        if (/(?:gỡ|xóa|remove|delete|take\s*down)\s+(?:poster|hình|ảnh|popup)/i.test(precedingText) || /^[0-9]+[./)]\s*(?:gỡ|xóa|remove)/i.test(precedingText)) {
-          isRemovalReference = true;
+        const hasRemoval = /(?:gỡ|xóa|remove|delete|take\s*down)\s+(?:poster|hình|ảnh|popup)/i.test(precedingText)
+          || /^[0-9]+[./)]\s*(?:gỡ|xóa|remove)/i.test(precedingText);
+        const hasSubsequentPopup = /(?:và|then|thay\s+bằng|thay\s+thế|update\s+lại)\s+(?:pop[\s-]*up|tạo|đăng|lên|treo|thay)\b/i.test(precedingText)
+          || /\bpop[\s-]*up\b[^.;\n]{0,60}\((?:ảnh|hình)\s+bên\s+dưới\)/i.test(precedingText);
+        if (hasRemoval) {
+          if (!hasSubsequentPopup) {
+            isRemovalReference = true;
+          } else {
+            // Mixed clause: "gỡ [A] ... và pop up [B] (ảnh bên dưới)"
+            // Check if another image preceded this one in the same container.
+            const previousSiblingImage = element.closest('p, div, li, tr')?.previousElementSibling?.querySelector?.('img')
+              || element.previousElementSibling?.matches?.('img');
+            // If another image preceded this one, this is the new popup B (not removal).
+            // If no image preceded this one, this is A (the removal reference).
+            isRemovalReference = !previousSiblingImage;
+          }
         }
         let context = element.parentElement?.innerText || '';
         let parent = element.parentElement;
@@ -285,7 +384,17 @@ async function readFullTicketContext(page, ticketUrl) {
   const root = await activeTicketRoot(page, ticketUrl);
   if (!root) throw new Error('CRM rendered ticket tabs, but the selected ticket panel could not be isolated.');
   await revealTicketAttachmentArea(page, root);
-  const items = await visibleTicketImageCandidates(root);
+  let items = await visibleTicketImageCandidates(root);
+  let previousCount = items.length;
+  // In background tabs or throttled windows, comments and attachments take time to render
+  for (let poll = 0; poll < 12; poll += 1) {
+    await page.waitForTimeout(300);
+    items = await visibleTicketImageCandidates(root);
+    if (items.length > 0 && items.length === previousCount) {
+      break;
+    }
+    previousCount = items.length;
+  }
   return {
     root,
     text: await root.innerText({ timeout: 10000 }),
@@ -306,7 +415,7 @@ async function ticketAttachmentItems(page, ticketUrl, { reveal = true } = {}) {
 
 async function ticketAttachmentAvailable(page, ticketUrl) {
   const { root, items } = await ticketAttachmentItems(page, ticketUrl);
-  return Boolean(items.length || (root && await allAttachmentsDownloadButton(root).isVisible().catch(() => false)));
+  return Boolean(items.length || (root && await isElementDisplayed(allAttachmentsDownloadButton(root))));
 }
 
 async function waitForTicketDetails(page, ticketUrl, { timeout = 30000 } = {}) {
@@ -340,6 +449,7 @@ async function openTicketDetails(page, ticketUrl) {
   let lastError = null;
   for (let attempt = 1; attempt <= 2; attempt += 1) {
     try {
+      await page.bringToFront().catch(() => {});
       await page.goto(ticketUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
       await waitForTicketDetails(page, ticketUrl);
       return;
@@ -362,6 +472,7 @@ module.exports = {
   ticketNumberFromUrl,
   ticketMarkerPattern,
   hasWebsiteIdHeader,
+  isElementDisplayed,
   activeTicketTabVisible,
   activeTicketRoot,
   activeTicketText,

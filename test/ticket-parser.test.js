@@ -38,6 +38,19 @@ test('keeps a missing start date empty and reads a Vietnamese expiry phrase', ()
   assert.equal(ticket.expiryDate, '2026-12-31');
 });
 
+test('does not mistake words starting with exp like Express or Experience for an expiry date', () => {
+  const ticket = parsed([
+    'ID#20566 - Website Support',
+    '#1454082',
+    'add service "Express Eyelash Extensions $65 " vào giúp tiệm',
+    'Nhờ team hỗ trợ gỡ pop up hình chân Pumpkin xuống và Pop up hình chân Christmas $68 (ảnh bên dưới) giúp tiệm'
+  ].join('\n'), 1454082);
+  assert.equal(ticket.siteId, '20566');
+  assert.equal(ticket.expiry, null);
+  assert.equal(ticket.expiryDate, null);
+  assert.equal(ticket.scheduleError, null);
+});
+
 test('reads a dotted two-digit US expiry after until', () => {
   const ticket = parsed([
     'ID#16266 - Website Support_pop-up',
@@ -380,6 +393,35 @@ test('replaces matching legacy block in-place when duplicateMatches is provided'
   assert.equal(entries[1].imagePath, 'C:/tmp/Celine Holiday Gift Special.png');
   assert.equal(entries[1].isTicket, true);
   assert.equal(entries[1].schedule.end.date, '2026-12-31');
+});
+
+test('replaces Thanksgiving popup among 3 legacy popups and preserves other 2 popups', () => {
+  const tickets = [{
+    ticketIndex: 0,
+    uploadPath: 'C:/tmp/thanksgiving-updated.png',
+    filename: 'thanksgiving-updated.png',
+    schedule: { start: null, end: null }
+  }];
+  const legacy = [
+    { imagePath: 'C:/tmp/thanksgiving-old.webp', sourceImageUrl: 'https://cdn.example/thanksgiving-old.webp', end: null },
+    { imagePath: 'C:/tmp/christmas.webp', sourceImageUrl: 'https://cdn.example/christmas.webp', end: { date: '2026-12-25' } },
+    { imagePath: 'C:/tmp/feet-care.webp', sourceImageUrl: 'https://cdn.example/feet-care.webp', end: null }
+  ];
+  const duplicateMatches = [{
+    ticketIndex: 0,
+    cmsIndex: 0,
+    method: 'visual-similarity',
+    similarity: 0.88
+  }];
+  const { entries, matchingLegacyIndex } = buildPopupEntriesForTickets(tickets, legacy, duplicateMatches, { replaceExisting: true });
+  assert.equal(matchingLegacyIndex, 0);
+  assert.equal(entries.length, 3);
+  assert.equal(entries[0].imagePath, 'C:/tmp/thanksgiving-updated.png');
+  assert.equal(entries[0].isTicket, true);
+  assert.equal(entries[1].imagePath, 'C:/tmp/christmas.webp');
+  assert.equal(entries[1].isTicket, false);
+  assert.equal(entries[2].imagePath, 'C:/tmp/feet-care.webp');
+  assert.equal(entries[2].isTicket, false);
 });
 
 test('replaces single legacy popup directly when replaceExisting is true and duplicateMatches is empty', () => {
@@ -885,6 +927,26 @@ test('extractPopupLink returns null when ticket has no URL', () => {
   assert.equal(url, null);
 });
 
+test('extractPopupLink returns null for salon Link website URL without explicit popup linking instruction', () => {
+  const text = [
+    'ID#18781 - Creating pop-ups',
+    'Link website: https://nailsalonprestige.com',
+    'Nhờ team hỗ trợ tạo pop-ups cho website đến ngày 28/11/2026.',
+    'Thank team.'
+  ].join('\n');
+  assert.equal(extractPopupLink(text), null);
+});
+
+test('extractPopupLink returns null for generic Website and Domain URLs', () => {
+  const text = [
+    'ID#12345 - Support',
+    'Website: https://example.com',
+    'Domain: https://example.com',
+    'Nhờ team đăng popup giùm mình.'
+  ].join('\n');
+  assert.equal(extractPopupLink(text), null);
+});
+
 test('ticketData includes popupLink from ticket text', () => {
   const ticket = parsed([
     'ID#9876 - Website Support',
@@ -901,4 +963,156 @@ test('ticketData popupLink is null when no URL in ticket', () => {
     'Nho team pop up poster dinh kem'
   ].join('\n'), 1575575);
   assert.equal(ticket.popupLink, null);
+});
+
+test('ticketData extracts expiry date for holiday closure notice "thông báo nghỉ ngày thanksgiving 26" (ticket 1601781)', () => {
+  const currentYear = new Date().getUTCFullYear();
+  const ticket = parsed([
+    'ID#20566 - Update website',
+    '#1601781',
+    'Nhờ team hỗ trợ thông báo nghỉ ngày thanksgiving 26.'
+  ].join('\n'), 1601781);
+  assert.equal(ticket.expiryDate, `${currentYear}-11-26`);
+  assert.equal(ticket.startDate, null);
+  const schedule = popupScheduleFromTicket(ticket);
+  assert.equal(schedule.end?.date, `${currentYear}-11-26`);
+  assert.equal(schedule.start, null);
+});
+
+test('ticketData extracts expiry date for "tiệm nghỉ lễ thanksgiving 26"', () => {
+  const currentYear = new Date().getUTCFullYear();
+  const ticket = parsed([
+    'ID#18781 - Support',
+    'Nhờ team pop up hình ảnh tiệm nghỉ lễ thanksgiving 26.'
+  ].join('\n'), 1601782);
+  assert.equal(ticket.expiryDate, `${currentYear}-11-26`);
+  const schedule = popupScheduleFromTicket(ticket);
+  assert.equal(schedule.end?.date, `${currentYear}-11-26`);
+});
+
+test('ticketData extracts expiry date for "thông báo tiệm nghỉ ngày 26/11"', () => {
+  const currentYear = new Date().getUTCFullYear();
+  const ticket = parsed([
+    'ID#18781 - Support',
+    'Thông báo tiệm nghỉ ngày 26/11, cảm ơn team.'
+  ].join('\n'), 1601783);
+  assert.equal(ticket.expiryDate, `${currentYear}-11-26`);
+  const schedule = popupScheduleFromTicket(ticket);
+  assert.equal(schedule.end?.date, `${currentYear}-11-26`);
+});
+
+test('ticketData extracts date range for holiday closure "tiệm nghỉ từ 24/11 đến 26/11"', () => {
+  const currentYear = new Date().getUTCFullYear();
+  const ticket = parsed([
+    'ID#18781 - Support',
+    'Nhờ team pop up poster tiệm nghỉ từ 24/11 đến 26/11.'
+  ].join('\n'), 1601784);
+  assert.equal(ticket.startDate, `${currentYear}-11-24`);
+  assert.equal(ticket.expiryDate, `${currentYear}-11-26`);
+  const schedule = popupScheduleFromTicket(ticket);
+  assert.equal(schedule.start?.date, `${currentYear}-11-24`);
+  assert.equal(schedule.end?.date, `${currentYear}-11-26`);
+});
+
+test('extractPopupDuration parses requested seconds and adds 3s open delay', () => {
+  const { extractPopupDuration, POPUP_OPEN_DELAY_SECONDS } = require('../src/ticket-parser');
+  assert.equal(POPUP_OPEN_DELAY_SECONDS, 3);
+
+  const dur1 = extractPopupDuration('Nhờ team chỉnh popup xuất hiện lâu hơn tầm 10s giúp em.');
+  assert.deepEqual(dur1, { requestedSeconds: 10, delaySliderSeconds: 13, isExplicitSlider: false });
+
+  const dur2 = extractPopupDuration('Ticket yêu cầu popup hiển thị 10s');
+  assert.deepEqual(dur2, { requestedSeconds: 10, delaySliderSeconds: 13, isExplicitSlider: false });
+
+  const dur3 = extractPopupDuration('Chỉnh delay slider trong popup settings lên 13s');
+  assert.deepEqual(dur3, { requestedSeconds: 10, delaySliderSeconds: 13, isExplicitSlider: true });
+
+  const dur4 = extractPopupDuration('Nhờ team pop up poster đính kèm, hạn tới 11/26.');
+  assert.equal(dur4, null);
+
+  const dur5 = extractPopupDuration('Nhờ team hỗ trợ pop up poster bên dưới lên website khoảng 10s');
+  assert.deepEqual(dur5, { requestedSeconds: 10, delaySliderSeconds: 13, isExplicitSlider: false });
+
+  const unrelatedDuration = extractPopupDuration('Thời gian tải trang là 10s, popup giữ nguyên.');
+  assert.equal(unrelatedDuration, null);
+});
+
+test('ticketData extracts popupDuration for ticket 11195 phrasing', () => {
+  const ticket = parsed([
+    'ID#11195 - Website support - Pop up poster',
+    'Hi team',
+    'Nhờ team hỗ trợ pop up poster bên dưới lên website khoảng 10s',
+    'Exp: 11/26/2026',
+    'Thank team'
+  ].join('\n'), 11195);
+
+  assert.equal(ticket.siteId, '11195');
+  assert.equal(ticket.popupAction, 'create');
+  assert.ok(ticket.popupDuration);
+  assert.equal(ticket.popupDuration.requestedSeconds, 10);
+  assert.equal(ticket.popupDuration.delaySliderSeconds, 13);
+  assert.equal(ticket.expiryDate, '2026-11-26');
+});
+
+test('ticketData detects popupAction "update-duration" for duration-only ticket without poster upload (ticket 1602842)', () => {
+  const ticket = parsed([
+    'ID#3349 - Chỉnh thời gian popup',
+    'Nhờ team chỉnh popup xuất hiện lâu hơn tầm 10s giúp em.',
+    'Thank team.'
+  ].join('\n'), 1602842);
+
+  assert.equal(ticket.popupAction, 'update-duration');
+  assert.ok(ticket.popupDuration);
+  assert.equal(ticket.popupDuration.requestedSeconds, 10);
+  assert.equal(ticket.popupDuration.delaySliderSeconds, 13);
+});
+
+test('ticketData preserves popupDuration while keeping popupAction "create" when poster is also uploaded', () => {
+  const ticket = parsed([
+    'ID#3349 - Up poster mới',
+    'Nhờ team up poster đính kèm và chỉnh popup hiển thị 10s giúp em.',
+    'Hạn tới cuối tháng.',
+    'Thank team.'
+  ].join('\n'), 1602843);
+
+  assert.equal(ticket.popupAction, 'create');
+  assert.ok(ticket.popupDuration);
+  assert.equal(ticket.popupDuration.requestedSeconds, 10);
+  assert.equal(ticket.popupDuration.delaySliderSeconds, 13);
+});
+
+test('ticketData extracts expiry 2026-11-27 from "ẩn sau 11/27/2026" without picking CRM header date (ticket 1603527)', () => {
+  const body = [
+    'ID#9412 - SUPPORT - WEBSITE -THANKSGIVING CLOSED',
+    'Download',
+    'Reload',
+    'Open',
+    'Normal',
+    'Nov 21, 2026 5:00 AMCelestial Beauty Loungevia Mai Anh (Laila)(assign)- Last update assignee by Tai Nguyen (TE)',
+    '',
+    'Hi team,',
+    '',
+    'Nhờ team pop-up poster và ẩn sau 11/27/2026 dùm',
+    '',
+    'Thanks team'
+  ].join('\n');
+  const ticket = parsed(body, 1603527);
+  assert.equal(ticket.expiryDate, '2026-11-27');
+  assert.equal(ticket.siteId, '9412');
+  assert.equal(ticket.popupAction, 'create');
+});
+
+test('ticketData extracts expiry dates with Vietnamese removal/hiding phrasing variants', () => {
+  const currentYear = new Date().getUTCFullYear();
+  const t1 = parsed('ID#100 - Support\nNhờ team up poster tắt sau 11/27/2026 giúp', 100);
+  assert.equal(t1.expiryDate, `${currentYear}-11-27`);
+
+  const t2 = parsed('ID#100 - Support\nNhờ team gỡ sau ngày 28/11/2026', 101);
+  assert.equal(t2.expiryDate, `${currentYear}-11-28`);
+
+  const t3 = parsed('ID#100 - Support\nNhờ team ẩn vào ngày 11/30/2026', 102);
+  assert.equal(t3.expiryDate, `${currentYear}-11-30`);
+
+  const t4 = parsed('ID#100 - Support\nPlease pop up poster and hide after 11/27/2026', 103);
+  assert.equal(t4.expiryDate, `${currentYear}-11-27`);
 });

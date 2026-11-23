@@ -5,7 +5,8 @@ const {
   popupDateFromCmsValue,
   popupItemScheduleMatches,
   resolvePopupItemByImageAndSchedule,
-  verifyPersistedPopupItem
+  verifyPersistedPopupItem,
+  popupItemsForReport
 } = require('../src/cms/popup-verification');
 const { setPopupImageLink } = require('../src/run');
 
@@ -94,6 +95,37 @@ test('resolves poster when entry has its own vision-derived schedule', () => {
   assert.equal(resolved.item, cmsItem);
 });
 
+test('verifies persistence when salon already has multiple popups (e.g. 4 items, expectedCount 1)', () => {
+  const schedule = { start: null, end: { date: '2026-11-30' } };
+  const existing1 = { image: 'https://cdn.example/1.webp', time_start: '', time_end: '2026-10-31' };
+  const existing2 = { image: 'https://cdn.example/2.webp', time_start: '', time_end: '2026-12-31' };
+  const existing3 = { image: 'https://cdn.example/3.webp', time_start: '', time_end: '2027-01-01' };
+  const newPoster = { image: 'https://cdn.example/1599478-poster.png', time_start: '', time_end: '2026-11-30' };
+
+  // Case A: verified with previewImageUrl
+  const resultA = verifyPersistedPopupItem({
+    afterItems: [existing1, existing2, existing3, newPoster],
+    targetIndex: 0,
+    expectedCount: 1,
+    schedule,
+    timezone,
+    previewImageUrl: 'blob:https://cdn.example/1599478-poster.png'
+  });
+  assert.equal(resultA.ok, true);
+  assert.equal(resultA.item, newPoster);
+
+  // Case B: verified without previewImageUrl (by schedule match on lastItem)
+  const resultB = verifyPersistedPopupItem({
+    afterItems: [existing1, existing2, existing3, newPoster],
+    targetIndex: 0,
+    expectedCount: 1,
+    schedule,
+    timezone
+  });
+  assert.equal(resultB.ok, true);
+  assert.equal(resultB.item, newPoster);
+});
+
 test('accurately locates removal target items by stableImageUrl', () => {
   const currentList = [
     { image: 'https://cdn.example/red-light.webp?t=1', time_start: null, time_end: null },
@@ -163,4 +195,17 @@ test('setPopupImageLink locates and fills the Image link control', async () => {
   const result = await setPopupImageLink(mockPage, 'http://booking.gocheckin.net/v2/16675');
   assert.equal(result, 'http://booking.gocheckin.net/v2/16675');
   assert.equal(filledValue, 'http://booking.gocheckin.net/v2/16675');
+});
+
+test('popupItemsForReport maps CMS items safely for error reporting', () => {
+  const items = [
+    { image: 'https://cdn.example/pic.webp?cache=1', time_start: '2026-11-20', time_end: '2026-12-30' },
+    { image: '', time_start: '', time_end: '' }
+  ];
+  const report = popupItemsForReport(items, timezone);
+  assert.equal(report.length, 2);
+  assert.equal(report[0].image, 'https://cdn.example/pic.webp');
+  assert.equal(report[0].empty, false);
+  assert.equal(report[1].image, null);
+  assert.equal(report[1].empty, true);
 });

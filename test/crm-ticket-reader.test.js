@@ -6,7 +6,8 @@ const {
   ticketMarkerPattern,
   hasWebsiteIdHeader,
   isInlineTicketImageUrl,
-  filenameFromImageUrl
+  filenameFromImageUrl,
+  isElementDisplayed
 } = require('../src/crm/ticket-reader');
 
 test('reads a CRM detail ticket number without accepting unrelated paths', () => {
@@ -45,4 +46,82 @@ test('reports browser offline only when the page and navigator agree', () => {
   assert.equal(browserProblem('No internet connection', false), 'browser-offline');
   assert.equal(browserProblem('No internet connection', true), null);
   assert.equal(browserProblem('Ticket loaded', false), null);
+});
+
+test('isElementDisplayed returns true when locator is visible', async () => {
+  const locator = {
+    isVisible: async () => true,
+    evaluate: async () => true
+  };
+  assert.equal(await isElementDisplayed(locator), true);
+});
+
+test('isElementDisplayed rejects zero-size controls when the window is minimized', async () => {
+  const locator = {
+    isVisible: async () => false,
+    evaluate: async (fn) => {
+      // Simulate an element that has display: block in DOM even if minimized (0x0 rect)
+      const fakeElement = {
+        parentElement: null,
+        hidden: false,
+        getAttribute: () => null,
+        hasAttribute: () => false,
+        getBoundingClientRect: () => ({ width: 0, height: 0, top: 0, left: 0, right: 0, bottom: 0 })
+      };
+      global.window = {
+        getComputedStyle: () => ({ display: 'block', visibility: 'visible', opacity: '1' }),
+        innerWidth: 0,
+        innerHeight: 0
+      };
+      global.document = { documentElement: { clientWidth: 0, clientHeight: 0 } };
+      global.Element = Object;
+      try {
+        return fn(fakeElement);
+      } finally {
+        delete global.window;
+        delete global.document;
+        delete global.Element;
+      }
+    }
+  };
+  assert.equal(await isElementDisplayed(locator), false);
+});
+
+test('isElementDisplayed returns false when element is display: none in DOM', async () => {
+  const locator = {
+    isVisible: async () => false,
+    evaluate: async (fn) => {
+      const fakeElement = {
+        parentElement: null,
+        hidden: false,
+        getAttribute: () => null,
+        hasAttribute: () => false,
+        getBoundingClientRect: () => ({ width: 20, height: 20, top: 0, left: 0, right: 20, bottom: 20 })
+      };
+      global.window = {
+        getComputedStyle: () => ({ display: 'none', visibility: 'visible', opacity: '1' }),
+        innerWidth: 100,
+        innerHeight: 100
+      };
+      global.document = { documentElement: { clientWidth: 100, clientHeight: 100 } };
+      global.Element = Object;
+      try {
+        return fn(fakeElement);
+      } finally {
+        delete global.window;
+        delete global.document;
+        delete global.Element;
+      }
+    }
+  };
+  assert.equal(await isElementDisplayed(locator), false);
+});
+
+test('isElementDisplayed returns false when locator is null or throws', async () => {
+  assert.equal(await isElementDisplayed(null), false);
+  const throwingLocator = {
+    isVisible: async () => { throw new Error('disconnected'); },
+    evaluate: async () => { throw new Error('disconnected'); }
+  };
+  assert.equal(await isElementDisplayed(throwingLocator), false);
 });

@@ -149,6 +149,7 @@ async function requestCmsAccount(options = {}) {
 function renderCmsAccount(status) {
   cmsAccountState = status || null;
   const configured = Boolean(status?.configured);
+  const needsReconfigure = Boolean(status?.needsReconfigure);
   const canSave = Boolean(status?.canSave);
   cmsAccountBadge.textContent = configured ? 'Đã lưu' : 'Chưa cấu hình';
   cmsAccountBadge.className = `status-badge status-${configured ? 'success' : 'warning'}`;
@@ -158,18 +159,21 @@ function renderCmsAccount(status) {
   cmsAccountDelete.hidden = status?.source === 'environment';
   cmsAccountDelete.disabled = !canSave;
   cmsAccountSave.textContent = configured ? 'Lưu thay đổi' : 'Lưu mã hóa';
-  cmsAccountSummary.hidden = !configured || cmsAccountEditing;
+  cmsAccountSummary.hidden = !configured || cmsAccountEditing || needsReconfigure;
   cmsAccountCurrentIdentifier.textContent = status?.identifier || '(không có tài khoản)';
-  cmsAccountPasswordOptional.textContent = configured ? '(để trống nếu giữ mật khẩu hiện tại)' : '';
-  cmsAccountPassword.placeholder = configured ? 'Để trống để giữ mật khẩu hiện tại' : 'Nhập mật khẩu';
-  cmsAccountForm.hidden = configured && !cmsAccountEditing;
-  cmsAccountCancel.hidden = !configured;
-  cmsAccountEdit.hidden = !configured || !canSave;
+  cmsAccountPasswordOptional.textContent = configured && !needsReconfigure ? '(để trống nếu giữ mật khẩu hiện tại)' : '';
+  cmsAccountPassword.placeholder = configured && !needsReconfigure ? 'Để trống để giữ mật khẩu hiện tại' : 'Nhập mật khẩu';
+  cmsAccountForm.hidden = configured && !cmsAccountEditing && !needsReconfigure;
+  cmsAccountCancel.hidden = !configured || needsReconfigure;
+  cmsAccountEdit.hidden = !configured || !canSave || needsReconfigure;
   if (configured && !cmsAccountEditing) {
     cmsAccountIdentifier.value = status?.identifier || '';
     cmsAccountPassword.value = '';
   }
-  if (status?.source === 'environment') {
+  if (needsReconfigure) {
+    cmsAccountForm.hidden = false;
+    setCmsAccountMessage('Credential CMS đã lưu không thể giải mã bằng Windows user hiện tại. Hãy nhập lại mật khẩu để lưu thay thế.');
+  } else if (status?.source === 'environment') {
     setCmsAccountMessage('Đang dùng credential từ biến môi trường. Bạn vẫn có thể lưu tài khoản khác tại đây; tài khoản đã lưu sẽ được ưu tiên.');
   } else if (configured) {
     setCmsAccountMessage(cmsAccountEditing
@@ -196,7 +200,7 @@ async function refreshCmsAccount() {
 async function saveCmsAccount() {
   const identifier = cmsAccountIdentifier.value.trim();
   const password = cmsAccountPassword.value;
-  if (!identifier || (!password && !cmsAccountState?.configured)) {
+  if (!identifier || (!password && (!cmsAccountState?.configured || cmsAccountState?.needsReconfigure))) {
     setCmsAccountMessage('Hãy nhập tài khoản CMS và mật khẩu khi cấu hình lần đầu.', true);
     return;
   }
@@ -510,6 +514,13 @@ function renderResult(result) {
       'Ngày hết hạn',
       result.ticket.expiryDate || result.ticket.expiry || (popupItemsWithSchedule.length ? 'Theo lịch riêng từng poster' : 'Không có trong ticket/poster')
     );
+    if (result.ticket.artworkExpiryDate) {
+      if (result.ticket.scheduleSource === 'poster-artwork') {
+        field('Nguồn ngày hết hạn', `Đọc từ ảnh popup poster (Gemini Vision: ${result.ticket.artworkExpiryDate})`);
+      } else if (result.ticket.expiryDate && result.ticket.expiryDate !== result.ticket.artworkExpiryDate) {
+        field('Hạn trên ảnh poster', `${result.ticket.artworkExpiryDate} (ưu tiên dùng hạn ghi trong ticket: ${result.ticket.expiryDate})`);
+      }
+    }
     if (result.ticket.endYearRolledOver) field('Năm kết thúc', 'Đã tự chuyển sang năm sau theo khoảng ngày trong ticket');
     field('Attachment poster', result.ticket.attachmentAvailable ? 'Đã phát hiện' : 'Không tìm thấy');
     if (result.ticket.attachmentCount > 1) {
@@ -536,7 +547,10 @@ function renderResult(result) {
   }
   if (result.semantic) {
     const applied = result.semantic.appliedFields?.length ? ` · Bổ sung: ${result.semantic.appliedFields.join(', ')}` : '';
-    const label = result.semantic.status === 'enriched'
+    const hasSemanticKeyError = result.semantic.warnings?.some((w) => /api\s*key\s*not\s*valid|không\s*hợp\s*lệ/i.test(w));
+    const label = hasSemanticKeyError
+      ? '⚠️ Gemini API key không hợp lệ hoặc đã hết hạn — hãy cập nhật key mới ở mục Cấu hình Gemini'
+      : result.semantic.status === 'enriched'
       ? `Gemini đã xác minh và bổ sung dữ liệu${applied}`
       : result.semantic.status === 'verified'
         ? 'Gemini đã xác minh ngữ nghĩa; parser cục bộ đã đủ dữ liệu'
@@ -548,7 +562,10 @@ function renderResult(result) {
     field('Đọc ngữ nghĩa ticket', label);
   }
   if (result.vision) {
-    const visionLabel = result.vision.status === 'selected-set'
+    const hasVisionKeyError = result.vision.warnings?.some((w) => /api\s*key\s*not\s*valid|không\s*hợp\s*lệ/i.test(w));
+    const visionLabel = hasVisionKeyError
+      ? '⚠️ Gemini Vision API key không hợp lệ hoặc đã hết hạn — hãy cập nhật key mới ở mục Cấu hình Gemini'
+      : result.vision.status === 'selected-set'
       ? `Gemini Vision đã xác nhận bộ poster${result.vision.rationale ? ` · ${result.vision.rationale}` : ''}`
       : result.vision.status === 'selected'
       ? `Gemini Vision đã xác nhận poster${result.vision.rationale ? ` · ${result.vision.rationale}` : ''}`

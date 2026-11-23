@@ -46,31 +46,26 @@ jobs:
           body: |
             ## Popup Ticket Runner v${{ steps.pkg.outputs.version }}
             - Commit: `${{ github.sha }}`
-            - **Tối ưu hóa tốc độ chạy ticket:**
-              - Cắt giảm các khoảng chờ tĩnh không cần thiết (`waitForTimeout`), chuyển sang chờ có điều kiện DOM (`waitFor`, `waitForURL`).
-              - Giảm debounce search CMS từ 1500ms xuống 400ms.
-              - Tối ưu hóa chụp ảnh màn hình báo cáo trung gian (chuyển sang chụp viewport `fullPage: false`), giảm 8 - 10 giây cho mỗi lượt chạy ticket.
-            - **Khắc phục triệt để lỗi khi ẩn tab / minimize cửa sổ CRM khi tool đang chạy:**
-              - Bổ sung các cờ chống background throttling cho Chromium (`--disable-background-timer-throttling`, `--disable-backgrounding-occluded-windows`, `--disable-renderer-backgrounding`).
-              - Chuyển cơ chế `waitForFunction` sang polling timer cố định 150ms thay vì `requestAnimationFrame` (vốn bị Windows freeze khi cửa sổ bị ẩn/minimize).
-              - Tự động tìm và kích hoạt lại tab Ticket mục tiêu trong CRM nếu người dùng chuyển tab.
-            - Bổ sung tính năng xác minh trạng thái CMS cuối cùng sau khi Build: kiểm tra `status_build = COMPLETE`, trạng thái dự án, và live website HTTP 200 OK.
-            - Sửa lỗi nhận diện nhầm thông báo "Saved successfully" (khi lưu nháp ở 1%) thành build hoàn tất, đảm bảo tool luôn chờ đến khi CMS build xong 100%.
-            - Nhận diện ngữ nghĩa lịch vô thời hạn ("Đến khi khách tắt" / "Không set hạn") và clear sạch 2 ô ngày `Time start` / `Time end`.
-            - Chuẩn hóa nhận diện ngày tháng tiếng Anh và tránh nhầm lẫn từ khóa `FROM` trong tên tiệm.
-            - Tự động đăng nhập CMS (CMS Auto-Login).
-            - Tải file **`Popup Ticket Runner Final.exe`** ở mục Assets bên dưới để sử dụng trực tiếp không cần cài đặt.
+            - **Tự động đưa popup mới của ticket lên vị trí đầu tiên (Card 1):**
+              - Mặc định mọi popup mới từ ticket đều được đưa lên vị trí đầu tiên (Card 1 / Top Priority) trong Popup settings.
+              - Khi nâng cấp plugin / chuyển block (migration), tất cả các popup cũ còn hạn được giữ lại sẽ xếp nối tiếp phía sau (Card 2, 3, 4...) và bảo lưu 100% thứ tự tương đối ban đầu.
+              - Bảo toàn vị trí khi thay thế (replace) ảnh cũ tại đúng slot của ảnh đó.
+            - **Tự động đọc ảnh poster bằng Gemini Vision để tìm ngày hết hạn (Promotion Period / Expiration Date):**
+              - Gemini Vision luôn tự động quét ảnh poster để đọc ngày khuyến mãi / ngày kết thúc (kể cả định dạng độc lập không kèm năm như `Dec 31`, `November 22 – December 31`).
+              - Chuẩn hóa thứ tự ưu tiên (Precedence): Nếu note ticket có ghi ngày -> ưu tiên dùng ngày note ticket; Nếu note ticket không ghi ngày -> tự động kế thừa ngày từ ảnh poster popup.
+            - **Tối ưu hóa và ổn định kết nối Gemini Vision:**
+              - Chuyển sang model mặc định `gemini-flash-lite-latest` siêu nhanh (1.8s text, 4.5s vision) với hạn mức lớn, không bị chạm ngưỡng 20 lượt/ngày.
+              - Tự động xoay vòng model dự phòng (Auto-fallback) giữa `gemini-flash-lite-latest`, `gemini-3.1-flash-lite`, `gemini-3.5-flash` khi Google gặp lỗi quá tải (503) hoặc chạm hạn mức (429).
+              - Tích hợp sẵn API key nội bộ hoạt động out-of-the-box cho mọi máy, không bắt buộc người dùng phải tự cấu hình key cá nhân.
+            - **Sửa lỗi Time delay slider:**
+              - Đảm bảo điền chính xác giá trị thời gian chờ slider (mặc định 5s hoặc theo ticket yêu cầu).
+            - **Cải tiến độ trễ tải ảnh CRM:**
+              - Tăng thời gian chờ CRM render upload card để không bị rớt ảnh đính kèm khi mạng chậm.
+              - Tự động quét Vision ngay trên file ảnh đã tải về máy qua cơ chế fallback.
+            - **Tải file executable:** Tải file **`Popup Ticket Runner Final.exe`** ở mục Assets bên dưới để sử dụng trực tiếp không cần cài đặt.
           files: dist/Popup Ticket Runner Final.exe
           draft: false
           prerelease: false
           make_latest: true
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Delete older releases (Keep only latest)
-        uses: dev-drprasad/delete-older-releases@v0.3.3
-        with:
-          keep_latest: 1
-          delete_tags: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

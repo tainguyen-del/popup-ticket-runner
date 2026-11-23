@@ -5,7 +5,8 @@ const {
   requestedPopupPosition,
   hasAffirmativePopupRemoval,
   hasAffirmativePopupUpdate,
-  hasAffirmativePopupReplace
+  hasAffirmativePopupReplace,
+  normalizeExpiry
 } = require('./ticket-parser');
 const { formatCasesForPrompt } = require('./case-knowledge');
 
@@ -19,7 +20,7 @@ const { formatCasesForPrompt } = require('./case-knowledge');
 // accepts the key but does not reliably accept Gemini's JSON response
 // configuration, which silently left ticket semantics unavailable.
 // Users can still override it with GEMINI_MODEL without changing source.
-const DEFAULT_GEMINI_MODEL = 'gemini-3.1-flash-lite';
+const DEFAULT_GEMINI_MODEL = 'gemini-flash-lite-latest';
 const DEFAULT_GEMINI_API_KEY = Buffer.from(
   'QVEuQWI4Uk42TEpDM0xoMjM4OXJDMzlvT25xYkNuazVWYmhlcExtTVdFNUZvanRYSTI0X0E=',
   'base64'
@@ -27,7 +28,13 @@ const DEFAULT_GEMINI_API_KEY = Buffer.from(
 // Vision requests use a documented multimodal Gemini model independently of
 // the existing text-only model setting. It can be overridden for an account
 // that has a different model allow-list.
-const DEFAULT_GEMINI_VISION_MODEL = 'gemini-3.1-flash-lite';
+const DEFAULT_GEMINI_VISION_MODEL = 'gemini-flash-lite-latest';
+const FALLBACK_GEMINI_MODELS = ['gemini-flash-lite-latest', 'gemini-3.1-flash-lite', 'gemini-3.5-flash'];
+
+function geminiCandidateModels(primaryModel) {
+  const models = [primaryModel, ...FALLBACK_GEMINI_MODELS].filter(Boolean);
+  return [...new Set(models)];
+}
 const GEMINI_MAX_ATTEMPTS = 3;
 const GEMINI_TEXT_TIMEOUT_MS = 30000;
 const GEMINI_VISION_TIMEOUT_MS = 45000;
@@ -70,12 +77,12 @@ const VISION_SELECTION_SCHEMA = {
     popupAttachmentIndex: { type: ['integer', 'null'], minimum: 1 },
     posterSchedule: {
       type: ['object', 'null'],
-      description: 'Display schedule explicitly printed on the selected poster artwork, or null when no explicit display-window language or promotional date range is visible.',
+      description: 'Display schedule explicitly printed on the selected poster artwork, or null when no promotional expiration date or display-window language is visible.',
       properties: {
         attachmentIndex: { type: 'integer', minimum: 1 },
         startDate: { type: ['string', 'null'], description: 'Explicit artwork display start date as YYYY-MM-DD, otherwise null.' },
-        endDate: { type: ['string', 'null'], description: 'Explicit artwork display expiry/end date as YYYY-MM-DD, otherwise null.' },
-        evidence: { type: ['string', 'null'], description: 'Short exact artwork phrase such as "Valid November 1 to December 31" or "NOV 16 - DEC 7", otherwise null.' },
+        endDate: { type: ['string', 'null'], description: 'Explicit artwork display expiry/end date as YYYY-MM-DD (e.g. "Dec 31" -> 2026-12-31), otherwise null.' },
+        evidence: { type: ['string', 'null'], description: 'Short exact artwork phrase such as "Dec 31", "December 31", "Valid November 1 to December 31", or "NOV 16 - DEC 7", otherwise null.' },
         confidence: { type: 'number', minimum: 0, maximum: 1 }
       },
       required: ['attachmentIndex', 'startDate', 'endDate', 'evidence', 'confidence'],
@@ -106,14 +113,14 @@ const MULTI_VISION_SELECTION_SCHEMA = {
     posterSchedules: {
       type: 'array',
       maxItems: 6,
-      description: 'One entry for every selected poster. Dates are populated from explicit validity/expiry language or prominent promotional date ranges (e.g. "NOV 16 - DEC 7") printed on that poster.',
+      description: 'One entry for every selected poster. Dates are populated from promotional expiration dates (e.g. "Dec 31", "12/31/2026") or prominent display windows (e.g. "NOV 16 - DEC 7") printed on that poster.',
       items: {
         type: 'object',
         properties: {
           attachmentIndex: { type: 'integer', minimum: 1 },
           startDate: { type: ['string', 'null'], description: 'Explicit artwork display start date as YYYY-MM-DD, otherwise null.' },
-          endDate: { type: ['string', 'null'], description: 'Explicit artwork display expiry/end date as YYYY-MM-DD, otherwise null.' },
-          evidence: { type: ['string', 'null'], description: 'Short exact artwork validity/expiry phrase or promotional date range, otherwise null.' },
+          endDate: { type: ['string', 'null'], description: 'Explicit artwork display expiry/end date as YYYY-MM-DD (e.g. "Dec 31" -> 2026-12-31), otherwise null.' },
+          evidence: { type: ['string', 'null'], description: 'Short exact artwork phrase such as "Dec 31", "December 31", "Valid November 1 to December 31", or "NOV 16 - DEC 7", otherwise null.' },
           confidence: { type: 'number', minimum: 0, maximum: 1 }
         },
         required: ['attachmentIndex', 'startDate', 'endDate', 'evidence', 'confidence'],
@@ -195,12 +202,23 @@ const POSTER_SCHEDULE_DATE_RANGE_PATTERN = new RegExp(
   ')',
   'i'
 );
-const POSTER_SCHEDULE_KEYWORD_PATTERN = /(?:\bvalid(?:ity)?\b|\bexp(?:ir(?:y|ation)|ires?)?\b|\buntil\b|\bthrough\b|\bthru\b|\btill\b|\beffective\b|\bends?\b|\bending\b|\bapplies?\s+from\b|\bapplied\s+from\b|\bdisplay(?:ed)?\s+(?:from|until|through)\b|\bshow(?:n|ing)?\s+(?:from|until|through)\b|\bgood\s+thr(?:u|ough)\b|\boffer\s+ends?\b|\bhsd\b)/i;
+const POSTER_SCHEDULE_KEYWORD_PATTERN = /(?:\bvalid(?:ity)?\b|\bexp(?:ir(?:y|ation)|ires?)?\b|\buntil\b|\bthrough\b|\bthru\b|\btill\b|\beffective\b|\bends?\b|\bending\b|\bapplies?\s+from\b|\bapplied\s+from\b|\bdisplay(?:ed)?\s+(?:from|until|through)\b|\bshow(?:n|ing)?\s+(?:from|until|through)\b|\bgood\s+thr(?:u|ough)\b|\boffer\s+ends?\b|\bhsd\b|\bhan\b|\bden\s+ngay\b|\bap\s+dung\b)/i;
+const POSTER_SCHEDULE_SINGLE_DATE_PATTERN = new RegExp(
+  '(?:' +
+    POSTER_SCHEDULE_MONTH_NAMES + '\\s+\\d{1,2}(?:\\s*,\\s*\\d{4})?' +
+    '|\\d{1,2}\\s+' + POSTER_SCHEDULE_MONTH_NAMES + '(?:\\s*,\\s*\\d{4})?' +
+    '|\\b\\d{1,2}[./-]\\d{1,2}(?:[./-]\\d{2,4})?\\b' +
+    '|\\b20\\d{2}[./-]\\d{1,2}[./-]\\d{1,2}\\b' +
+  ')',
+  'i'
+);
 
 function isValidPosterScheduleEvidence(evidence) {
   if (!evidence || typeof evidence !== 'string') return false;
   if (POSTER_SCHEDULE_CLOSURE_PATTERN.test(evidence)) return false;
-  return POSTER_SCHEDULE_KEYWORD_PATTERN.test(evidence) || POSTER_SCHEDULE_DATE_RANGE_PATTERN.test(evidence);
+  return POSTER_SCHEDULE_KEYWORD_PATTERN.test(evidence)
+    || POSTER_SCHEDULE_DATE_RANGE_PATTERN.test(evidence)
+    || POSTER_SCHEDULE_SINGLE_DATE_PATTERN.test(evidence);
 }
 
 const POSTER_SCHEDULE_EVIDENCE_PATTERN = {
@@ -241,8 +259,8 @@ function posterSchedulesFromResponse(rawSchedules, visionCandidates, selectedInd
     const rawEnd = raw?.endDate;
     const hasStart = rawStart !== null && rawStart !== undefined && rawStart !== '';
     const hasEnd = rawEnd !== null && rawEnd !== undefined && rawEnd !== '';
-    const startDate = hasStart && validIsoDate(rawStart) ? rawStart : null;
-    const endDate = hasEnd && validIsoDate(rawEnd) ? rawEnd : null;
+    const startDate = hasStart ? (validIsoDate(rawStart) ? rawStart : normalizeExpiry(rawStart)) : null;
+    const endDate = hasEnd ? (validIsoDate(rawEnd) ? rawEnd : normalizeExpiry(rawEnd)) : null;
     if ((hasStart && !startDate) || (hasEnd && !endDate)) {
       warnings.push(`Gemini returned an invalid artwork date for attachment #${attachmentIndex}; its artwork schedule was ignored.`);
       continue;
@@ -251,7 +269,7 @@ function posterSchedulesFromResponse(rawSchedules, visionCandidates, selectedInd
 
     const evidence = typeof raw?.evidence === 'string' ? raw.evidence.replace(/\s+/g, ' ').trim().slice(0, 300) : '';
     const confidence = Number(raw?.confidence);
-    if (!Number.isFinite(confidence) || confidence < 0.85 || !evidence || !isValidPosterScheduleEvidence(evidence)) {
+    if (!Number.isFinite(confidence) || confidence < 0.75 || !evidence || !isValidPosterScheduleEvidence(evidence)) {
       warnings.push(`Gemini did not provide sufficiently confident validity/expiry evidence for attachment #${attachmentIndex}; its artwork dates were ignored.`);
       continue;
     }
@@ -346,6 +364,7 @@ function semanticPrompt(ticketText, attachmentCandidates = []) {
     '- For numeric US support tickets, interpret MM.DD.YY and MM/DD/YY as 20YY; only use D/M when the first number is greater than 12.',
     '- Do not infer a missing end date from poster artwork, current date, ticket creation date, or general knowledge.',
     '- popupAttachmentIndex must be one numbered image attachment explicitly associated with the requested popup in the ticket/comment. Use null if more than one image could fit. Do not choose from the visual appearance of an image alone.',
+    '- In Vietnamese support instructions such as "gỡ [A] xuống và pop up [B]" or "gỡ [A] và pop up [B] (ảnh bên dưới)", "pop up [B]" uses "pop up" as a VERB meaning to create/publish popup B. The operation is "replace", old reference A is to be removed, and B is the new popup poster. Do NOT select A as popupAttachmentIndex; select B.',
     '',
     formatCasesForPrompt(),
     '',
@@ -386,14 +405,17 @@ function visionPrompt(ticketText, visionCandidates = []) {
     '- VIETNAMESE SUPPORT INSTRUCTIONS:',
     '  * "gỡ poster này xuống", "gỡ hình này", "xóa poster": The inline image directly below or beside this instruction is an old popup reference to REMOVE from CMS. Do NOT select it as the new poster.',
     '  * "thay bằng hình mới đính kèm", "hình mới đính kèm", "ảnh đính kèm", "file đính kèm": Points to the file upload attachment (marked [Category: File upload attachment / "hình mới đính kèm"]), which is the clean graphic design artwork to publish.',
+    '  * "gỡ pop up [A] xuống và pop up [B]" / "gỡ [A] và pop up [B] (ảnh bên dưới)": In Vietnamese support requests, "pop up [B]" uses "pop up" as a VERB meaning to CREATE/PUBLISH popup B. This means remove old popup A from the website, and publish new graphic artwork B as the new popup. Do NOT treat B as an image to remove; select B as the new popup poster to publish.',
     '- The new popup poster to publish must be a clean standalone graphic design artwork (promotional flyer/banner/poster), without website headers, browser UI, or modal close "X" buttons.',
     'Use visual content to distinguish seasonal posters (for example Halloween versus a new Holiday or promotion poster) when ticket text is not enough.',
     'A request to remove an old popup refers to the existing CMS popup, not necessarily an attachment in this ticket. Do not select an old CMS popup that is not shown as a candidate image.',
     'For the selected poster, return posterSchedule with the same attachmentIndex.',
-    'Read artwork dates only when the poster itself explicitly defines its promotion/display window, such as a prominent date range (e.g. "NOV 16 – DEC 7", "NOV 15 – DEC 31, 2026") or language such as "EXP: ...", "EXP. ...", "Valid ... to ...", "Expires", "Expiry", "Until", "Through", "Till", or "Good Thru".',
-    'Dates for closures, holidays, appointments, events, prices, or general promotion copy are not popup schedules. For example, "Closed on November 26" must return null dates.',
-    'If explicit validity/expiry artwork omits the year (e.g. "NOV 16 – DEC 7"), use a year only when the ticket/header explicitly supplies the applicable year (or from fine print on the artwork); otherwise return null dates.',
-    'Return null dates and null evidence when no explicit artwork display window exists. Copy a short exact artwork phrase into evidence for any non-null date.',
+    'ALWAYS CAREFULLY INSPECT THE POSTER IMAGE TO FIND THE PROMOTION EXPIRATION DATE OR DISPLAY WINDOW:',
+    '- Look for prominent promotion end dates printed anywhere on the artwork (e.g. "Dec 31", "December 31", "12/31", "12/31/2026", "DEC 31", "Valid until Dec 31", "Expires Dec 31", "EXP: 12/31", "Good thru Dec 31", or date ranges like "NOV 16 – DEC 7", "NOV 15 – DEC 31, 2026").',
+    '- Populate posterSchedule.endDate with the promotion end date in YYYY-MM-DD format. If the poster omits the year, infer the year from the ticket context/header or use the current year (2026). Copy the exact short artwork phrase into evidence (e.g. "Dec 31").',
+    '- If the poster displays a start date or date range, also populate posterSchedule.startDate.',
+    '- Dates for closures, holidays, appointments, events, prices, or general promotion copy are not popup schedules. For example, "Closed on November 26" must return null dates.',
+    '- Return null dates and null evidence only when no promotional display window or expiration date exists on the poster artwork.',
     '',
     '--- TICKET ---',
     ticketTextForSemanticPrompt(ticketText),
@@ -429,6 +451,7 @@ function multiVisionPrompt(ticketText, visionCandidates = []) {
     '- VIETNAMESE SUPPORT INSTRUCTIONS:',
     '  * "gỡ poster này xuống", "gỡ hình này", "xóa poster": The inline image directly below or beside this instruction is an old popup reference to REMOVE from CMS. Do NOT select it as the new poster.',
     '  * "thay bằng hình mới đính kèm", "hình mới đính kèm", "ảnh đính kèm", "file đính kèm": Points to the file upload attachment (marked [Category: File upload attachment / "hình mới đính kèm"]), which is the clean graphic design artwork to publish.',
+    '  * "gỡ pop up [A] xuống và pop up [B]" / "gỡ [A] và pop up [B] (ảnh bên dưới)": In Vietnamese support requests, "pop up [B]" uses "pop up" as a VERB meaning to CREATE/PUBLISH popup B. This means remove old popup A from the website, and publish new graphic artwork B as the new popup. Do NOT treat B as an image to remove; select B as the new popup poster to publish.',
     '- The new popup poster to publish must be a clean standalone graphic design artwork (promotional flyer/banner/poster), without website headers, browser UI, or modal close "X" buttons.',
     'IMPORTANT DISAMBIGUATION RULES FOR MULTIPLE ATTACHMENTS:',
     '- If the ticket requests a single popup poster (e.g. "pop up poster", "nhờ team pop up poster", "treo poster", singular form) or a generic update without explicit plural poster count, and an attachment appears in a later comment, that comment attachment typically updates, replaces, or corrects an earlier attachment. In this case, select ONLY that single intended/latest poster index, NOT both.',
@@ -436,10 +459,12 @@ function multiVisionPrompt(ticketText, visionCandidates = []) {
     'Return an empty array if the full set is uncertain. Never return a partial set merely because one image looks like a poster.',
     'Use image content and nearby ticket/comment text to exclude screenshots, old-popup references, logos, or unrelated attachments.',
     'Return one posterSchedules entry for every selected attachment index, in the same order.',
-    'Read artwork dates only when that poster explicitly defines its promotion/display window, such as a prominent date range (e.g. "NOV 16 – DEC 7", "NOV 15 – DEC 31, 2026") or language such as "EXP: ...", "EXP. ...", "Valid ... to ...", "Expires", "Expiry", "Until", "Through", "Till", or "Good Thru".',
-    'Dates for closures, holidays, appointments, events, prices, or general promotion copy are not popup schedules. For example, "Closed on November 26" must return null dates.',
-    'If explicit validity/expiry artwork omits the year (e.g. "NOV 16 – DEC 7"), use a year only when the ticket/header explicitly supplies the applicable year (or from fine print on the artwork); otherwise return null dates.',
-    'Return null dates and null evidence for a selected poster with no explicit artwork display window. Copy a short exact artwork phrase into evidence for any non-null date.',
+    'FOR EACH SELECTED POSTER, ALWAYS CAREFULLY INSPECT THE POSTER IMAGE TO FIND THE PROMOTION EXPIRATION DATE OR DISPLAY WINDOW:',
+    '- Look for prominent promotion end dates printed anywhere on that artwork (e.g. "Dec 31", "December 31", "12/31", "12/31/2026", "DEC 31", "Valid until Dec 31", "Expires Dec 31", "EXP: 12/31", "Good thru Dec 31", or date ranges like "NOV 16 – DEC 7", "NOV 15 – DEC 31, 2026").',
+    '- Populate posterSchedules.endDate with that poster\'s promotion end date in YYYY-MM-DD format. If the poster omits the year, infer the year from the ticket context/header or use the current year (2026). Copy the exact short artwork phrase into evidence (e.g. "Dec 31").',
+    '- If the poster displays a start date or date range, also populate posterSchedules.startDate.',
+    '- Dates for closures, holidays, appointments, events, prices, or general promotion copy are not popup schedules. For example, "Closed on November 26" must return null dates.',
+    '- Return null dates and null evidence only when no promotional display window or expiration date exists on that poster artwork.',
     '',
     '--- TICKET ---',
     ticketTextForSemanticPrompt(ticketText),
@@ -557,8 +582,12 @@ async function requestGeminiJson({
       });
       const payload = await response.json().catch(() => null);
       if (!response.ok) {
-        const error = new Error(`${requestLabel} failed (HTTP ${response.status}).`);
-        error.retryable = response.status === 408 || response.status === 425 || response.status === 429 || response.status >= 500;
+        const errorDetail = payload?.error?.message ? ` (${payload.error.message})` : '';
+        const error = new Error(`${requestLabel} failed (HTTP ${response.status})${errorDetail}.`);
+        if (payload?.error?.details?.some((d) => d.reason === 'API_KEY_INVALID') || payload?.error?.message?.includes('API key not valid')) {
+          error.code = 'gemini-key-invalid';
+        }
+        error.retryable = response.status === 408 || response.status === 425 || response.status >= 500;
         throw error;
       }
       const text = responseText(payload);
@@ -823,8 +852,8 @@ function mergeSemanticTicket(baseTicket, semantic, ticketText, model = DEFAULT_G
   }
 
   if (!ticket.isIndefinite) {
-    const semanticStart = validIsoDate(semantic.startDate) ? semantic.startDate : null;
-    const semanticEnd = validIsoDate(semantic.endDate) ? semantic.endDate : null;
+    const semanticStart = validIsoDate(semantic.startDate) ? semantic.startDate : normalizeExpiry(semantic.startDate);
+    const semanticEnd = validIsoDate(semantic.endDate) ? semantic.endDate : normalizeExpiry(semantic.endDate);
     applyMissing('startDate', semanticStart, 'startDate', dateEvidenceLooksRelevant);
     applyMissing('expiryDate', semanticEnd, 'endDate', dateEvidenceLooksRelevant);
     if (!ticket.start && ticket.startDate) ticket.start = ticket.startDate;
@@ -881,11 +910,15 @@ function mergeSemanticTicket(baseTicket, semantic, ticketText, model = DEFAULT_G
   // deterministic extractor already found; never replace an existing one.
   if (!ticket.popupLink) {
     const semanticLink = typeof semantic.popupLink === 'string' && /^https?:\/\//i.test(semantic.popupLink.trim())
-      ? semantic.popupLink.trim()
+      ? semantic.popupLink.trim().replace(/[.,;)]+$/, '')
       : null;
-    if (semanticLink) {
-      ticket.popupLink = semanticLink;
-      audit.appliedFields.push('popupLink');
+    if (semanticLink && !/^(?:https?:\/\/)?(?:crm|jira|api)\.fastboy\./i.test(semanticLink)) {
+      const websiteUrlMatch = /(?:link\s+website|website|domain|web)\s*[:=-]?\s*(https?:\/\/[^\s<>"']+)/i.exec(ticketText || '');
+      const websiteUrl = websiteUrlMatch ? websiteUrlMatch[1].replace(/[.,;)]+$/, '') : null;
+      if (!websiteUrl || semanticLink.toLowerCase() !== websiteUrl.toLowerCase()) {
+        ticket.popupLink = semanticLink;
+        audit.appliedFields.push('popupLink');
+      }
     }
   }
   if (audit.appliedFields.some((field) => ['startDate', 'expiryDate'].includes(field))) {
@@ -900,18 +933,31 @@ function mergeSemanticTicket(baseTicket, semantic, ticketText, model = DEFAULT_G
 }
 
 async function resolveTicketSemantics(baseTicket, ticketText, options = {}) {
-  const model = options.model || process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
+  const primaryModel = options.model || process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
   const key = options.apiKey || process.env.GEMINI_API_KEY || process.env.POPUP_TICKET_RUNNER_GEMINI_KEY || DEFAULT_GEMINI_API_KEY;
-  if (!key) return { ticket: baseTicket, audit: semanticAudit(model, 'disabled') };
-  try {
-    const response = await requestGeminiTicketJson(ticketText, { ...options, apiKey: key, model });
-    return mergeSemanticTicket(baseTicket, response.value, ticketText, response.model, options.attachmentCandidates || []);
-  } catch (error) {
-    // Intentionally do not include request details or the API key in the plan.
-    const audit = semanticAudit(model, 'unavailable');
-    audit.warnings.push(error?.code === 'gemini-key-missing' ? 'Gemini key is unavailable.' : 'Gemini semantic fallback was unavailable; deterministic parsing was used.');
-    return { ticket: baseTicket, audit };
+  if (!key) return { ticket: baseTicket, audit: semanticAudit(primaryModel, 'disabled') };
+  const models = options.model ? [options.model] : geminiCandidateModels(primaryModel);
+  let lastError = null;
+  let lastModel = primaryModel;
+  for (const model of models) {
+    lastModel = model;
+    try {
+      const response = await requestGeminiTicketJson(ticketText, { ...options, apiKey: key, model });
+      return mergeSemanticTicket(baseTicket, response.value, ticketText, response.model, options.attachmentCandidates || []);
+    } catch (error) {
+      lastError = error;
+      if (error?.code === 'gemini-key-missing' || error?.code === 'gemini-key-invalid') break;
+    }
   }
+  // Intentionally do not include request details or the API key in the plan.
+  const audit = semanticAudit(lastModel, 'unavailable');
+  const warning = lastError?.code === 'gemini-key-missing'
+    ? 'Gemini key is unavailable.'
+    : lastError?.code === 'gemini-key-invalid'
+      ? 'Gemini API key không hợp lệ hoặc đã hết hạn (Google báo: API key not valid). Hãy cấu hình API key mới.'
+      : 'Gemini semantic fallback was unavailable; deterministic parsing was used.';
+  audit.warnings.push(warning);
+  return { ticket: baseTicket, audit };
 }
 
 function visionAudit(model, status, extra = {}) {
@@ -979,110 +1025,149 @@ function removalVisionSelectionFromResponse(value, popupCandidates) {
 }
 
 async function resolveTicketVision(ticketText, visionCandidates, options = {}) {
-  const model = options.model || process.env.GEMINI_VISION_MODEL || DEFAULT_GEMINI_VISION_MODEL;
+  const primaryModel = options.model || process.env.GEMINI_VISION_MODEL || DEFAULT_GEMINI_VISION_MODEL;
   const key = options.apiKey || process.env.GEMINI_API_KEY || process.env.POPUP_TICKET_RUNNER_GEMINI_KEY || DEFAULT_GEMINI_API_KEY;
-  if (!key) return { selection: null, audit: visionAudit(model, 'disabled') };
-  try {
-    const response = await requestGeminiVisionJson(ticketText, visionCandidates, { ...options, apiKey: key, model });
-    const selection = visionSelectionFromResponse(response.value, visionCandidates);
-    const warnings = Array.isArray(response.value?.warnings)
-      ? response.value.warnings.filter((warning) => typeof warning === 'string').slice(0, 4)
-      : [];
-    if (!selection) {
+  if (!key) return { selection: null, audit: visionAudit(primaryModel, 'disabled') };
+  const models = options.model ? [options.model] : geminiCandidateModels(primaryModel);
+  let lastError = null;
+  let lastModel = primaryModel;
+  for (const model of models) {
+    lastModel = model;
+    try {
+      const response = await requestGeminiVisionJson(ticketText, visionCandidates, { ...options, apiKey: key, model });
+      const selection = visionSelectionFromResponse(response.value, visionCandidates);
+      const warnings = Array.isArray(response.value?.warnings)
+        ? response.value.warnings.filter((warning) => typeof warning === 'string').slice(0, 4)
+        : [];
+      if (!selection) {
+        return {
+          selection: null,
+          audit: visionAudit(response.model, 'ambiguous', { warnings: ['Gemini Vision did not identify one sufficiently confident ticket poster.', ...warnings] })
+        };
+      }
       return {
-        selection: null,
-        audit: visionAudit(response.model, 'ambiguous', { warnings: ['Gemini Vision did not identify one sufficiently confident ticket poster.', ...warnings] })
+        selection,
+        audit: visionAudit(response.model, 'selected', {
+          rationale: selection.rationale,
+          posterSchedules: selection.posterSchedules,
+          warnings: [...selection.scheduleWarnings, ...warnings].slice(0, 4)
+        })
       };
+    } catch (error) {
+      lastError = error;
+      if (error?.code === 'gemini-key-missing' || error?.code === 'gemini-key-invalid') break;
     }
-    return {
-      selection,
-      audit: visionAudit(response.model, 'selected', {
-        rationale: selection.rationale,
-        posterSchedules: selection.posterSchedules,
-        warnings: [...selection.scheduleWarnings, ...warnings].slice(0, 4)
-      })
-    };
-  } catch (error) {
-    return {
-      selection: null,
-      audit: visionAudit(model, 'unavailable', {
-        warnings: [error?.code === 'gemini-key-missing' ? 'Gemini Vision key is unavailable.' : 'Gemini Vision was unavailable; text-based attachment selection was used.']
-      })
-    };
   }
+  const warning = lastError?.code === 'gemini-key-missing'
+    ? 'Gemini Vision key is unavailable.'
+    : lastError?.code === 'gemini-key-invalid'
+      ? 'Gemini Vision API key không hợp lệ hoặc đã hết hạn (Google báo: API key not valid). Hãy cấu hình API key mới.'
+      : 'Gemini Vision was unavailable; text-based attachment selection was used.';
+  return {
+    selection: null,
+    audit: visionAudit(lastModel, 'unavailable', {
+      warnings: [warning]
+    })
+  };
 }
 
 async function resolveTicketPopupVisionSet(ticketText, visionCandidates, options = {}) {
-  const model = options.model || process.env.GEMINI_VISION_MODEL || DEFAULT_GEMINI_VISION_MODEL;
+  const primaryModel = options.model || process.env.GEMINI_VISION_MODEL || DEFAULT_GEMINI_VISION_MODEL;
   const key = options.apiKey || process.env.GEMINI_API_KEY || process.env.POPUP_TICKET_RUNNER_GEMINI_KEY || DEFAULT_GEMINI_API_KEY;
-  if (!key) return { selection: null, audit: visionAudit(model, 'disabled') };
-  try {
-    const response = await requestGeminiPopupVisionSetJson(ticketText, visionCandidates, { ...options, apiKey: key, model });
-    const selection = popupAttachmentSetFromResponse(response.value, visionCandidates);
-    const warnings = Array.isArray(response.value?.warnings)
-      ? response.value.warnings.filter((warning) => typeof warning === 'string').slice(0, 4)
-      : [];
-    if (!selection) {
+  if (!key) return { selection: null, audit: visionAudit(primaryModel, 'disabled') };
+  const models = options.model ? [options.model] : geminiCandidateModels(primaryModel);
+  let lastError = null;
+  let lastModel = primaryModel;
+  for (const model of models) {
+    lastModel = model;
+    try {
+      const response = await requestGeminiPopupVisionSetJson(ticketText, visionCandidates, { ...options, apiKey: key, model });
+      const selection = popupAttachmentSetFromResponse(response.value, visionCandidates);
+      const warnings = Array.isArray(response.value?.warnings)
+        ? response.value.warnings.filter((warning) => typeof warning === 'string').slice(0, 4)
+        : [];
+      if (!selection) {
+        return {
+          selection: null,
+          audit: visionAudit(response.model, 'ambiguous', { warnings: ['Gemini Vision did not identify a complete, sufficiently confident popup-poster set.', ...warnings] })
+        };
+      }
       return {
-        selection: null,
-        audit: visionAudit(response.model, 'ambiguous', { warnings: ['Gemini Vision did not identify a complete, sufficiently confident popup-poster set.', ...warnings] })
+        selection,
+        audit: visionAudit(response.model, 'selected-set', {
+          rationale: selection.rationale,
+          posterSchedules: selection.posterSchedules,
+          warnings: [...selection.scheduleWarnings, ...warnings].slice(0, 4)
+        })
       };
+    } catch (error) {
+      lastError = error;
+      if (error?.code === 'gemini-key-missing' || error?.code === 'gemini-key-invalid') break;
     }
-    return {
-      selection,
-      audit: visionAudit(response.model, 'selected-set', {
-        rationale: selection.rationale,
-        posterSchedules: selection.posterSchedules,
-        warnings: [...selection.scheduleWarnings, ...warnings].slice(0, 4)
-      })
-    };
-  } catch (error) {
-    return {
-      selection: null,
-      audit: visionAudit(model, 'unavailable', {
-        warnings: [error?.code === 'gemini-key-missing' ? 'Gemini Vision key is unavailable.' : 'Gemini Vision was unavailable; no multi-poster CMS change was made.']
-      })
-    };
   }
+  const warning = lastError?.code === 'gemini-key-missing'
+    ? 'Gemini Vision key is unavailable.'
+    : lastError?.code === 'gemini-key-invalid'
+      ? 'Gemini Vision API key không hợp lệ hoặc đã hết hạn (Google báo: API key not valid). Hãy cấu hình API key mới.'
+      : 'Gemini Vision was unavailable; no multi-poster CMS change was made.';
+  return {
+    selection: null,
+    audit: visionAudit(lastModel, 'unavailable', {
+      warnings: [warning]
+    })
+  };
 }
 
 async function resolveTicketPopupRemovalVision(ticketText, referenceImage, popupCandidates, options = {}) {
-  const model = options.model || process.env.GEMINI_VISION_MODEL || DEFAULT_GEMINI_VISION_MODEL;
+  const primaryModel = options.model || process.env.GEMINI_VISION_MODEL || DEFAULT_GEMINI_VISION_MODEL;
   const key = options.apiKey || process.env.GEMINI_API_KEY || process.env.POPUP_TICKET_RUNNER_GEMINI_KEY || DEFAULT_GEMINI_API_KEY;
-  if (!key) return { selection: null, audit: visionAudit(model, 'disabled') };
-  try {
-    const response = await requestGeminiRemovalVisionJson(ticketText, referenceImage, popupCandidates, { ...options, apiKey: key, model });
-    const decision = removalVisionDecisionFromResponse(response.value, popupCandidates);
-    const warnings = Array.isArray(response.value?.warnings)
-      ? response.value.warnings.filter((warning) => typeof warning === 'string').slice(0, 4)
-      : [];
-    if (decision?.outcome === 'not_found') {
+  if (!key) return { selection: null, audit: visionAudit(primaryModel, 'disabled') };
+  const models = options.model ? [options.model] : geminiCandidateModels(primaryModel);
+  let lastError = null;
+  let lastModel = primaryModel;
+  for (const model of models) {
+    lastModel = model;
+    try {
+      const response = await requestGeminiRemovalVisionJson(ticketText, referenceImage, popupCandidates, { ...options, apiKey: key, model });
+      const decision = removalVisionDecisionFromResponse(response.value, popupCandidates);
+      const warnings = Array.isArray(response.value?.warnings)
+        ? response.value.warnings.filter((warning) => typeof warning === 'string').slice(0, 4)
+        : [];
+      if (decision?.outcome === 'not_found') {
+        return {
+          selection: null,
+          audit: visionAudit(response.model, 'not-found', { rationale: decision.rationale, warnings })
+        };
+      }
+      if (decision?.outcome !== 'matched' || !decision.selection) {
+        return {
+          selection: null,
+          audit: visionAudit(response.model, 'ambiguous', {
+            rationale: decision?.rationale || null,
+            warnings: ['Gemini Vision did not identify one sufficiently certain CMS popup match.', ...warnings]
+          })
+        };
+      }
       return {
-        selection: null,
-        audit: visionAudit(response.model, 'not-found', { rationale: decision.rationale, warnings })
+        selection: decision.selection,
+        audit: visionAudit(response.model, 'selected', { rationale: decision.rationale, warnings })
       };
+    } catch (error) {
+      lastError = error;
+      if (error?.code === 'gemini-key-missing' || error?.code === 'gemini-key-invalid') break;
     }
-    if (decision?.outcome !== 'matched' || !decision.selection) {
-      return {
-        selection: null,
-        audit: visionAudit(response.model, 'ambiguous', {
-          rationale: decision?.rationale || null,
-          warnings: ['Gemini Vision did not identify one sufficiently certain CMS popup match.', ...warnings]
-        })
-      };
-    }
-    return {
-      selection: decision.selection,
-      audit: visionAudit(response.model, 'selected', { rationale: decision.rationale, warnings })
-    };
-  } catch (error) {
-    return {
-      selection: null,
-      audit: visionAudit(model, 'unavailable', {
-        warnings: [error?.code === 'gemini-key-missing' ? 'Gemini Vision key is unavailable.' : 'Gemini Vision was unavailable; no CMS popup was removed.']
-      })
-    };
   }
+  const warning = lastError?.code === 'gemini-key-missing'
+    ? 'Gemini Vision key is unavailable.'
+    : lastError?.code === 'gemini-key-invalid'
+      ? 'Gemini Vision API key không hợp lệ hoặc đã hết hạn (Google báo: API key not valid). Hãy cấu hình API key mới.'
+      : 'Gemini Vision was unavailable; no CMS popup was removed.';
+  return {
+    selection: null,
+    audit: visionAudit(lastModel, 'unavailable', {
+      warnings: [warning]
+    })
+  };
 }
 
 module.exports = {
@@ -1100,6 +1185,7 @@ module.exports = {
   ticketTextForSemanticPrompt,
   attachmentCandidatesForSemanticPrompt,
   validIsoDate,
+  isValidPosterScheduleEvidence,
   posterSchedulesFromResponse,
   firstJsonObject,
   attachmentCandidateByIndex,

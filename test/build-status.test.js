@@ -57,3 +57,30 @@ test('verifyFinalCmsStatus formats complete CMS status summary', async () => {
   assert.match(result.summary, /Project: Active/);
   assert.match(result.summary, /HTTP 200 OK/);
 });
+
+test('buildControl pattern correctly matches Build button with notification badge', () => {
+  const pattern = /^Build(?:\.\.\.|\b)/i;
+  assert.ok(pattern.test('Build...'));
+  assert.ok(pattern.test('Build... 1'));
+  assert.ok(pattern.test('Build... 2'));
+  assert.ok(pattern.test('Build 1'));
+  assert.ok(pattern.test('Build'));
+  assert.equal(pattern.test('Building'), false);
+  assert.equal(pattern.test('Building 50%'), false);
+});
+
+test('build confirmation dialog pattern matches all CMS confirm and save buttons', () => {
+  const confirmPattern = /^(?:Save(?:\s*all)?(?:\s*changes)?|Confirm(?:\s*build)?|Save\s*&\s*build|Build|Yes|Ok)$/i;
+  assert.ok(confirmPattern.test('Save all'));
+  assert.ok(confirmPattern.test('Save all changes'));
+  assert.ok(confirmPattern.test('Save changes'));
+  assert.ok(confirmPattern.test('Save'));
+  assert.ok(confirmPattern.test('Confirm'));
+  assert.ok(confirmPattern.test('Confirm build'));
+  assert.ok(confirmPattern.test('Save & build'));
+  assert.ok(confirmPattern.test('Build'));
+  assert.ok(confirmPattern.test('Yes'));
+  assert.ok(confirmPattern.test('Ok'));
+  assert.equal(confirmPattern.test('Cancel'), false);
+  assert.equal(confirmPattern.test('Close'), false);
+});

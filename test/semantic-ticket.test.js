@@ -14,8 +14,10 @@ const {
   SEMANTIC_SCHEMA,
   geminiResponseSchema,
   multiVisionPrompt,
-  visionPrompt
+  visionPrompt,
+  isValidPosterScheduleEvidence
 } = require('../src/semantic-ticket');
+const { applyArtworkSchedulePrecedence } = require('../src/run');
 
 const baseTicket = {
   siteId: '16266',
@@ -495,6 +497,92 @@ test('poster artwork schedules accept standard expiration evidence like EXP: 11/
   assert.equal(result.warnings.length, 0);
 });
 
+test('isValidPosterScheduleEvidence accepts standalone expiration dates like Dec 31, December 31, and 12/31/2026', () => {
+  assert.equal(isValidPosterScheduleEvidence('Dec 31'), true);
+  assert.equal(isValidPosterScheduleEvidence('December 31'), true);
+  assert.equal(isValidPosterScheduleEvidence('Dec 31, 2026'), true);
+  assert.equal(isValidPosterScheduleEvidence('12/31/2026'), true);
+  assert.equal(isValidPosterScheduleEvidence('12/31'), true);
+  assert.equal(isValidPosterScheduleEvidence('31 Dec'), true);
+  assert.equal(isValidPosterScheduleEvidence('Valid until Dec 31'), true);
+  assert.equal(isValidPosterScheduleEvidence('Closed on November 26'), false);
+  assert.equal(isValidPosterScheduleEvidence('Nails & Spa promotion'), false);
+});
+
+test('poster artwork schedules accept standalone dates like Dec 31 from poster image (ticket 1604739)', () => {
+  const candidates = [{ index: 1 }];
+  const result = posterSchedulesFromResponse([
+    {
+      attachmentIndex: 1,
+      startDate: null,
+      endDate: '2026-12-31',
+      evidence: 'Dec 31',
+      confidence: 0.95
+    }
+  ], candidates, [1]);
+
+  assert.deepEqual(result.schedules, [
+    {
+      attachmentIndex: 1,
+      startDate: null,
+      endDate: '2026-12-31',
+      evidence: 'Dec 31',
+      confidence: 0.95
+    }
+  ]);
+  assert.equal(result.warnings.length, 0);
+});
+
+test('applyArtworkSchedulePrecedence enforces precedence: ticket note takes priority over poster artwork, but poster artwork date is adopted when ticket note has no expiry', () => {
+  // Case 1: Ticket note has NO expiry date -> adopts poster artwork date (ticket 1604739)
+  const ticketWithoutExpiry = {
+    expiryDate: null,
+    expiry: null,
+    startDate: null,
+    start: null,
+    scheduleSource: null,
+    popupAttachmentIndex: 1
+  };
+  const visionSchedules = [{
+    attachmentIndex: 1,
+    startDate: null,
+    endDate: '2026-12-31',
+    evidence: 'Dec 31',
+    confidence: 0.95
+  }];
+  applyArtworkSchedulePrecedence(ticketWithoutExpiry, visionSchedules, 1);
+  assert.equal(ticketWithoutExpiry.expiryDate, '2026-12-31');
+  assert.equal(ticketWithoutExpiry.expiry, 'Dec 31');
+  assert.equal(ticketWithoutExpiry.artworkExpiryDate, '2026-12-31');
+  assert.equal(ticketWithoutExpiry.scheduleSource, 'poster-artwork');
+  assert.equal(ticketWithoutExpiry.scheduleEvidence, 'Dec 31');
+
+  // Case 2: Ticket note HAS an expiry date -> note takes precedence, but artworkExpiryDate is also recorded
+  const ticketWithExplicitNote = {
+    expiryDate: '2026-11-27',
+    expiry: '11/27/2026',
+    startDate: null,
+    start: null,
+    scheduleSource: 'ticket-text',
+    popupAttachmentIndex: 1
+  };
+  applyArtworkSchedulePrecedence(ticketWithExplicitNote, visionSchedules, 1);
+  assert.equal(ticketWithExplicitNote.expiryDate, '2026-11-27'); // Preserved from ticket note!
+  assert.equal(ticketWithExplicitNote.artworkExpiryDate, '2026-12-31'); // Recorded from poster!
+  assert.equal(ticketWithExplicitNote.scheduleSource, 'ticket-text');
+
+  // Case 3: Indefinite ticket ("đến khi khách tắt") -> do not adopt dates
+  const indefiniteTicket = {
+    isIndefinite: true,
+    expiryDate: null,
+    expiry: null,
+    popupAttachmentIndex: 1
+  };
+  applyArtworkSchedulePrecedence(indefiniteTicket, visionSchedules, 1);
+  assert.equal(indefiniteTicket.expiryDate, null);
+  assert.equal(indefiniteTicket.artworkExpiryDate, '2026-12-31');
+});
+
 test('Gemini Vision refuses an incomplete or duplicate multi-poster set', async () => {
   const candidates = [
     { index: 1, filename: 'first.png', mimeType: 'image/png', base64: 'MQ==' },
@@ -679,4 +767,17 @@ test('multiVisionPrompt and visionPrompt clearly distinguish file upload posters
   const singlePrompt = visionPrompt(ticket, candidates);
   assert.match(singlePrompt, /EXCLUDE SCREENSHOTS/i);
   assert.match(singlePrompt, /REMOVAL REFERENCE/i);
+});
+
+test('multiVisionPrompt and visionPrompt include dual-action rule for gỡ [A] xuống và pop up [B]', () => {
+  const prompt = multiVisionPrompt('test', []);
+  assert.match(prompt, /gỡ pop up \[A\] xuống và pop up \[B\]/i);
+  assert.match(prompt, /VERB meaning to CREATE\/PUBLISH popup B/i);
+
+  const singlePrompt = visionPrompt('test', []);
+  assert.match(singlePrompt, /gỡ pop up \[A\] xuống và pop up \[B\]/i);
+
+  const semPrompt = semanticPrompt('test', []);
+  assert.match(semPrompt, /gỡ \[A\] xuống và pop up \[B\]/i);
+  assert.match(semPrompt, /VERB meaning to create\/publish popup B/i);
 });

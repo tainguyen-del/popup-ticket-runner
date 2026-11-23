@@ -83,5 +83,18 @@
       "popupPosition": null,
       "popupAttachmentIndex": 2
     }
+  },
+  {
+    "id": "case-remove-and-popup-new",
+    "title": "Gỡ popup cũ A và Pop up hình mới B (Thay thế - Replace)",
+    "ticketSample": "ID#20566 - Website Support\nNhờ team hỗ trợ gỡ pop up hình chân Pumpkin xuống và Pop up hình chân Christmas $68 (ảnh bên dưới) giúp tiệm\nThank you",
+    "explanation": "Cụm 'gỡ pop up A xuống và Pop up hình B' là lệnh thay thế (replace). A là ảnh cũ cần gỡ, 'Pop up hình B' dùng 'Pop up' như động từ nghĩa là tạo popup mới cho hình B. Hình B là poster mới cần publish.",
+    "expected": {
+      "siteId": "20566",
+      "operation": "replace",
+      "expiry": null,
+      "popupPosition": null,
+      "popupAttachmentIndex": 2
+    }
   }
 ]

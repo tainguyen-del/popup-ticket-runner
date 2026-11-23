@@ -427,14 +427,22 @@ const server = http.createServer(async (request, response) => {
     if (activeJobId) return json(response, 409, { error: 'Một ticket đang chạy. Hãy chờ hoàn tất trước khi đổi tài khoản CMS.' });
     try {
       const payload = JSON.parse(await readBody(request));
-      const currentCredentials = getCmsCredentials(ROOT);
+      if (payload.password !== undefined && typeof payload.password !== 'string') {
+        const error = new Error('Password CMS phải là chuỗi hợp lệ.');
+        error.code = 'cms-credential-invalid';
+        throw error;
+      }
+      const hasNewPassword = typeof payload.password === 'string' && payload.password.length > 0;
+      // A user who enters a new password must be able to overwrite a stale
+      // DPAPI credential that the current Windows user cannot decrypt.
+      const currentCredentials = hasNewPassword ? null : getCmsCredentials(ROOT);
       saveStoredCredentials(ROOT, {
         email: payload.identifier,
-        password: payload.password || currentCredentials?.password
+        password: hasNewPassword ? payload.password : currentCredentials?.password
       });
       return json(response, 200, cmsCredentialStatus(ROOT));
     } catch (error) {
-      const status = ['cms-credential-invalid', 'cms-credential-platform'].includes(error?.code) ? 422 : 400;
+      const status = ['cms-credential-invalid', 'cms-credential-platform', 'cms-credential-decryption-failed'].includes(error?.code) ? 422 : 400;
       return json(response, status, { error: error?.message || 'Không thể lưu tài khoản CMS.' });
     }
   }

@@ -36,7 +36,8 @@ const {
   ticketAttachmentDescriptors,
   readFullTicketContext,
   ticketAttachmentItems,
-  openTicketDetails
+  openTicketDetails,
+  isElementDisplayed
 } = require('./crm/ticket-reader');
 const {
   imageFiles,
@@ -75,10 +76,69 @@ const {
   findDuplicatePopupImages,
   findDuplicatePopupImagesWithVision
 } = require('./cms/popup-image-policy');
+const {
+  visibleMatch,
+  waitForVisibleMatch,
+  visibleLabel,
+  controlForLabel,
+  ensureDesktopViewport
+} = require('./cms/dom-utils');
+const {
+  setProgressHandler: setPopupProgressHandler,
+  expiryAriaLabel,
+  todayInTimezone,
+  calendarMonthStart,
+  popupInputValues,
+  trySetPopupDateInput,
+  popupCalendar,
+  calendarHeading,
+  calendarMoveControl,
+  calendarMonthDistance,
+  popupCalendarDay,
+  waitForCalendarMonthChange,
+  setPopupDate,
+  setPopupDateValue,
+  setPopupStart,
+  setPopupExpiry,
+  clearPopupDateControl,
+  clearPopupStartDate,
+  clearPopupEndDate,
+  isPopupItemEditorOpen,
+  popupListItemEditorIsOpen,
+  isPopupListItemsViewOpen,
+  popupListItemsPanel,
+  waitForPopupListItemsPanel,
+  popupListItemCards,
+  openPopupListCard,
+  readPopupListItems,
+  waitForPopupListItemCount,
+  isEmptyPopupItem,
+  planPopupItemTarget,
+  popupItemSignature,
+  samePopupItemSequence,
+  resolveAddedPopupItemTarget,
+  openPopupListItem,
+  openConfiguredPopupListItem,
+  popupImageUploadControl,
+  popupImageUrls,
+  waitForPopupImageUpload,
+  setPopupImageLink,
+  configurePopupListItem,
+  backToPopupSettings,
+  waitForPersistedPopupItem,
+  deletePopupItemAtIndex,
+  deleteOneEmptyPopupItem,
+  repairExistingPopupSettings,
+  normalizeTicketPopupEntries,
+  buildPopupEntriesForTickets,
+  buildPopupEntries,
+  setTimeDelaySlider
+} = require('./cms/popup-editor');
 
 function progress(stage, message, details = {}) {
   process.stdout.write(`PROGRESS ${JSON.stringify({ stage, message, ...details })}\n`);
 }
+setPopupProgressHandler(progress);
 
 const value = (flag, fallback) => {
   const index = process.argv.indexOf(flag);
@@ -139,6 +199,35 @@ function popupTicketEntriesFromDownloads(downloadedAttachments, schedule, poster
   }
   if (!entries.length) throw new Error('No validated ticket poster was available for Popup settings.');
   return entries;
+}
+
+function applyArtworkSchedulePrecedence(ticket, visionPosterSchedules, targetIndex = null) {
+  const schedules = Array.isArray(visionPosterSchedules) ? visionPosterSchedules : [];
+  if (!schedules.length || !ticket) return;
+  const preferredIndex = targetIndex
+    || ticket.popupAttachmentIndex
+    || (Array.isArray(ticket.popupAttachmentIndexes) ? ticket.popupAttachmentIndexes[0] : null);
+  const matched = schedules.find((s) => s?.attachmentIndex === preferredIndex) || schedules[0];
+  if (!matched) return;
+
+  if (matched.endDate) {
+    ticket.artworkExpiryDate = matched.endDate;
+    // Precedence rule: explicit note in ticket > expiry in popup image.
+    // If ticket text did NOT specify an expiry date, adopt the expiry date from Gemini Vision:
+    if (!ticket.expiryDate && !ticket.isIndefinite) {
+      ticket.expiryDate = matched.endDate;
+      ticket.expiry = matched.evidence || matched.endDate;
+      ticket.scheduleSource = 'poster-artwork';
+      ticket.scheduleEvidence = matched.evidence;
+    }
+  }
+  if (matched.startDate) {
+    ticket.artworkStartDate = matched.startDate;
+    if (!ticket.startDate && !ticket.isIndefinite) {
+      ticket.startDate = matched.startDate;
+      ticket.start = matched.evidence || matched.startDate;
+    }
+  }
 }
 
 function shouldUseTicketVision(popupAction, attachmentCount) {
@@ -225,51 +314,6 @@ async function projectSearchCandidates(page, siteId) {
   return candidates;
 }
 
-
-async function visibleMatch(locator, description, fromEnd = false) {
-  const count = await locator.count();
-  const start = fromEnd ? count - 1 : 0;
-  const end = fromEnd ? -1 : count;
-  const step = fromEnd ? -1 : 1;
-  for (let index = start; index !== end; index += step) {
-    const candidate = locator.nth(index);
-    if (await candidate.isVisible().catch(() => false)) return candidate;
-  }
-  if (description) throw new Error(`${description} was not found.`);
-  return null;
-}
-
-async function waitForVisibleMatch(locator, description, fromEnd = false, timeout = 5000) {
-  const deadline = Date.now() + timeout;
-  do {
-    const match = await visibleMatch(locator, null, fromEnd);
-    if (match) return match;
-    await new Promise((resolve) => setTimeout(resolve, 150));
-  } while (Date.now() < deadline);
-  throw new Error(`${description || 'Expected CMS control'} was not found.`);
-}
-
-async function visibleLabel(page, labelText, fromEnd = false) {
-  const labels = page.locator('label');
-  const count = await labels.count();
-  const matches = [];
-  for (let index = 0; index < count; index += 1) {
-    const label = labels.nth(index);
-    if (await label.isVisible().catch(() => false) && (await label.innerText().catch(() => '')).trim() === labelText) matches.push(label);
-  }
-  const result = fromEnd ? matches.at(-1) : matches[0];
-  if (!result) throw new Error(`Visible label "${labelText}" was not found.`);
-  return result;
-}
-
-async function controlForLabel(page, labelText, fromEnd = false) {
-  const label = await visibleLabel(page, labelText, fromEnd);
-  const id = await label.getAttribute('for');
-  if (!id) throw new Error(`The "${labelText}" control has no associated ID.`);
-  const control = page.locator(`[id="${id}"]`);
-  const found = await visibleMatch(control, `The "${labelText}" control`, fromEnd);
-  return { label, control: found, id };
-}
 
 async function announcementRow(page) {
   const row = page.locator('tr').filter({ has: page.getByText('Announcement', { exact: true }) }).first();
@@ -462,7 +506,11 @@ async function downloadTicketCandidateImages(page, ticketUrl, runDir, { expected
     const { root, items } = await ticketAttachmentItems(page, ticketUrl, { reveal: true });
     if (!root) throw new Error('CRM did not expose the selected ticket panel for Vision attachment download.');
     if (Number.isInteger(expectedAttachmentCount) && expectedAttachmentCount !== items.length) {
-      throw new Error(`The visible attachment list changed from ${expectedAttachmentCount} to ${items.length}; Vision did not guess an image.`);
+      if (items.length > 0) {
+        progress('attachment-candidates-discovered', `Đã tìm thấy ${items.length} ảnh đính kèm (ban đầu phát hiện ${expectedAttachmentCount})`);
+      } else {
+        throw new Error(`The visible attachment list changed from ${expectedAttachmentCount} to ${items.length}; Vision did not guess an image.`);
+      }
     }
     if (!items.length) throw new Error('No visible image attachment was available for Gemini Vision.');
     const downloads = [];
@@ -531,7 +579,15 @@ async function downloadTicketImage(page, ticketUrl, runDir, {
     const { root, items } = await ticketAttachmentItems(page, ticketUrl, { reveal: true });
     if (!root) throw new Error('CRM did not expose the selected ticket panel for attachment download.');
     if (Number.isInteger(expectedAttachmentCount) && expectedAttachmentCount !== items.length) {
-      throw new Error(`The visible attachment list changed from ${expectedAttachmentCount} to ${items.length}; the poster was not guessed.`);
+      if (expectedAttachmentCount === 0 && items.length === 1 && (!selectedAttachmentIndex || selectedAttachmentIndex === 1)) {
+        progress('attachment-discovered', 'Đã tìm thấy poster đính kèm sau khi tải xong nội dung');
+      } else if (items.length > 1 && selectedAttachmentIndex && selectedAttachmentIndex <= items.length) {
+        progress('attachment-count-settled', `CRM hiển thị ${items.length} ảnh đính kèm; tải poster đã chọn #${selectedAttachmentIndex}`);
+      } else if (items.length === 1 && (!selectedAttachmentIndex || selectedAttachmentIndex === 1)) {
+        progress('attachment-discovered', 'Đã tìm thấy 1 poster đính kèm duy nhất');
+      } else {
+        throw new Error(`The visible attachment list changed from ${expectedAttachmentCount} to ${items.length}; the poster was not guessed.`);
+      }
     }
     let selectedItem = null;
     let selectedIndex = null;
@@ -834,18 +890,61 @@ async function ensurePopupSection(page, baseUrl, { replaceExisting = false, expe
   };
 }
 
+// A duration-only ticket changes settings on an existing popup. It must never
+// use the creation path, otherwise a missing section becomes a new empty block.
+async function existingPopupSection(page, baseUrl, { expectedPluginVersion = null } = {}) {
+  await openPageEditor(page, baseUrl);
+  const existing = await popupSectionCards(page);
+  if (!existing.length) {
+    const error = new Error('No existing Announcement Popup section was found. A duration-only ticket cannot create a new popup section.');
+    error.stage = 'popup-section-not-found';
+    throw error;
+  }
+
+  const expectedToken = announcementSectionVersionToken(expectedPluginVersion);
+  let card = await popupSectionCardForVersion(existing, expectedToken);
+  // An older but unique popup is still a safe target. Multiple unmatched
+  // sections are ambiguous and must not be changed automatically.
+  if (!card && existing.length === 1) card = existing[0];
+  if (!card) {
+    const error = new Error(`Found ${existing.length} Announcement Popup sections but could not identify a unique section for the duration-only update.`);
+    error.stage = 'popup-section-ambiguous';
+    throw error;
+  }
+  return {
+    exists: true,
+    sectionId: await card.getAttribute('id'),
+    created: false,
+    replaced: false,
+    removedCount: 0
+  };
+}
+
 async function openPopupSection(page, sectionId = null) {
-  // Choosing Announcement Popup from "Add new section" immediately opens a
-  // full-screen section editor in current NewZenSite.  In that state the
-  // page-editor card is still visible in the DOM but is behind the overlay,
-  // so clicking it would time out.  Prefer the already-open editor.
+  // If Announcement Popup editor is already open (Preview / Slide direction style / Add block / Popup_setting),
+  // do not re-click the background section card in the page editor. Clicking the background card while
+  // the section drawer is open causes Playwright to fail with a 30s timeout because the drawer overlay
+  // (absolute inset-0 z-10) intercepts pointer events.
   const alreadyOpen = await waitForVisibleMatch(
     page.getByText(/Popup[\s_]setting/i),
     null,
     true,
-    1200
-  ).catch(() => null);
+    500
+  ).catch(() => null) || await visibleMatch(
+    page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")'),
+    null,
+    true
+  ) || await visibleMatch(
+    page.getByText('Slide direction style', { exact: true }),
+    null,
+    true
+  ) || await visibleMatch(
+    page.getByText(/Slide direction style/i),
+    null,
+    true
+  );
   if (alreadyOpen) return alreadyOpen;
+
   if (sectionId) {
     const card = await popupSectionCardById(page, sectionId);
     if (!card) throw new Error(`Announcement section ${sectionId} was not found in the Page editor.`);
@@ -855,7 +954,8 @@ async function openPopupSection(page, sectionId = null) {
     await page.waitForTimeout(250);
   }
   for (let attempt = 0; attempt < 20; attempt += 1) {
-    const settingsCard = await visibleMatch(page.getByText(/Popup[\s_]setting/i), null);
+    const settingsCard = await visibleMatch(page.getByText(/Popup[\s_]setting/i), null)
+      || await visibleMatch(page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")'), null);
     if (settingsCard) return settingsCard;
     const section = await visiblePopupSection(page, null);
     if (section) await section.click();
@@ -867,14 +967,17 @@ async function openPopupSection(page, sectionId = null) {
 async function openPopupSettings(page, sectionId = null) {
   await openPopupSection(page, sectionId);
   const isAddBlockVisible = async () => {
-    return (await page.getByRole('button', { name: /Add\s*block/i }).isVisible().catch(() => false))
-      || (await page.locator('button:has-text("Add block")').isVisible().catch(() => false))
-      || (await page.locator('[role="button"]:has-text("Add block")').isVisible().catch(() => false));
+    return isElementDisplayed(page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")').first());
   };
   if (await isAddBlockVisible()) return;
 
   const popupSetting = await visibleMatch(page.getByText('Popup_setting', { exact: true }), null)
-    || await visibleMatch(page.getByText(/Popup[\s_]setting/i), 'Popup setting control');
+    || await visibleMatch(page.getByText(/Popup[\s_]setting/i), null);
+
+  if (!popupSetting) {
+    if (await isAddBlockVisible()) return;
+    return;
+  }
 
   // Check if the accordion item is already expanded/active before clicking
   const isExpanded = await popupSetting.evaluate((el) => {
@@ -913,182 +1016,6 @@ async function openPopupSettings(page, sectionId = null) {
   }
 }
 
-function expiryAriaLabel(expiry) {
-  return new Intl.DateTimeFormat('en-US', {
-    weekday: 'long', month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC'
-  }).format(new Date(`${expiry}T12:00:00.000Z`));
-}
-
-function calendarMonthStart(heading) {
-  const match = /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})$/.exec(heading);
-  if (!match) return null;
-  const month = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'].indexOf(match[1]);
-  return new Date(Date.UTC(Number(match[2]), month, 1, 12));
-}
-
-function popupInputValues(type, date, defaultTime) {
-  if (type === 'date') return [date];
-  if (type === 'datetime-local') return [`${date}T${defaultTime}`];
-  return [`${date} ${defaultTime}`, date];
-}
-
-async function trySetPopupDateInput(page, control, id, date, defaultTime) {
-  const meta = await control.evaluate((element) => ({
-    tag: element.tagName.toLowerCase(),
-    type: (element.getAttribute('type') || 'text').toLowerCase(),
-    readOnly: Boolean(element.readOnly),
-    disabled: Boolean(element.disabled)
-  })).catch(() => null);
-  if (!meta || meta.tag !== 'input' || meta.readOnly || meta.disabled) return false;
-  for (const value of popupInputValues(meta.type, date, defaultTime)) {
-    try {
-      await control.fill(value);
-      await control.press('Tab').catch(() => {});
-      const applied = await page.waitForFunction(
-        ({ fieldId, expected }) => document.getElementById(fieldId)?.value.includes(expected),
-        { fieldId: id, expected: date },
-        { timeout: 1500 }
-      ).then(() => true).catch(() => false);
-      if (applied) return true;
-    } catch {
-      // Some CMS date inputs are readonly and only expose the calendar.
-    }
-  }
-  return false;
-}
-
-async function popupCalendar(page) {
-  // This CMS uses VCalendar in two forms: a popover (`vc-date-picker-content`)
-  // and an inline calendar inside its own popup (`vc-container`). The latter
-  // is what the Announcement list-item editor currently renders.
-  const candidates = page.locator('.vc-date-picker-content, .vc-container');
-  const count = await candidates.count();
-  for (let index = count - 1; index >= 0; index -= 1) {
-    const candidate = candidates.nth(index);
-    if (!await candidate.isVisible().catch(() => false)) continue;
-    const title = await visibleMatch(candidate.locator('.vc-header .vc-title'), null, true);
-    if (title) return candidate;
-  }
-  throw new Error('Popup date calendar was not found.');
-}
-
-async function calendarHeading(calendar) {
-  const title = await visibleMatch(calendar.locator('.vc-header .vc-title'), null, true)
-    || await visibleMatch(calendar.locator('.vc-title'), null, true);
-  if (title) return (await title.innerText()).trim();
-  const header = await visibleMatch(calendar.locator('.vc-header'), 'Popup calendar month', true);
-  return (await header.innerText()).trim();
-}
-
-async function calendarMoveControl(calendar, forward) {
-  const selectors = forward
-    ? ['.vc-header .vc-arrow.vc-next', '.vc-header .vc-next', '.vc-arrow.is-right', '[aria-label*="next month" i]', 'button[title*="next month" i]', '.vc-nav-arrow-next']
-    : ['.vc-header .vc-arrow.vc-prev', '.vc-header .vc-prev', '.vc-arrow.is-left', '[aria-label*="previous month" i]', '[aria-label*="prev month" i]', 'button[title*="previous month" i]', '.vc-nav-arrow-prev'];
-  for (const selector of selectors) {
-    const control = await visibleMatch(calendar.locator(selector), null, true);
-    if (control && !await control.isDisabled().catch(() => false)) return control;
-  }
-  const headerButtons = calendar.locator('.vc-header button');
-  const count = await headerButtons.count();
-  if (count >= 2) {
-    const control = forward ? headerButtons.nth(count - 1) : headerButtons.first();
-    if (await control.isVisible().catch(() => false) && !await control.isDisabled().catch(() => false)) return control;
-  }
-  return null;
-}
-
-function calendarMonthDistance(heading, date) {
-  const visible = calendarMonthStart(heading);
-  if (!visible) return null;
-  const target = new Date(`${date}T12:00:00.000Z`);
-  return ((target.getUTCFullYear() - visible.getUTCFullYear()) * 12)
-    + (target.getUTCMonth() - visible.getUTCMonth());
-}
-
-async function popupCalendarDay(calendar, date) {
-  // VCalendar marks the owning day cell with `id-YYYY-MM-DD`; unlike an
-  // accessible name this remains stable across locales and versions. Do not
-  // click its faint trailing/leading duplicate in an adjacent month: those
-  // cells intentionally intercept pointer events in this CMS.
-  const byId = await visibleMatch(
-    calendar.locator(`.vc-day.in-month.id-${date} [role="button"]:not([aria-disabled="true"])`),
-    null,
-    true
-  );
-  if (byId) return byId;
-  return visibleMatch(
-    calendar.locator(`.vc-day.in-month [aria-label="${expiryAriaLabel(date)}"][role="button"]:not([aria-disabled="true"])`),
-    null,
-    true
-  );
-}
-
-async function waitForCalendarMonthChange(page, calendar, before) {
-  for (let attempt = 0; attempt < 15; attempt += 1) {
-    await page.waitForTimeout(100);
-    const after = await calendarHeading(calendar).catch(() => null);
-    if (after && after !== before) return after;
-  }
-  throw new Error(`Popup calendar arrow did not change month from ${before}.`);
-}
-
-async function setPopupDate(page, labelText, date, defaultTime) {
-  const { control, id } = await controlForLabel(page, labelText, true);
-  const currentValue = await control.inputValue().catch(() => '');
-  if (currentValue && currentValue.includes(date)) return;
-  if (await trySetPopupDateInput(page, control, id, date, defaultTime)) return;
-  await control.click();
-  const calendar = await popupCalendar(page);
-  for (let move = 0; move < 25; move += 1) {
-    const day = await popupCalendarDay(calendar, date);
-    if (day) {
-      await day.click();
-      await page.waitForFunction(({ fieldId, expected }) => document.getElementById(fieldId)?.value.startsWith(expected), { fieldId: id, expected: date }, { timeout: 5000 });
-      return;
-    }
-    const current = await calendarHeading(calendar);
-    const distance = calendarMonthDistance(current, date);
-    if (distance === null) throw new Error(`Popup calendar month could not be read: ${current}`);
-    if (distance === 0) throw new Error(`${labelText} date ${date} is missing from the visible CMS calendar month.`);
-    const forward = distance > 0;
-    const arrow = await calendarMoveControl(calendar, forward);
-    if (!arrow) throw new Error(`Popup calendar ${forward ? 'next' : 'previous'} month arrow was not found.`);
-    await arrow.click({ force: true });
-    await waitForCalendarMonthChange(page, calendar, current);
-  }
-  throw new Error(`${labelText} date ${date} was not available in the calendar.`);
-}
-
-function todayInTimezone(iana) {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: iana, year: 'numeric', month: '2-digit', day: '2-digit'
-  }).formatToParts(new Date());
-  const value = Object.fromEntries(parts.filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]));
-  return `${value.year}-${value.month}-${value.day}`;
-}
-
-async function setPopupDateValue(page, label, date, defaultTime) {
-  // The popup request is date-based. CMS supplies its own safe default clock
-  // value when a calendar day is picked, so avoid the version-dependent hour
-  // and minute controls entirely.
-  await setPopupDate(page, label, date, defaultTime);
-  const { control } = await controlForLabel(page, label, true);
-  await page.waitForFunction(({ fieldId, date }) => {
-    const value = document.getElementById(fieldId)?.value || '';
-    return value.includes(date);
-  }, { fieldId: await control.getAttribute('id'), date }, { timeout: 5000 });
-  return { date, time: null };
-}
-
-async function setPopupStart(page, requestedStart, timezone) {
-  const date = requestedStart?.date || todayInTimezone(timezone.iana);
-  return setPopupDateValue(page, 'Time start (optional)', date, '00:00');
-}
-
-async function setPopupExpiry(page, expiry) {
-  return setPopupDateValue(page, 'Time end (optional)', expiry.date, '23:59');
-}
-
 async function waitForSaveEnabled(page) {
   for (let attempt = 0; attempt < 30; attempt += 1) {
     const save = await visibleMatch(page.getByRole('button', { name: 'Save', exact: true }), null, true);
@@ -1096,24 +1023,6 @@ async function waitForSaveEnabled(page) {
     await page.waitForTimeout(200);
   }
   throw new Error('Popup Save control did not become enabled.');
-}
-
-async function readPopupListItems(page) {
-  const checkboxes = page.locator('input[type="checkbox"][name^="check-all-list_items-"]');
-  const count = await checkboxes.count();
-  if (!count) return { chooseAll: null, items: [] };
-  const chooseAll = checkboxes.nth(count - 1);
-  const name = await chooseAll.getAttribute('name');
-  const serialized = name?.slice('check-all-list_items-'.length);
-  try {
-    const items = JSON.parse(serialized || '[]');
-    if (!Array.isArray(items)) throw new Error('not an array');
-    return { chooseAll, items };
-  } catch {
-    const error = new Error('CMS popup item list could not be read safely. No popup was removed.');
-    error.stage = 'popup-replacement-ambiguous';
-    throw error;
-  }
 }
 
 
@@ -1152,6 +1061,13 @@ async function downloadLegacyPopupImage(page, rawUrl, assetDir, index) {
 async function snapshotActiveLegacyPopups(page, baseUrl, timezone, runDir, { preserveActive = true } = {}) {
   await openPageEditor(page, baseUrl);
   const cards = await popupSectionCards(page);
+  const targetSectionIds = [];
+  for (const card of cards) {
+    const sectionId = await card.getAttribute('id');
+    if (sectionId && !targetSectionIds.includes(sectionId)) {
+      targetSectionIds.push(sectionId);
+    }
+  }
   const sectionIds = [];
   const preserved = [];
   const scannedItems = [];
@@ -1159,18 +1075,61 @@ async function snapshotActiveLegacyPopups(page, baseUrl, timezone, runDir, { pre
   let expiredCount = 0;
   const assetDir = path.join(runDir, preserveActive ? 'legacy-popup' : 'popup-image-scan');
   fs.mkdirSync(assetDir, { recursive: true });
-  for (const card of cards) {
-    const sectionId = await card.getAttribute('id');
-    if (!sectionId) continue;
+  for (let sIdx = 0; sIdx < targetSectionIds.length; sIdx += 1) {
+    const sectionId = targetSectionIds[sIdx];
+    if (sIdx > 0) {
+      await openPageEditor(page, baseUrl);
+      await waitForVisibleMatch(
+        page.locator(`div#${sectionId}`),
+        `Legacy announcement section ${sectionId}`,
+        true,
+        8000
+      ).catch(() => {});
+    }
     sectionIds.push(sectionId);
     await openPopupSettings(page, sectionId);
+    const sectionDefaults = await page.evaluate(() => {
+      const findVal = (field) => {
+        const inputs = Array.from(document.querySelectorAll('input'));
+        for (const input of inputs) {
+          const name = (input.getAttribute('name') || '').toLowerCase();
+          const id = (input.getAttribute('id') || '').toLowerCase();
+          if (name.includes('list_items') || id.includes('list_items')) continue;
+          if (name === field || id === field || name.endsWith(`[${field}]`) || name.includes(`setting-${field}`) || name.includes(`setting_${field}`)) {
+            if (input.value && input.value.trim()) return input.value.trim();
+          }
+        }
+        const labels = Array.from(document.querySelectorAll('label, .el-form-item__label'));
+        for (const label of labels) {
+          const text = (label.innerText || '').trim().toLowerCase();
+          if ((field === 'time_start' && text === 'time start') || (field === 'time_end' && text === 'time end')) {
+            const forId = label.getAttribute('for');
+            if (forId) {
+              const input = document.getElementById(forId);
+              if (input && input.value && input.value.trim()) return input.value.trim();
+            }
+            const parent = label.closest('.el-form-item') || label.parentElement;
+            const input = parent?.querySelector('input');
+            if (input && input.value && input.value.trim()) return input.value.trim();
+          }
+        }
+        return null;
+      };
+      return {
+        time_start: findVal('time_start'),
+        time_end: findVal('time_end')
+      };
+    }).catch(() => ({ time_start: null, time_end: null }));
+
     const { items } = await readPopupListItems(page);
     for (const item of items) {
       if (isEmptyPopupItem(item)) continue;
-      const start = popupDateFromCmsValue(item?.time_start, timezone);
-      const end = popupDateFromCmsValue(item?.time_end, timezone);
-      if (item?.time_start && !start && preserveActive) throw new Error(`Could not read the start date of a popup in legacy Announcement section ${sectionId}. Old section was kept.`);
-      if (item?.time_end && !end && preserveActive) throw new Error(`Could not read the expiry date of a popup in legacy Announcement section ${sectionId}. Old section was kept.`);
+      const rawStart = item?.time_start || sectionDefaults.time_start;
+      const rawEnd = item?.time_end || sectionDefaults.time_end;
+      const start = popupDateFromCmsValue(rawStart, timezone);
+      const end = popupDateFromCmsValue(rawEnd, timezone);
+      if (rawStart && !start && preserveActive) throw new Error(`Could not read the start date of a popup in legacy Announcement section ${sectionId}. Old section was kept.`);
+      if (rawEnd && !end && preserveActive) throw new Error(`Could not read the expiry date of a popup in legacy Announcement section ${sectionId}. Old section was kept.`);
       if (!item?.image || typeof item.image !== 'string') {
         throw new Error(preserveActive
           ? `An active popup in legacy Announcement section ${sectionId} has no readable image. Old section was kept.`
@@ -1201,10 +1160,6 @@ async function snapshotActiveLegacyPopups(page, baseUrl, timezone, runDir, { pre
       }
       if (preserveActive) preserved.push(scanned);
     }
-    // The next legacy card is opened from the page editor, not the nested
-    // list-item panel, so return to the editor before selecting it.
-    const back = await visibleMatch(page.getByRole('button', { name: /^back$/i }), null, true);
-    if (back) await back.click();
   }
   return { sectionIds, items: preserved, scannedItems, expiredCount, warnings };
 }
@@ -1273,26 +1228,40 @@ function recoverInterruptedLegacyMigration(root, {
   const records = priorRunRecords(root, currentRunDir);
   const interrupted = records.find(({ plan, modifiedAt, directory }) => {
     if (modifiedAt < cutoff) return false;
-    if (plan.cms?.siteId !== siteId || plan.ticketUrl !== ticketUrl) return false;
+    const planSiteId = plan.cms?.siteId || plan.ticket?.siteId;
+    if (String(planSiteId || '') !== String(siteId || '')) return false;
+    if (plan.ticketUrl !== ticketUrl) return false;
     if (plan.popupSection?.replaced !== true || plan.popupSection?.created !== true) return false;
     const hasSnapshot = fs.existsSync(path.join(directory, 'legacy-popup-snapshot.json'));
-    const isFailed = !plan.popup?.imageConfigured && /(?:section-apply|popup-settings)-failed$/i.test(plan.status || '');
-    const missingMigration = plan.popup?.imageConfigured && Number(plan.popup?.migratedLegacyPopups || 0) === 0;
-    return isFailed || (hasSnapshot && missingMigration);
+    if (!hasSnapshot) return false;
+    const snapshot = readJsonFile(path.join(directory, 'legacy-popup-snapshot.json'));
+    const snapshotCount = Array.isArray(snapshot?.items) ? snapshot.items.length : 0;
+    if (snapshotCount === 0) return false;
+    const actualCmsCount = Array.isArray(plan.popup?.cmsImageUrls) ? plan.popup.cmsImageUrls.length : (plan.popup?.cmsImageUrl ? 1 : 0);
+    const incompleteMigration = snapshotCount > 1 && actualCmsCount < snapshotCount;
+    const isFailed = /(?:section-apply|popup-settings|popup-item|popup-ticket|popup-position).*failed$/i.test(plan.status || '')
+      || (!completedPopupRun(plan) && !plan.build?.completed);
+    const missingMigration = plan.popup?.imageConfigured && (Number(plan.popup?.migratedLegacyPopups || 0) === 0 || incompleteMigration);
+    return isFailed || missingMigration || incompleteMigration;
   });
   if (!interrupted) return null;
-  // Once a later run has successfully configured this same ticket WITH migrated
-  // popups, an older interrupted migration is no longer resumable state.
-  const laterSuccessfulRun = records.find(({ plan, modifiedAt }) => (
-    modifiedAt > interrupted.modifiedAt
-    && completedPopupRun(plan)
-    && plan.cms?.siteId === siteId
-    && plan.ticketUrl === ticketUrl
-    && Number(plan.popup?.migratedLegacyPopups || 0) > 0
-  ));
-  if (laterSuccessfulRun) return null;
 
   const snapshot = readJsonFile(path.join(interrupted.directory, 'legacy-popup-snapshot.json'));
+  const snapshotCount = Array.isArray(snapshot?.items) ? snapshot.items.length : 0;
+
+  // Once a later run has successfully configured this same ticket WITH migrated
+  // popups, an older interrupted migration is no longer resumable state.
+  const laterSuccessfulRun = records.find(({ plan, modifiedAt }) => {
+    const planSiteId = plan.cms?.siteId || plan.ticket?.siteId;
+    if (modifiedAt <= interrupted.modifiedAt) return false;
+    if (!completedPopupRun(plan)) return false;
+    if (String(planSiteId || '') !== String(siteId || '')) return false;
+    if (plan.ticketUrl !== ticketUrl) return false;
+    const cmsCount = Array.isArray(plan.popup?.cmsImageUrls) ? plan.popup.cmsImageUrls.length : (plan.popup?.cmsImageUrl ? 1 : 0);
+    return cmsCount >= snapshotCount && Number(plan.popup?.migratedLegacyPopups || 0) >= (snapshotCount - 1);
+  });
+  if (laterSuccessfulRun) return null;
+
   let items = [];
   if (Array.isArray(snapshot?.items)) {
     items = snapshot.items.map((item) => ({
@@ -1363,13 +1332,24 @@ function completedPopupRun(plan) {
 }
 
 function findTicketPopupInHistory(root, currentRunDir, { siteId, ticketUrl, attachment, items }) {
-  const matchingRuns = priorRunRecords(root, currentRunDir).filter(({ plan }) => (
-    completedPopupRun(plan)
-    && plan.popup?.ticketPosterVerified === true
-    && plan.cms?.siteId === siteId
-    && plan.ticketUrl === ticketUrl
-    && attachmentMatchEvidence(plan.attachment, attachment)
-  ));
+  const matchingRuns = priorRunRecords(root, currentRunDir).filter(({ plan, directory }) => {
+    if (!completedPopupRun(plan)) return false;
+    if (plan.popup?.ticketPosterVerified !== true) return false;
+    const planSiteId = plan.cms?.siteId || plan.ticket?.siteId;
+    if (String(planSiteId || '') !== String(siteId || '')) return false;
+    if (plan.ticketUrl !== ticketUrl) return false;
+    if (!attachmentMatchEvidence(plan.attachment, attachment)) return false;
+    // An incomplete migration run whose snapshot had more items than were actually uploaded
+    // should not block recovery of the missing popups.
+    const snapshotPath = path.join(directory, 'legacy-popup-snapshot.json');
+    if (fs.existsSync(snapshotPath)) {
+      const snap = readJsonFile(snapshotPath);
+      const snapCount = Array.isArray(snap?.items) ? snap.items.length : 0;
+      const actualCount = Array.isArray(plan.popup?.cmsImageUrls) ? plan.popup.cmsImageUrls.length : (plan.popup?.cmsImageUrl ? 1 : 0);
+      if (snapCount > 1 && actualCount < snapCount) return false;
+    }
+    return true;
+  });
   if (!matchingRuns.length) return { item: null, method: null, ambiguous: false };
 
   const configured = items.filter((item) => typeof item?.image === 'string' && item.image.trim());
@@ -1395,141 +1375,6 @@ function findTicketPopupInHistory(root, currentRunDir, { siteId, ticketUrl, atta
   }
   return { item: null, method: null, ambiguous: configured.length > 1 };
 }
-
-async function waitForPopupListItemCount(page, expected) {
-  for (let attempt = 0; attempt < 30; attempt += 1) {
-    const { items } = await readPopupListItems(page);
-    if (items.length === expected) return items;
-    await page.waitForTimeout(200);
-  }
-  throw new Error(`CMS popup list did not reach ${expected} item${expected === 1 ? '' : 's'} after the requested change.`);
-}
-
-function planPopupItemTarget(items, { forceNewBlock = false } = {}) {
-  const current = Array.isArray(items) ? items : [];
-  const firstEmptyIndex = current.findIndex(isEmptyPopupItem);
-  // A popup editor always writes into a blank item.  `forceNewBlock` means
-  // "do not overwrite a configured legacy popup"; it does *not* mean "add a
-  // second placeholder even when the previous run already left one".  That
-  // makes a retry idempotent after an interrupted Add block action.
-  //
-  // Never select a card by its status text: Vue recreates that text during
-  // transitions and can point at the preceding legacy card. The CMS
-  // serializes list_items in the same order as its draggable cards, so retain
-  // the exact array index whenever a blank card already exists.
-  if (firstEmptyIndex >= 0) {
-    return {
-      targetIndex: firstEmptyIndex,
-      expectedCount: current.length,
-      addBlock: false
-    };
-  }
-  // NewZen may insert a new card at either end of list_items. Its position
-  // cannot be predicted from the old count, so resolve it only after reading
-  // the post-click serialized list.
-  return {
-    targetIndex: null,
-    expectedCount: current.length + 1,
-    addBlock: true
-  };
-}
-
-function popupItemSignature(item) {
-  // Only persistent fields belong in the comparison. IDs and UI-only state
-  // vary on every Vue render and would make a valid prepend look ambiguous.
-  return JSON.stringify({
-    time_start: String(item?.time_start || '').trim(),
-    time_end: String(item?.time_end || '').trim(),
-    image: stableImageUrl(item?.image || ''),
-    image_alt: String(item?.image_alt || '').trim(),
-    link: String(item?.link || '').trim(),
-    html_code: String(item?.html_code || '').trim(),
-    open_new_tab: item?.open_new_tab === undefined ? null : Boolean(item.open_new_tab)
-  });
-}
-
-function samePopupItemSequence(left, right) {
-  if (left.length !== right.length) return false;
-  return left.every((item, index) => popupItemSignature(item) === popupItemSignature(right[index]));
-}
-
-function resolveAddedPopupItemTarget(beforeItems, afterItems) {
-  const before = Array.isArray(beforeItems) ? beforeItems : [];
-  const after = Array.isArray(afterItems) ? afterItems : [];
-  const expectedCount = before.length + 1;
-  if (after.length !== expectedCount) {
-    return {
-      targetIndex: null,
-      expectedCount,
-      method: null,
-      reason: `list-count-${after.length}-expected-${expectedCount}`
-    };
-  }
-
-  // First prove where the new item was inserted by removing each candidate
-  // from the after-list and comparing the remaining serialized values with
-  // the before-list. This supports both prepend and append without assuming
-  // either UI implementation.
-  const insertedIndexes = [];
-  for (let index = 0; index < after.length; index += 1) {
-    const withoutCandidate = [...after.slice(0, index), ...after.slice(index + 1)];
-    if (samePopupItemSequence(withoutCandidate, before)) insertedIndexes.push(index);
-  }
-  const blankInsertedIndexes = insertedIndexes.filter((index) => isEmptyPopupItem(after[index]));
-  if (blankInsertedIndexes.length === 1) {
-    return {
-      targetIndex: blankInsertedIndexes[0],
-      expectedCount,
-      method: 'serialized-delta',
-      reason: null
-    };
-  }
-  if (blankInsertedIndexes.length > 1) {
-    const lastIndex = after.length - 1;
-    const targetIndex = blankInsertedIndexes.includes(lastIndex) ? lastIndex : blankInsertedIndexes[0];
-    return {
-      targetIndex,
-      expectedCount,
-      method: 'appended-blank-card',
-      reason: null
-    };
-  }
-
-  // Some NewZen versions normalize a legacy field while adding a card. In
-  // that case the exact delta comparison is no longer stable, but because we
-  // only call Add when the before-list had no blanks, one newly blank card is
-  // still unambiguous and safe to use.
-  const blankIndexes = after
-    .map((item, index) => (isEmptyPopupItem(item) ? index : -1))
-    .filter((index) => index >= 0);
-  if (blankIndexes.length === 1) {
-    return {
-      targetIndex: blankIndexes[0],
-      expectedCount,
-      method: 'unique-blank-after-add',
-      reason: null
-    };
-  }
-  if (blankIndexes.length > 1) {
-    const lastIndex = after.length - 1;
-    const targetIndex = blankIndexes.includes(lastIndex) ? lastIndex : blankIndexes[blankIndexes.length - 1];
-    return {
-      targetIndex,
-      expectedCount,
-      method: 'latest-blank-card',
-      reason: null
-    };
-  }
-  return {
-    targetIndex: null,
-    expectedCount,
-    method: null,
-    reason: blankIndexes.length
-      ? `ambiguous-blank-items-${blankIndexes.length}`
-      : 'new-item-not-blank'
-  };
-}
-
 
 function popupItemsForReport(items, timezone) {
   return (Array.isArray(items) ? items : []).map((item, index) => ({
@@ -1563,155 +1408,6 @@ async function removeSingleExistingPopup(page) {
   return { removed: true, previous };
 }
 
-async function popupListItemEditorIsOpen(page, timeout = 1200) {
-  const isHeading = page.getByRole('heading', { name: 'List items', exact: true });
-  const isImageLabel = page.locator('label').filter({ hasText: /^Image$/ });
-  const hasChangeImage = page.getByText(/Click to change image/i);
-  return Promise.any([
-    waitForVisibleMatch(isHeading, null, true, timeout),
-    waitForVisibleMatch(isImageLabel, null, true, timeout),
-    waitForVisibleMatch(hasChangeImage, null, true, timeout)
-  ]).then(() => true).catch(() => false);
-}
-
-async function popupListItemsPanel(page) {
-  // The page editor contains many `button-drag` controls (including fields
-  // such as Horizontal). Anchor strictly to the `list_items` array field.
-  // It is the only one with this serialized checkbox name. When the array is
-  // empty the checkbox is absent, so the visible List items label is the
-  // narrow fallback. Never fall back to a page-wide card selector.
-  const checkAll = await visibleMatch(
-    page.locator('input[type="checkbox"][name^="check-all-list_items-"]'),
-    null,
-    true
-  );
-  const anchor = checkAll || await visibleMatch(
-    page.getByText('List items', { exact: true }),
-    'Popup List items label',
-    true
-  );
-  const panel = anchor.locator(
-    'xpath=ancestor::div[.//button[normalize-space(.)="Add block"]][1]'
-  );
-  if (!await panel.isVisible().catch(() => false)) {
-    const error = new Error('Popup List items panel was not available. No unrelated CMS field was selected.');
-    error.stage = 'popup-item-target';
-    throw error;
-  }
-  return panel;
-}
-
-async function waitForPopupListItemsPanel(page, timeout = 5000) {
-  const deadline = Date.now() + timeout;
-  let lastError = null;
-  while (Date.now() < deadline) {
-    try {
-      const panel = await popupListItemsPanel(page);
-      const addBlock = await visibleMatch(
-        panel.getByRole('button', { name: 'Add block', exact: true }),
-        null,
-        true
-      );
-      if (addBlock) return panel;
-    } catch (error) {
-      lastError = error;
-    }
-    await page.waitForTimeout(150);
-  }
-  const error = new Error(`Popup List items panel did not become ready${lastError?.message ? ` (${lastError.message})` : ''}.`);
-  error.stage = 'popup-item-target';
-  throw error;
-}
-
-async function popupListItemCards(page, expectedCount = null) {
-  const panel = await popupListItemsPanel(page);
-  const dragButtons = panel.locator('button.button-drag');
-  const rawCards = [];
-  const count = await dragButtons.count();
-  for (let index = 0; index < count; index += 1) {
-    const button = dragButtons.nth(index);
-    if (!await button.isVisible().catch(() => false)) continue;
-    // UCard owns the Vue onClick handler. An inner flex row can contain the
-    // drag button too, but clicking it does not reliably select the item.
-    const card = button.locator(
-      'xpath=ancestor::div[contains(concat(" ", normalize-space(@class), " "), " relative ") and contains(concat(" ", normalize-space(@class), " "), " cursor-pointer ")][1]'
-    );
-    if (await card.isVisible().catch(() => false)) rawCards.push(card);
-  }
-
-  // Deduplicate cards so duplicate locator instances pointing to the same element are merged
-  const cards = [];
-  for (const card of rawCards) {
-    let duplicate = false;
-    for (const existing of cards) {
-      const same = await page.evaluate(([a, b]) => a === b, [await existing.elementHandle(), await card.elementHandle()]).catch(() => false);
-      if (same) {
-        duplicate = true;
-        break;
-      }
-    }
-    if (!duplicate) cards.push(card);
-  }
-
-  if (Number.isInteger(expectedCount) && cards.length !== expectedCount) {
-    const error = new Error(`Popup list exposed ${cards.length} cards for ${expectedCount} serialized items. No unrelated CMS field was selected.`);
-    error.stage = 'popup-item-target';
-    throw error;
-  }
-  return cards;
-}
-
-async function openPopupListCard(page, targetIndex, description, { timeout = 10000, expectedCount = null } = {}) {
-  // If the editor is already open, do not attempt to click cards
-  if (await popupListItemEditorIsOpen(page, 500)) return true;
-
-  const deadline = Date.now() + timeout;
-  let lastError = null;
-  while (Date.now() < deadline) {
-    if (await popupListItemEditorIsOpen(page, 300)) return true;
-
-    let card = null;
-    try {
-      let cards = [];
-      try {
-        cards = await popupListItemCards(page, expectedCount);
-      } catch (err) {
-        cards = await popupListItemCards(page, null);
-      }
-      card = cards[targetIndex] || null;
-    } catch (error) {
-      lastError = error;
-    }
-    if (card) {
-      try {
-        await card.scrollIntoViewIfNeeded();
-        // Priority 1: Click the interactive text body, thumbnail, or card directly
-        const clickTarget = card.locator('span.truncate, .grow, img').first();
-        if (await clickTarget.isVisible().catch(() => false)) {
-          await clickTarget.click({ force: true }).catch(() => {});
-        } else {
-          await card.click({ force: true }).catch(() => {});
-        }
-        if (await popupListItemEditorIsOpen(page, 2500)) return true;
-
-        const box = await card.boundingBox();
-        if (box && box.width > 8 && box.height > 8) {
-          const x = Math.min(Math.max(70, Math.floor(box.width * 0.35)), Math.max(8, box.width - 18));
-          const y = Math.max(2, Math.min(Math.floor(box.height / 2), box.height - 2));
-          await page.mouse.click(box.x + x, box.y + y).catch(() => {});
-          if (await popupListItemEditorIsOpen(page, 2500)) return true;
-        }
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    if (await popupListItemEditorIsOpen(page, 300)) return true;
-    await page.waitForTimeout(200);
-  }
-  const suffix = lastError?.message ? ` (${lastError.message})` : '';
-  throw new Error(`${description} at popup item ${targetIndex + 1} was not available as a stable popup card${suffix}`);
-}
-
 async function popupPositionPersisted(page, beforeItems, imageUrl, position, timeout = 5000) {
   const deadline = Date.now() + timeout;
   let last = { ok: false, reason: 'not-observed' };
@@ -1739,9 +1435,52 @@ async function dragPopupImageToPosition(page, imageUrl, position) {
   const cards = await popupListItemCards(page, before.items.length);
   const sourceCard = cards[sourceIndex];
   const destinationCard = cards[destinationIndex];
-  const sourceHandle = await visibleMatch(sourceCard.locator('button.button-drag'), 'Popup position drag handle', true);
-  await sourceCard.scrollIntoViewIfNeeded();
-  await destinationCard.scrollIntoViewIfNeeded();
+
+  // Primary Strategy: Move using the card's native context menu ("Move to top" / "Move to bottom")
+  try {
+    const menuButton = await visibleMatch(
+      sourceCard.locator('button.button-drag, [class*="button-drag"], [class*="drag-handle"], button[class*="drag"], button:has([class*="bars"]), svg.cursor-grab, svg.cursor-move, [role="button"]:has(svg)'),
+      null,
+      true
+    ).catch(() => null) || await visibleMatch(sourceCard.locator('button, [role="button"]').last(), null, true).catch(() => null);
+
+    if (menuButton) {
+      await sourceCard.evaluate((el) => {
+        try { el.scrollIntoView({ block: 'nearest', inline: 'nearest' }); } catch {}
+      }).catch(() => {});
+      await menuButton.click({ force: true });
+      const menu = await waitForVisibleMatch(page.getByRole('menu'), null, true, 2500).catch(() => null);
+      if (menu) {
+        const movePattern = position === 'first'
+          ? /^(?:Move\s+to\s+top|Chuyển\s+lên\s+đầu|Lên\s+đầu)$/i
+          : /^(?:Move\s+to\s+bottom|Chuyển\s+xuống\s+dưới|Xuống\s+dưới)$/i;
+        const fallbackPattern = position === 'first' ? /Move\s+to\s+top|top/i : /Move\s+to\s+bottom|bottom/i;
+        const moveOption = await visibleMatch(
+          menu.getByRole('menuitem', { name: movePattern }),
+          null,
+          true
+        ).catch(() => null) || await visibleMatch(
+          menu.locator('button, [role="menuitem"], a, div, span').filter({ hasText: fallbackPattern }),
+          null,
+          true
+        ).catch(() => null);
+        if (moveOption) {
+          await moveOption.click({ force: true });
+          const persistedByMenu = await popupPositionPersisted(page, before.items, imageUrl, position, 3500);
+          if (persistedByMenu.ok) return true;
+        }
+      }
+      await page.keyboard.press('Escape').catch(() => {});
+    }
+  } catch {}
+
+  const sourceHandle = await visibleMatch(
+    sourceCard.locator('button.button-drag, [class*="button-drag"], [class*="drag-handle"], button[class*="drag"], button:has([class*="bars"]), svg.cursor-grab, svg.cursor-move, [role="button"]:has(svg)'),
+    'Popup position drag handle',
+    true
+  ) || await visibleMatch(sourceCard.locator('button, [role="button"]').last(), 'Popup position drag handle', true);
+  await sourceCard.evaluate((el) => el.scrollIntoView({ block: 'nearest', inline: 'nearest' })).catch(() => {});
+  await destinationCard.evaluate((el) => el.scrollIntoView({ block: 'nearest', inline: 'nearest' })).catch(() => {});
   const destinationBox = await destinationCard.boundingBox();
   if (!destinationBox) {
     const error = new Error('Popup destination card was not visible for reordering. CMS Build was not started.');
@@ -1762,7 +1501,8 @@ async function dragPopupImageToPosition(page, imageUrl, position) {
       const refreshedCards = await popupListItemCards(page, refreshed.items.length);
       const refreshedSource = refreshedCards[refreshedPlan.targetIndexes[0]];
       const refreshedDestination = refreshedCards[position === 'first' ? 0 : refreshed.items.length - 1];
-      const handleBox = await refreshedSource.locator('button.button-drag').boundingBox();
+      const handleLocator = refreshedSource.locator('button.button-drag, [class*="button-drag"], [class*="drag-handle"], button[class*="drag"], button:has([class*="bars"]), svg.cursor-grab, svg.cursor-move, [role="button"]:has(svg)');
+      const handleBox = await (handleLocator.first().boundingBox().catch(() => null)) || await refreshedSource.locator('button, [role="button"]').last().boundingBox().catch(() => null);
       const targetBox = await refreshedDestination.boundingBox();
       if (handleBox && targetBox) {
         await page.mouse.move(handleBox.x + handleBox.width / 2, handleBox.y + handleBox.height / 2);
@@ -1806,265 +1546,52 @@ async function movePopupImagesToPosition(page, imageUrls, position) {
   return { applied: true, moved };
 }
 
-async function openPopupListItem(page, { forceNewBlock = false, replaceTargetIndex = null } = {}) {
+function popupOrderMatches(items, orderedImageUrls) {
+  const actual = (Array.isArray(items) ? items : [])
+    .map((item) => stableImageUrl(item?.image))
+    .filter(Boolean);
+  const expected = (Array.isArray(orderedImageUrls) ? orderedImageUrls : [])
+    .map(stableImageUrl)
+    .filter(Boolean);
+  return actual.length === expected.length
+    && expected.every((url, index) => actual[index] === url);
+}
+
+// NewZen can prepend or append every newly added card. During migration we
+// restore the exact saved list order, unless the ticket explicitly requests a
+// new first/last position for the ticket poster.
+async function restoreMigratedPopupOrder(page, orderedImageUrls) {
+  const expected = (Array.isArray(orderedImageUrls) ? orderedImageUrls : [])
+    .map(stableImageUrl)
+    .filter(Boolean);
+  if (expected.length < 2) return { applied: false, moved: false };
+
   const before = await readPopupListItems(page);
-  let target;
-  let items = before.items;
-  if (Number.isInteger(replaceTargetIndex) && replaceTargetIndex >= 0 && replaceTargetIndex < before.items.length) {
-    target = {
-      targetIndex: replaceTargetIndex,
-      expectedCount: before.items.length,
-      addBlock: false
-    };
-  } else {
-    target = planPopupItemTarget(before.items, { forceNewBlock });
-    if (target.addBlock) {
-      const panel = await waitForPopupListItemsPanel(page, 6000).catch(() => null);
-      const addBlockLocator = panel
-        ? panel.getByRole('button', { name: /Add\s*block/i })
-        : page.getByRole('button', { name: /Add\s*block/i });
+  if (popupOrderMatches(before.items, expected)) return { applied: true, moved: false };
 
-      const addBlock = await waitForVisibleMatch(
-        addBlockLocator,
-        null,
-        true,
-        6000
-      ).catch(() => null) || await waitForVisibleMatch(
-        page.locator('button:has-text("Add block")'),
-        'Popup Add block control',
-        true,
-        8000
-      );
-      await addBlock.click();
-      // CMS sometimes auto-opens the last card, and sometimes leaves the
-      // previous card open. Always return to the list then select the exact
-      // serialized index; an open editor alone is not proof of its identity.
-      if (await popupListItemEditorIsOpen(page, 1000)) await backToPopupSettings(page);
-      items = await waitForPopupListItemCount(page, target.expectedCount);
-      const resolved = resolveAddedPopupItemTarget(before.items, items);
-      if (!Number.isInteger(resolved.targetIndex)) {
-        const error = new Error(
-          `CMS added a popup item but it was not a uniquely identifiable blank card (${resolved.reason}). `
-          + 'The ticket poster and dates were not changed.'
-        );
-        error.stage = 'popup-item-target';
-        error.popupItems = popupItemsForReport(items, { iana: 'UTC' });
-        throw error;
-      }
-      target = {
-        ...target,
-        targetIndex: resolved.targetIndex,
-        expectedCount: resolved.expectedCount,
-        targetResolution: resolved.method
-      };
-    }
-    if (!isEmptyPopupItem(items[target.targetIndex])) {
-      const error = new Error(
-        `Popup item ${target.targetIndex + 1} is not blank before opening it. `
-        + 'The ticket poster and dates were not changed.'
-      );
-      error.stage = 'popup-item-target';
-      throw error;
-    }
+  // Apply Move to top from the last expected item backward. This produces the
+  // complete target sequence using NewZen's stable native action.
+  let moved = false;
+  for (const imageUrl of [...expected].reverse()) {
+    moved = await dragPopupImageToPosition(page, imageUrl, 'first') || moved;
   }
-  if (await popupListItemEditorIsOpen(page, 500)) await backToPopupSettings(page);
-  await openPopupListCard(page, target.targetIndex, target.addBlock ? 'New popup block' : (Number.isInteger(replaceTargetIndex) ? 'Popup block for replacement' : 'Popup placeholder'), {
-    expectedCount: target.expectedCount
-  });
-  return { ...target, beforeItems: before.items };
-}
-
-async function setPopupImageLink(page, imageLink) {
-  if (!imageLink || typeof imageLink !== 'string' || !imageLink.trim()) return null;
-  const link = imageLink.trim();
-
-  // Try controlForLabel for standard label variations
-  const candidateLabels = [
-    'Image link',
-    'Image link (optional)',
-    'Link',
-    'Link (optional)'
-  ];
-
-  for (const labelText of candidateLabels) {
-    try {
-      const { control } = await controlForLabel(page, labelText, true);
-      if (control) {
-        await control.fill('');
-        await control.fill(link);
-        await control.evaluate((el, val) => {
-          el.value = val;
-          el.dispatchEvent(new Event('input', { bubbles: true }));
-          el.dispatchEvent(new Event('change', { bubbles: true }));
-        }, link).catch(() => {});
-        await page.waitForTimeout(300);
-        const value = await control.inputValue().catch(() => '');
-        if (value === link) {
-          progress('popup-link', `Đã gắn link cho popup: ${link}`);
-          return link;
-        }
-      }
-    } catch {
-      // try next
-    }
-  }
-
-  // Fallback 1: find label by case-insensitive text match
-  try {
-    const labels = page.locator('label');
-    const count = await labels.count();
-    for (let i = count - 1; i >= 0; i -= 1) {
-      const label = labels.nth(i);
-      if (!await label.isVisible().catch(() => false)) continue;
-      const text = (await label.innerText().catch(() => '')).trim();
-      if (/^(?:image\s+)?link(?:\s*\(optional\))?$/i.test(text)) {
-        const id = await label.getAttribute('for');
-        let input = id ? page.locator(`[id="${id}"]`) : null;
-        if (!input || !await input.isVisible().catch(() => false)) {
-          input = label.locator('xpath=following::input[1]');
-        }
-        if (!input || !await input.isVisible().catch(() => false)) {
-          input = label.locator('xpath=ancestor::div[1]//input');
-        }
-        if (input && await input.isVisible().catch(() => false)) {
-          await input.fill('');
-          await input.fill(link);
-          await input.evaluate((el, val) => {
-            el.value = val;
-            el.dispatchEvent(new Event('input', { bubbles: true }));
-            el.dispatchEvent(new Event('change', { bubbles: true }));
-          }, link).catch(() => {});
-          await page.waitForTimeout(300);
-          progress('popup-link', `Đã gắn link cho popup: ${link}`);
-          return link;
-        }
-      }
-    }
-  } catch {
-    // try direct input
-  }
-
-  // Fallback 2: look for direct input with matching name or placeholder
-  try {
-    const direct = page.locator('input[name="link"], input[name="image_link"], input[placeholder*="link" i], input[placeholder*="http" i]').last();
-    if (await direct.isVisible().catch(() => false)) {
-      await direct.fill('');
-      await direct.fill(link);
-      await direct.evaluate((el, val) => {
-        el.value = val;
-        el.dispatchEvent(new Event('input', { bubbles: true }));
-        el.dispatchEvent(new Event('change', { bubbles: true }));
-      }, link).catch(() => {});
-      await page.waitForTimeout(300);
-      progress('popup-link', `Đã gắn link cho popup: ${link}`);
-      return link;
-    }
-  } catch {
-    // ignore
-  }
-
-  progress('popup-link-warning', `Không tìm thấy ô nhập link trong popup editor để gắn URL: ${link}`);
-  return null;
-}
-
-async function configurePopupListItem(page, imagePath, schedule, timezone, { forceNewBlock = false, replaceTargetIndex = null, isReplacement = false, imageLink = null } = {}) {
-  const target = await openPopupListItem(page, { forceNewBlock, replaceTargetIndex });
-  await waitForVisibleMatch(
-    page.getByRole('heading', { name: 'List items', exact: true }),
-    'Popup list item editor',
-    true,
-    5000
-  );
-
-  const imageLabel = await visibleLabel(page, 'Image', true);
-  const imagePanel = imageLabel.locator('xpath=ancestor::div[3]');
-  const imageInput = imagePanel.locator('input[type="file"]');
-  const previousImageUrls = await imagePanel.locator('img').evaluateAll((images) => images
-    .map((image) => image.src)
-    .filter((source) => source && !/\/images\/download\.png(?:$|\?)/.test(source))
-  ).catch(() => []);
-  if (!isReplacement && previousImageUrls.length > 0) {
-    const error = new Error(`Popup item ${target.targetIndex + 1} unexpectedly contains an existing image. The ticket poster was not uploaded.`);
-    error.stage = 'popup-item-target';
+  const after = await readPopupListItems(page);
+  if (!popupOrderMatches(after.items, expected)) {
+    const error = new Error('Migrated popup order did not match the original section order. CMS Build was not started.');
+    error.stage = 'popup-position-verification';
     throw error;
   }
-  // A missing start date means "show now" in the CMS.  Do not invent a
-  // calendar date: only a date written in the ticket is allowed to populate
-  // Time start. The blank-card assertion above happens first so a stale
-  // editor can never alter a legacy popup's dates.
-  let start = null;
-  if (schedule?.start) {
-    start = await setPopupStart(page, schedule.start, timezone);
-  } else if (schedule?.isIndefinite || isReplacement) {
-    await clearPopupStartDate(page).catch(() => {});
-  }
-
-  let end = null;
-  if (schedule?.end) {
-    end = await setPopupExpiry(page, schedule.end);
-  } else if (schedule?.isIndefinite || isReplacement) {
-    await clearPopupEndDate(page).catch(() => {});
-  }
-  await imageInput.setInputFiles(imagePath);
-  await page.waitForFunction((before) => {
-    const labels = [...document.querySelectorAll('label')].filter((label) => {
-      const rect = label.getBoundingClientRect();
-      return rect.width > 0 && rect.height > 0 && label.textContent.trim() === 'Image';
-    });
-    let panel = labels.at(-1);
-    for (let step = 0; panel && step < 3; step += 1) panel = panel.parentElement;
-    const current = [...(panel?.querySelectorAll('img') || [])]
-      .map((image) => image.src)
-      .filter((source) => source && !/\/images\/download\.png(?:$|\?)/.test(source));
-    // An existing legacy image must not be mistaken for a newly uploaded
-    // ticket poster. A blank item accepts its first image; an occupied item
-    // must visibly receive a different media URL.
-    return before.length === 0 ? current.length > 0 : current.some((source) => !before.includes(source));
-  }, previousImageUrls, { timeout: 30000 });
-  const currentImageUrls = await imagePanel.locator('img').evaluateAll((images) => images
-    .map((image) => image.src)
-    .filter((source) => source && !/\/images\/download\.png(?:$|\?)/.test(source))
-  ).catch(() => []);
-  const uploadedImageUrl = previousImageUrls.length === 0
-    ? currentImageUrls.at(-1) || null
-    : currentImageUrls.find((source) => !previousImageUrls.includes(source)) || null;
-  if (!uploadedImageUrl) throw new Error('CMS did not expose a new image URL after the ticket poster upload.');
-
-  // Fill the Image link field when the ticket supplies a URL.
-  let configuredLink = null;
-  if (imageLink && typeof imageLink === 'string' && imageLink.trim()) {
-    configuredLink = await setPopupImageLink(page, imageLink);
-  }
-
-  // List item changes are kept by the CMS as the fields/upload change. The
-  // only explicit Save belongs to the outer Timezone panel and was clicked
-  // before opening Popup settings. Do not close the editor or wait for a
-  // nonexistent popup Save: Build is the global control at the top-right.
-  await page.waitForTimeout(800);
-  return {
-    ...target,
-    start: start?.date || null,
-    end: end?.date || null,
-    previewImageUrl: uploadedImageUrl,
-    imageLink: configuredLink || imageLink || null
-  };
-}
-
-async function backToPopupSettings(page) {
-  const back = await visibleMatch(page.getByRole('button', { name: /^back$/i }), 'Popup item Back control', true);
-  if (!back) throw new Error('Could not return from the popup item editor to Popup settings.');
-  await back.click();
-  await waitForPopupListItemsPanel(page);
-  await page.waitForTimeout(150);
+  return { applied: true, moved };
 }
 
 async function returnToPageEditor(page) {
   for (let attempt = 0; attempt < 4; attempt += 1) {
     const contentBlocks = await visibleMatch(page.getByText('Content blocks', { exact: true }), null, true);
     if (contentBlocks) return;
-    const back = await visibleMatch(page.getByRole('button', { name: /^back$/i }), null, true);
+    const back = await visibleMatch(page.getByRole('button', { name: /back/i }), null, true)
+      || await visibleMatch(page.locator('button:has-text("Back"), [role="button"]:has-text("Back"), .el-button:has-text("Back")'), null, true);
     if (!back) break;
-    await back.click();
+    await back.click({ force: true }).catch(() => {});
     await page.waitForTimeout(250);
   }
   await waitForVisibleMatch(page.getByText('Content blocks', { exact: true }), 'Page editor after popup action', true, 5000);
@@ -2200,286 +1727,6 @@ async function removePopupForTicket(page, baseUrl, runDir, ticketText, action, r
   return { scope: 'one', ...removal, vision: resolution.audit, visionRationale: resolution.selection.rationale, warnings: prepared.warnings };
 }
 
-async function waitForPersistedPopupItem(page, target, schedule, timezone) {
-  let lastItems = [];
-  let lastReason = 'not-observed';
-  for (let attempt = 0; attempt < 120; attempt += 1) {
-    try {
-      const { items } = await readPopupListItems(page);
-      lastItems = items;
-      const verification = verifyPersistedPopupItem({
-        afterItems: items,
-        targetIndex: target.targetIndex,
-        expectedCount: target.expectedCount,
-        schedule,
-        timezone
-      });
-      lastReason = verification.reason || 'not-persisted';
-      if (verification.ok) {
-        // Use the serialized CMS URL, never the temporary image preview from
-        // the nested editor. This ties the ticket poster to the exact card
-        // that will be present at Build time.
-        return {
-          ...target,
-          item: verification.item,
-          imageUrl: verification.item.image
-        };
-      }
-    } catch (error) {
-      lastReason = error?.message || 'popup-list-unavailable';
-    }
-    await page.waitForTimeout(250);
-  }
-  const error = new Error(
-    `Popup item ${target.targetIndex + 1} did not persist its ticket poster and dates (${lastReason}). CMS Build was not started.`
-  );
-  error.stage = 'popup-item-persist';
-  error.popupItems = popupItemsForReport(lastItems, timezone);
-  throw error;
-}
-
-function isEmptyPopupItem(item) {
-  if (!item || typeof item !== 'object') return true;
-  // A card without an uploaded image is never a configured popup poster.
-  // CMS auto-fills `time_start` with today's date when "Add block" is clicked,
-  // so an empty image determines that the item is an unconfigured blank card.
-  if (!String(item.image || '').trim()) return true;
-  return ['time_start', 'time_end', 'image', 'image_alt', 'link', 'html_code']
-    .every((key) => !String(item?.[key] || '').trim());
-}
-
-async function openConfiguredPopupListItem(page, imageUrl = null) {
-  const { items } = await readPopupListItems(page);
-  const configuredIndexes = items
-    .map((item, index) => (String(item?.image || '').trim() ? index : -1))
-    .filter((index) => index >= 0);
-  let targetIndex = -1;
-  if (imageUrl) {
-    const expected = stableImageUrl(imageUrl);
-    const matches = configuredIndexes.filter((index) => stableImageUrl(items[index].image) === expected);
-    if (matches.length !== 1) {
-      const error = new Error(`Configured popup image could not be matched to exactly one CMS card (found ${matches.length}).`);
-      error.stage = 'popup-item-target';
-      throw error;
-    }
-    targetIndex = matches[0];
-  } else if (configuredIndexes.length === 1) {
-    targetIndex = configuredIndexes[0];
-  } else {
-    const error = new Error(`Configured popup target is ambiguous (${configuredIndexes.length} configured cards).`);
-    error.stage = 'popup-item-target';
-    throw error;
-  }
-  await openPopupListCard(page, targetIndex, 'Configured popup item');
-}
-
-async function clearPopupDateControl(page, labelText) {
-  const controlInfo = await controlForLabel(page, labelText, false).catch(() => null);
-  if (!controlInfo) return false;
-  const { control, id } = controlInfo;
-  const existing = await control.inputValue().catch(() => '');
-  if (!existing) return false;
-  await control.click();
-  const calendar = await popupCalendar(page).catch(() => null);
-  if (calendar) {
-    const clear = await visibleMatch(calendar.getByText('Clear', { exact: true }), `${labelText} Clear control`, false).catch(() => null);
-    if (clear) await clear.click().catch(() => {});
-  }
-  const stillHasValue = await control.inputValue().catch(() => '');
-  if (stillHasValue) {
-    await control.fill('').catch(() => {});
-  }
-  await page.waitForFunction((fieldId) => !(document.getElementById(fieldId)?.value || '').trim(), id, { timeout: 3000 }).catch(() => {});
-  return true;
-}
-
-async function clearPopupStartDate(page) {
-  return clearPopupDateControl(page, 'Time start (optional)');
-}
-
-async function clearPopupEndDate(page) {
-  return clearPopupDateControl(page, 'Time end (optional)');
-}
-
-async function deletePopupItemAtIndex(page, targetIndex, expectedRemaining, description = 'Popup item') {
-  const { items } = await readPopupListItems(page);
-  if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= items.length) {
-    throw new Error(`${description} was not found in the CMS list.`);
-  }
-  const card = (await popupListItemCards(page, items.length))[targetIndex] || null;
-  if (!card) throw new Error(`${description} was not found as a stable popup card.`);
-  const menuButton = await visibleMatch(card.locator('button.button-drag'), `${description} menu`, true);
-  await menuButton.click();
-  const menu = await waitForVisibleMatch(page.getByRole('menu'), `${description} menu`, true, 3000);
-  const remove = await visibleMatch(
-    menu.getByRole('menuitem', { name: 'Delete item', exact: true }),
-    `${description} Delete item control`,
-    true
-  );
-  await remove.click();
-  const confirm = await waitForVisibleMatch(
-    page.getByRole('button', { name: /^(?:Confirm|Delete|Yes)$/i }),
-    `${description} delete confirmation`,
-    true,
-    3000
-  ).catch(() => null);
-  if (confirm) await confirm.click();
-  await waitForPopupListItemCount(page, expectedRemaining);
-}
-
-async function deleteOneEmptyPopupItem(page, expectedRemaining) {
-  const { items } = await readPopupListItems(page);
-  const targetIndex = items.findIndex(isEmptyPopupItem);
-  if (targetIndex < 0) throw new Error('Empty popup item was not found in the CMS list.');
-  return deletePopupItemAtIndex(page, targetIndex, expectedRemaining, 'Empty popup item');
-}
-
-async function repairExistingPopupSettings(page, schedule, timezone) {
-  const before = await readPopupListItems(page);
-  const emptyItems = before.items.filter(isEmptyPopupItem);
-  const configuredItems = before.items.filter((item) => !isEmptyPopupItem(item));
-  // Repair mode is intentionally limited to the precise state this tool
-  // created by mistake: one empty placeholder plus one configured popup.
-  // Anything else must be reviewed rather than guessed at.
-  if (emptyItems.length !== 1 || configuredItems.length !== 1) {
-    throw new Error(`Popup cleanup is ambiguous: expected one empty item and one configured popup, found ${emptyItems.length} empty and ${configuredItems.length} configured.`);
-  }
-  if (schedule.start) {
-    throw new Error('Popup cleanup does not clear Time start because this ticket explicitly includes a start date.');
-  }
-  const configured = configuredItems[0];
-  const existingEnd = popupDateFromCmsValue(configured.time_end, timezone);
-  if (schedule.end?.date && existingEnd !== schedule.end.date) {
-    throw new Error(`Popup cleanup stopped: the configured popup expires ${existingEnd || 'without a date'}, not the ticket date ${schedule.end.date}.`);
-  }
-  const existingStart = popupDateFromCmsValue(configured.time_start, timezone);
-  if (existingStart) {
-    await openConfiguredPopupListItem(page);
-    await clearPopupStartDate(page);
-    await backToPopupSettings(page);
-  }
-  await deleteOneEmptyPopupItem(page, configuredItems.length);
-  return {
-    imageConfigured: true,
-    start: null,
-    end: existingEnd,
-    removedEmptyItems: emptyItems.length,
-    clearedStart: Boolean(existingStart),
-    repaired: true,
-    replacement: { removed: false, previous: null },
-    migratedCount: 0,
-    ticketMergedWithLegacy: false,
-    timezoneControl: { applied: false, supported: false }
-  };
-}
-
-function normalizeTicketPopupEntries(ticketEntries, imagePath, schedule, ticketFilename = null) {
-  const supplied = Array.isArray(ticketEntries) && ticketEntries.length
-    ? ticketEntries
-    : [{ imagePath, schedule, filename: ticketFilename }];
-  const usedIndexes = new Set();
-  return supplied.map((entry, index) => {
-    const ticketIndex = Number.isInteger(entry?.ticketIndex) ? entry.ticketIndex : index;
-    const entryImagePath = entry?.imagePath || null;
-    if (!entryImagePath) throw new Error(`Ticket popup poster ${index + 1} has no local image path.`);
-    if (usedIndexes.has(ticketIndex)) throw new Error(`Ticket popup poster index ${ticketIndex + 1} is duplicated.`);
-    usedIndexes.add(ticketIndex);
-    return {
-      ticketIndex,
-      candidateIndex: Number.isInteger(entry?.candidateIndex) ? entry.candidateIndex : null,
-      imagePath: entryImagePath,
-      filename: entry?.filename || ticketFilename || path.basename(entryImagePath),
-      schedule: {
-        start: entry?.schedule?.start?.date ? { date: entry.schedule.start.date } : null,
-        end: entry?.schedule?.end?.date ? { date: entry.schedule.end.date } : null
-      }
-    };
-  });
-}
-
-function buildPopupEntriesForTickets(ticketEntries, legacyPopups = [], duplicateMatches = [], { replaceExisting = false } = {}) {
-  const normalizedTickets = Array.isArray(ticketEntries) ? ticketEntries : [];
-  const matchedTicketIndexes = new Set();
-  const matchingLegacyIndexes = [];
-  const legacyToTicketMap = new Map();
-
-  for (const match of duplicateMatches) {
-    if (match && Number.isInteger(match.cmsIndex) && Number.isInteger(match.ticketIndex)) {
-      legacyToTicketMap.set(match.cmsIndex, match.ticketIndex);
-    }
-  }
-
-  // When replacing and no specific duplicate match was found, if there is only 1 legacy popup
-  // on CMS, the ticket's first poster directly replaces that single legacy popup instead of adding alongside it.
-  if (replaceExisting && duplicateMatches.length === 0 && legacyPopups.length === 1 && normalizedTickets.length >= 1) {
-    legacyToTicketMap.set(0, normalizedTickets[0].ticketIndex ?? 0);
-  }
-
-  const entries = legacyPopups.map((legacy, legacyIndex) => {
-    let ticket = null;
-    if (legacyToTicketMap.has(legacyIndex)) {
-      const tIndex = legacyToTicketMap.get(legacyIndex);
-      ticket = normalizedTickets.find((c) => c.ticketIndex === tIndex) || null;
-    }
-    if (!ticket) {
-      const legacyIdentity = popupImageIdentity(legacy?.sourceImageUrl);
-      ticket = legacyIdentity
-        ? normalizedTickets.find((candidate) => (
-          !matchedTicketIndexes.has(candidate.ticketIndex)
-          && popupImageIdentity(candidate.filename || (candidate.imagePath ? path.basename(candidate.imagePath) : (candidate.uploadPath ? path.basename(candidate.uploadPath) : ''))) === legacyIdentity
-        ))
-        : null;
-    }
-    if (ticket) {
-      matchedTicketIndexes.add(ticket.ticketIndex);
-      matchingLegacyIndexes.push(legacyIndex);
-      return {
-        imagePath: ticket.uploadPath || ticket.path || ticket.imagePath || legacy.imagePath,
-        // An old active popup is retained for its poster and expiry. The new
-        // section must not introduce a start date unless this ticket gave one.
-        schedule: {
-          start: ticket.schedule?.start || null,
-          end: ticket.schedule?.end || legacy.end
-        },
-        imageLink: ticket.imageLink || legacy.imageLink || null,
-        isTicket: true,
-        ticketIndexes: [ticket.ticketIndex]
-      };
-    }
-    return {
-      imagePath: legacy.imagePath,
-      schedule: {
-        start: legacy.start || null,
-        end: legacy.end || null
-      },
-      imageLink: legacy.imageLink || null,
-      isTicket: false,
-      ticketIndexes: []
-    };
-  });
-  for (const ticket of normalizedTickets) {
-    if (matchedTicketIndexes.has(ticket.ticketIndex)) continue;
-    entries.push({
-      imagePath: ticket.uploadPath || ticket.path || ticket.imagePath,
-      schedule: ticket.schedule,
-      isTicket: true,
-      ticketIndexes: [ticket.ticketIndex]
-    });
-  }
-  return {
-    entries,
-    matchingLegacyIndex: matchingLegacyIndexes[0] ?? -1,
-    matchingLegacyIndexes
-  };
-}
-
-// Compatibility wrapper for the established one-poster unit tests and call
-// sites. The actual CMS writer accepts an array through `ticketEntries`.
-function buildPopupEntries(imagePath, schedule, legacyPopups, { ticketFilename = null, replaceExisting = false } = {}) {
-  const tickets = normalizeTicketPopupEntries(null, imagePath, schedule, ticketFilename);
-  return buildPopupEntriesForTickets(tickets, legacyPopups, [], { replaceExisting });
-}
-
 async function configurePopup(page, imagePath, schedule, timezone, {
   replaceExisting = false,
   sectionId = null,
@@ -2490,8 +1737,10 @@ async function configurePopup(page, imagePath, schedule, timezone, {
   popupPosition = null,
   duplicateMatches = [],
   removalMatches = [],
-  imageLink = null
+  imageLink = null,
+  popupDuration = null
 } = {}) {
+  await ensureDesktopViewport(page);
   await openPopupSection(page, sectionId);
   const timezoneControl = await setPopupTimezone(page, timezone);
   await openPopupSettings(page, sectionId);
@@ -2515,26 +1764,81 @@ async function configurePopup(page, imagePath, schedule, timezone, {
         duplicateTargetIndex = configuredMatch ? configuredMatch.idx : matches[0].idx;
       }
     }
-    if (duplicateTargetIndex < 0 && Number.isInteger(duplicateMatch?.cmsIndex) && before.items[duplicateMatch.cmsIndex]) {
+    if (duplicateTargetIndex < 0 && legacyPopups.length === 0 && Number.isInteger(duplicateMatch?.cmsIndex) && before.items[duplicateMatch.cmsIndex]) {
       duplicateTargetIndex = duplicateMatch.cmsIndex;
+    }
+  }
+
+  // A replace ticket must be idempotent: it may update one existing configured
+  // card, but it must never fall through to the create/placeholder path. Empty
+  // cards left by older failed runs do not make the replacement target ambiguous.
+  if (replaceExisting && legacyPopups.length === 0 && duplicateTargetIndex < 0) {
+    const configuredIndexes = before.items
+      .map((item, index) => (!isEmptyPopupItem(item) ? index : -1))
+      .filter((index) => index >= 0);
+    if (configuredIndexes.length === 1) {
+      duplicateTargetIndex = configuredIndexes[0];
+      duplicateMatch = {
+        ticketIndex: normalizedTicketEntries[0]?.ticketIndex ?? 0,
+        cmsIndex: duplicateTargetIndex,
+        cms: { sourceImageUrl: before.items[duplicateTargetIndex]?.image || null },
+        method: 'sole-configured-replacement-target'
+      };
+    } else if (removalMatches.length === 1 && Number.isInteger(removalMatches[0]?.cmsIndex)) {
+      duplicateTargetIndex = removalMatches[0].cmsIndex;
+      duplicateMatch = {
+        ticketIndex: normalizedTicketEntries[0]?.ticketIndex ?? 0,
+        cmsIndex: duplicateTargetIndex,
+        cms: { sourceImageUrl: before.items[duplicateTargetIndex]?.image || null },
+        method: 'removal-match-replacement-target'
+      };
+      removalMatches = [];
+    } else {
+      const error = new Error(
+        `Replacement target is ambiguous (${configuredIndexes.length} configured popup cards). `
+        + 'Add block and placeholder reuse were not allowed.'
+      );
+      error.stage = 'popup-item-target';
+      error.popupItems = popupItemsForReport(before.items, timezone);
+      throw error;
+    }
+  }
+
+  // Mixed add+remove or replacement: when a specific old popup is targeted for removal
+  // and there is 1 new ticket poster, replace that exact card in-place to preserve its position completely.
+  if (duplicateTargetIndex < 0 && legacyPopups.length === 0 && removalMatches.length === 1 && normalizedTicketEntries.length === 1) {
+    const targetIdx = removalMatches[0].cmsIndex;
+    if (Number.isInteger(targetIdx) && targetIdx >= 0 && targetIdx < before.items.length) {
+      duplicateTargetIndex = targetIdx;
+      duplicateMatch = {
+        ticketIndex: normalizedTicketEntries[0]?.ticketIndex ?? 0,
+        cmsIndex: targetIdx,
+        cms: { sourceImageUrl: before.items[targetIdx]?.image || null },
+        method: 'removal-match-in-place-replacement'
+      };
+      removalMatches = [];
     }
   }
 
   const shouldRemoveSingle = replaceExisting && duplicateMatches.length === 0 && before.items.length === 1;
   const replacement = shouldRemoveSingle ? await removeSingleExistingPopup(page) : { removed: false, previous: null };
+  // Default popup position: ticket poster should ALWAYS be at the first position
+  // unless the ticket explicitly requested another position (such as 'last').
+  const effectivePosition = popupPosition === 'last' ? 'last' : 'first';
   const { entries, matchingLegacyIndex, matchingLegacyIndexes } = buildPopupEntriesForTickets(
     normalizedTicketEntries,
     legacyPopups,
     duplicateMatches,
-    { replaceExisting }
+    { replaceExisting, popupPosition: effectivePosition, replacementMatches: removalMatches }
   );
   const emptyItemsBefore = before.items.filter(isEmptyPopupItem);
   const configuredItemsBefore = before.items.filter((item) => !isEmptyPopupItem(item));
   const hasReusablePlaceholder = emptyItemsBefore.length > 0;
   const ticketItems = new Map();
+  const configuredEntryItems = new Map();
   let lastConfiguredItem = null;
 
-  if (duplicateTargetIndex >= 0 && duplicateMatch) {
+  if (legacyPopups.length === 0 && duplicateTargetIndex >= 0 && duplicateMatch) {
     const targetItem = before.items[duplicateTargetIndex];
     const ticketEntry = normalizedTicketEntries.find((t) => t.ticketIndex === duplicateMatch.ticketIndex) || normalizedTicketEntries[0];
     const isIndefinite = Boolean(ticketEntry?.schedule?.isIndefinite);
@@ -2554,7 +1858,13 @@ async function configurePopup(page, imagePath, schedule, timezone, {
       ticketEntry.uploadPath || ticketEntry.path || ticketEntry.imagePath,
       targetSchedule,
       timezone,
-      { replaceTargetIndex: duplicateTargetIndex, isReplacement: true, imageLink: imageLink || null }
+      {
+        replaceTargetIndex: duplicateTargetIndex,
+        replaceTargetImageUrl: targetItem?.image || duplicateMatch.cms?.sourceImageUrl || null,
+        isReplacement: true,
+        allowAddBlock: false,
+        imageLink: imageLink || null
+      }
     );
     await backToPopupSettings(page);
     const item = await waitForPersistedPopupItem(page, configured, targetSchedule, timezone);
@@ -2562,33 +1872,40 @@ async function configurePopup(page, imagePath, schedule, timezone, {
     for (const ticketIndex of [ticketEntry.ticketIndex]) ticketItems.set(ticketIndex, item);
 
     try {
-      const { items: afterItems } = await readPopupListItems(page);
-      for (let i = afterItems.length - 1; i >= 0; i -= 1) {
-        if (i === duplicateTargetIndex) continue;
-        const it = afterItems[i];
-        const isUnconfigured = !String(it?.time_end || '').trim();
-        const matchesReplacedImage = stableImageUrl(it?.image) === stableImageUrl(duplicateMatch.cms?.sourceImageUrl)
-          || stableImageUrl(it?.image) === stableImageUrl(item.imageUrl)
-          || isEmptyPopupItem(it);
-        if (isUnconfigured && matchesReplacedImage) {
-          progress('popup-cleanup', `Xóa block ảnh trùng lặp chưa cấu hình (Not configured) tại vị trí #${i + 1}`);
-          await deletePopupItemAtIndex(page, i, afterItems.length - 1, 'Unconfigured duplicate popup item');
-          break;
-        }
+      let { items: afterItems } = await readPopupListItems(page);
+      const keptUrl = stableImageUrl(item.imageUrl);
+      const ticketIdentity = popupImageIdentity(item.imageUrl || duplicateMatch.cms?.sourceImageUrl || '');
+      while (true) {
+        const duplicateIndex = afterItems.findIndex((candidate) => {
+          const candidateUrl = stableImageUrl(candidate?.image);
+          if (!candidateUrl || candidateUrl === keptUrl) return false;
+          const sameIdentity = ticketIdentity && popupImageIdentity(candidate?.image) === ticketIdentity;
+          return sameIdentity && !String(candidate?.time_end || '').trim();
+        });
+        if (duplicateIndex < 0) break;
+        progress('popup-cleanup', `Xóa block ảnh trùng lặp chưa cấu hình (Not configured) tại vị trí #${duplicateIndex + 1}`);
+        await deletePopupItemAtIndex(page, duplicateIndex, afterItems.length - 1, 'Unconfigured duplicate popup item');
+        ({ items: afterItems } = await readPopupListItems(page));
       }
     } catch {
       // Non-blocking cleanup
     }
   } else {
+    const effectiveMaxAllowedBlocks = legacyPopups.length > 0
+      ? entries.length
+      : (configuredItemsBefore.length + entries.length);
     for (let index = 0; index < entries.length; index += 1) {
       const entry = entries[index];
       const configured = await configurePopupListItem(page, entry.imagePath, entry.schedule, timezone, {
-        forceNewBlock: index > 0 || (index === 0 && configuredItemsBefore.length > 0 && !hasReusablePlaceholder),
-        imageLink: entry.isTicket !== false ? (imageLink || null) : (entry.imageLink || null)
+        forceNewBlock: false,
+        imageLink: entry.isTicket !== false ? (imageLink || null) : (entry.imageLink || null),
+        maxAllowedBlocks: effectiveMaxAllowedBlocks,
+        itemIndex: index
       });
       await backToPopupSettings(page);
       const item = await waitForPersistedPopupItem(page, configured, entry.schedule, timezone);
       lastConfiguredItem = item;
+      configuredEntryItems.set(index, item);
       for (const ticketIndex of entry.ticketIndexes || []) {
         ticketItems.set(ticketIndex, item);
         const ticketEntry = normalizedTicketEntries.find((t) => t.ticketIndex === ticketIndex);
@@ -2640,21 +1957,53 @@ async function configurePopup(page, imagePath, schedule, timezone, {
     }
   }
 
+  // After all planned entries are configured and removals are processed,
+  // clean up any remaining empty / unconfigured popup items (Not configured).
+  // These occur when CMS adds an initial default blank item or when earlier runs were interrupted.
+  try {
+    let { items: currentList } = await readPopupListItems(page);
+    while (true) {
+      const emptyIndex = currentList.findIndex(isEmptyPopupItem);
+      if (emptyIndex < 0) break;
+      progress('popup-cleanup', `Xóa block trống chưa cấu hình (Not configured) tại vị trí #${emptyIndex + 1}`);
+      await deletePopupItemAtIndex(page, emptyIndex, currentList.length - 1, 'Empty unconfigured popup item');
+      const updated = await readPopupListItems(page);
+      currentList = updated.items;
+    }
+  } catch (err) {
+    progress('popup-cleanup-warning', `Không thể tự động xóa block trống: ${err.message}`);
+  }
+
   let positionResult = { applied: false, moved: false };
-  if ((popupPosition === 'first' || popupPosition === 'last') && ticketItems.size) {
+  if (legacyPopups.length > 0) {
+    const originalOrderUrls = entries.map((_, index) => configuredEntryItems.get(index)?.imageUrl || null);
+    if (originalOrderUrls.some((url) => !url)) {
+      const error = new Error('A migrated popup item could not be resolved for order verification. CMS Build was not started.');
+      error.stage = 'popup-position-verification';
+      throw error;
+    }
+    progress('popup-position', 'Sắp xếp thứ tự popup: popup mới ở vị trí đầu tiên, các popup cũ giữ nguyên thứ tự');
+    positionResult = await restoreMigratedPopupOrder(page, originalOrderUrls);
+  } else if (ticketItems.size > 0 && configuredItemsBefore.length > 0) {
     const ticketImageUrls = normalizedTicketEntries
       .map((ticket) => ticketItems.get(ticket.ticketIndex)?.imageUrl || null)
       .filter(Boolean);
-    progress('popup-position', `Moving ticket popup image${ticketImageUrls.length === 1 ? '' : 's'} to the requested ${popupPosition} position`);
-    positionResult = await movePopupImagesToPosition(page, ticketImageUrls, popupPosition);
+    if (ticketImageUrls.length > 0) {
+      progress('popup-position', `Sắp xếp poster ticket theo vị trí ${effectivePosition}`);
+      positionResult = await movePopupImagesToPosition(page, ticketImageUrls, effectivePosition);
+    }
   }
   const after = await readPopupListItems(page);
   // The last exact target is the authoritative count.  This also handles a
   // replacement ticket, where the original single popup was intentionally
   // removed before adding the new one.
-  const expectedItemCount = itemsRemovedAfterAdd > 0 || duplicateTargetIndex >= 0
-    ? after.items.length
-    : (lastConfiguredItem?.expectedCount ?? after.items.length);
+  const expectedConfiguredCount = legacyPopups.length > 0
+    ? entries.length
+    : (duplicateTargetIndex >= 0
+        ? Math.max(1, configuredItemsBefore.length)
+        : Math.max(1, configuredItemsBefore.length + entries.length - itemsRemovedAfterAdd)
+      );
+  const expectedItemCount = expectedConfiguredCount;
   const configuredItems = after.items.filter((item) => typeof item?.image === 'string' && item.image.trim());
   const emptyItems = after.items.filter(isEmptyPopupItem);
   const verifiedTicketItems = normalizedTicketEntries.map((ticket) => {
@@ -2699,6 +2048,22 @@ async function configurePopup(page, imagePath, schedule, timezone, {
     error.popupItems = popupItemsForReport(after.items, timezone);
     throw error;
   }
+  let delaySliderResult = null;
+  if (popupDuration?.delaySliderSeconds) {
+    progress('popup-delay-slider', `Cài đặt Time delay slider: ${popupDuration.delaySliderSeconds}s (thời gian yêu cầu ${popupDuration.requestedSeconds}s + 3s thời gian mở popup)`);
+    try {
+      delaySliderResult = await setTimeDelaySlider(page, popupDuration.delaySliderSeconds);
+      if (delaySliderResult.applied !== true) {
+        const error = new Error(`Time delay slider was not verified at ${popupDuration.delaySliderSeconds}s (reported value: ${delaySliderResult.value || 'empty'}). CMS Build was not started.`);
+        error.stage = 'popup-delay-slider-verification';
+        throw error;
+      }
+      progress('popup-delay-slider-applied', `Đã cài Time delay slider = ${delaySliderResult.value}s`, { delaySliderResult });
+    } catch (err) {
+      err.stage ||= 'popup-delay-slider-verification';
+      throw err;
+    }
+  }
   return {
     imageConfigured: true,
     ticketPosterVerified: true,
@@ -2706,16 +2071,18 @@ async function configurePopup(page, imagePath, schedule, timezone, {
     end: verifiedTicketItems[0]?.end || null,
     ticketItems: verifiedTicketItems,
     replacement,
-    migratedCount: legacyPopups.length,
+    migratedCount: entries.filter((entry) => entry.isTicket === false).length,
     ticketMergedWithLegacy: matchingLegacyIndexes.length > 0 || matchingLegacyIndex >= 0,
     deduplicated: false,
     deduplicationMethod: null,
     cmsImageUrl: ticketCmsImageUrls[0] || null,
     cmsImageUrls: ticketCmsImageUrls,
     ticketPosterCount: normalizedTicketEntries.length,
-    popupPosition: positionResult.applied ? popupPosition : null,
+    popupPosition: positionResult.applied ? effectivePosition : null,
     positionMoved: positionResult.moved,
     link: imageLink || null,
+    delaySlider: delaySliderResult,
+    delaySliderSeconds: popupDuration?.delaySliderSeconds || null,
     timezoneControl
   };
 }
@@ -2864,7 +2231,9 @@ async function verifyFinalCmsStatus(page, baseUrl, projectId, fallbackDomain = n
 
 async function buildWebsite(page, baseUrl, { fallbackDomain = null, progress = () => {} } = {}) {
   const projectId = baseUrl.match(/\/projects\/(\d+)/)?.[1] || null;
-  const buildControl = page.getByRole('button', { name: /^Build(?:\.\.\.)?$/i });
+  const buildControl = page.locator('button').filter({ hasText: /^Build(?:\.\.\.|\b)/i })
+    .or(page.getByRole('button', { name: /^Build(?:\.\.\.|\b)/i }))
+    .or(page.locator('button:has-text("Build")'));
   // The editor has the global Build action in its upper-right corner. Use it
   // without leaving the popup editor so the just-uploaded item stays in the
   // current CMS editing state. Older CMS layouts expose it only on Dashboard.
@@ -2879,33 +2248,40 @@ async function buildWebsite(page, baseUrl, { fallbackDomain = null, progress = (
   const initialLogId = initialCmsBuild.logIdLast === null || initialCmsBuild.logIdLast === undefined
     ? null
     : String(initialCmsBuild.logIdLast);
-  await buildButton.click();
-  // NewZen may present a confirmation immediately after Build. Confirming
-  // "Save all" commits the pending editor changes before its build queue
-  // starts. Some CMS versions start the queue directly, so this is optional.
-  const saveAll = await waitForVisibleMatch(
-    page.getByRole('button', { name: /^Save all(?: changes)?$/i }),
-    'CMS Save all confirmation',
-    true,
-    5000
-  ).catch(() => null);
-  if (saveAll) {
+  // Reset any horizontal scroll before triggering Build
+  await page.evaluate(() => {
+    try {
+      window.scrollTo({ left: 0 });
+      if (document.documentElement) document.documentElement.scrollLeft = 0;
+      if (document.body) document.body.scrollLeft = 0;
+    } catch {}
+  }).catch(() => {});
+
+  progress('build-start', 'Đang click nút Build website');
+  await buildButton.click({ force: true });
+
+  // NewZen may present confirmation dialogs after clicking Build:
+  // Step 1: "Save all" or "Save changes" commits pending editor changes.
+  // Step 2: "Confirm build" or "Confirm" queues the build.
+  // We wait up to 5000ms for each dialog step so animations can render.
+  const saveControl = page.getByRole('button', { name: /^Save\s*(?:all)?(?:\s*changes)?$/i })
+    .or(page.locator('button:has-text("Save all"), button:has-text("Save changes")'));
+  const saveBtn = await waitForVisibleMatch(saveControl, null, true, 5000).catch(() => null);
+  if (saveBtn) {
     progress('build-save-all', 'Đang Save all thay đổi trước khi Build');
-    await saveAll.click();
-    // The CMS follows Save all with a final confirmation before queuing the
-    // build. Confirm it when that dialog is present.
-    const confirm = await waitForVisibleMatch(
-      page.getByRole('button', { name: /^Confirm(?: build)?$/i }),
-      'CMS Build confirmation',
-      true,
-      5000
-    ).catch(() => null);
-    if (confirm) {
-      progress('build-confirm', 'Đang xác nhận Build');
-      await confirm.click();
-    }
-    await page.waitForTimeout(500);
+    await saveBtn.click({ force: true }).catch(() => {});
+    await page.waitForTimeout(600);
   }
+
+  const confirmControl = page.getByRole('button', { name: /^Confirm(?:\s*build)?$/i })
+    .or(page.locator('button:has-text("Confirm")'));
+  const confirmBtn = await waitForVisibleMatch(confirmControl, null, true, 5000).catch(() => null);
+  if (confirmBtn) {
+    progress('build-confirm', 'Đang xác nhận Build');
+    await confirmBtn.click({ force: true }).catch(() => {});
+    await page.waitForTimeout(600);
+  }
+
   progress('build-wait', 'CMS đang chạy Build');
   let highest = baseline.percent ?? -1;
   let sawBuildProgress = false;
@@ -2940,7 +2316,7 @@ async function buildWebsite(page, baseUrl, { fallbackDomain = null, progress = (
         if (statusBuild === 2 && (sawCmsProcessing || sawBuildProgress)) {
           throw new BuildWorkflowError('CMS Build thất bại theo trạng thái dự án.');
         }
-        if (statusBuild === 1 && (sawCmsProcessing || (sawNewCmsLog && sawBuildProgress))) {
+        if (statusBuild === 1 && (sawCmsProcessing || sawNewCmsLog || (sawBuildProgress && highest >= 100))) {
           const cmsStatus = await verifyFinalCmsStatus(page, baseUrl, projectId, fallbackDomain, progress);
           progress('cms-status-verified', `Xác nhận trạng thái CMS: ${cmsStatus.summary}`, cmsStatus);
           return {
@@ -3121,44 +2497,50 @@ function resolveTimezoneFromData(data) {
   return mapped ? { address, state, iana: mapped[0], cmsLabel: mapped[1], source: 'data/setting.json' } : { address, state, iana: null, cmsLabel: null, source: null };
 }
 
-async function readProjectDataFile(page, baseUrl, filename) {
+async function discoverProjectTimezone(page, baseUrl) {
+  let fallback = { address: null, iana: null, cmsLabel: null, source: null };
+  const filenames = ['setting.json', 'settings.json', 'footer.json'];
+
   if (!page.url().startsWith(`${baseUrl}/files`)) {
     await page.goto(`${baseUrl}/files`, { waitUntil: 'domcontentloaded', timeout: 45000 });
   }
-  const dataFolder = await waitForVisibleMatch(page.getByText('data', { exact: true }), 'data folder', true, 10000).catch(() => null);
-  if (!dataFolder) return null;
-  await dataFolder.click();
-  const file = await waitForVisibleMatch(page.getByText(filename, { exact: true }), 'project data file', true, 5000).catch(() => null);
-  if (!file) return null;
-  await file.click();
-  await page.locator('.jsoneditor, .ace_editor, pre, code, [class*="editor"]').first().waitFor({ state: 'visible', timeout: 2500 }).catch(() => {});
-  const body = await page.locator('body').innerText();
-  const marker = body.lastIndexOf(filename);
-  const raw = extractJsonObject(marker >= 0 ? body.slice(marker) : body);
-  try { return JSON.parse(repairWrappedJson(raw)); } catch { return null; }
-}
-
-async function discoverProjectTimezone(page, baseUrl) {
-  let fallback = { address: null, iana: null, cmsLabel: null, source: null };
-  for (const filename of ['setting.json', 'settings.json', 'footer.json']) {
-    // A project may omit a data file, or the Files view may briefly fail while
-    // loading it.  Timezone discovery must not make the whole popup job stop:
-    // try the remaining sources and eventually use the agreed US default.
-    let data = null;
-    try {
-      data = await readProjectDataFile(page, baseUrl, filename);
-    } catch {
-      continue;
-    }
-    if (!data) continue;
-    const timezone = { ...resolveTimezoneFromData(data), source: `data/${filename}` };
-    if (timezone.address) fallback = timezone;
-    if (timezone.iana) return timezone;
+  const dataFolder = await waitForVisibleMatch(page.getByText('data', { exact: true }), 'data folder', true, 8000).catch(() => null);
+  if (!dataFolder) {
+    return {
+      address: null,
+      state: null,
+      iana: DEFAULT_US_TIMEZONE.iana,
+      cmsLabel: DEFAULT_US_TIMEZONE.cmsLabel,
+      source: 'default-us-timezone'
+    };
   }
+  await dataFolder.click();
+  await page.waitForTimeout(300);
+
+  for (const filename of filenames) {
+    const file = page.getByText(filename, { exact: true }).first();
+    const isVisible = await file.isVisible().catch(() => false);
+    if (!isVisible) continue;
+
+    await file.click();
+    await page.locator('.jsoneditor, .ace_editor, pre, code, [class*="editor"]').first().waitFor({ state: 'visible', timeout: 2000 }).catch(() => {});
+    const body = await page.locator('body').innerText();
+    const marker = body.lastIndexOf(filename);
+    const raw = extractJsonObject(marker >= 0 ? body.slice(marker) : body);
+    let parsed = null;
+    try { parsed = JSON.parse(repairWrappedJson(raw)); } catch { /* ignore */ }
+
+    if (parsed) {
+      const timezone = { ...resolveTimezoneFromData(parsed), source: `data/${filename}` };
+      if (timezone.address) fallback = timezone;
+      if (timezone.iana) return timezone;
+    }
+
+    await page.goBack({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => {});
+    await page.waitForTimeout(200);
+  }
+
   if (fallback.iana) return fallback;
-  // The workflow is date-based and the user requested that it continue
-  // without a manual timezone confirmation. Use the national default only
-  // after every supported project data file has been checked.
   return {
     address: fallback.address,
     state: fallback.state || null,
@@ -3259,7 +2641,7 @@ async function main() {
       plan.semantic = semanticResolution.audit;
       plan.ticket.attachmentAvailable = Boolean(
         ticketContext.attachmentCandidates.length
-        || await allAttachmentsDownloadButton(ticketContext.root).isVisible().catch(() => false)
+        || (ticketContext.root && await isElementDisplayed(allAttachmentsDownloadButton(ticketContext.root)))
       );
       plan.ticket.attachmentCount = ticketContext.attachmentCandidates.length;
       plan.ticket = resolveRemovalScopeFromAttachments(plan.ticket, ticketContext.attachmentCandidates);
@@ -3357,9 +2739,20 @@ async function main() {
             const textCandidate = candidateMap.get(textSelection);
             const validTextSelection = textSelection && textCandidate && !textCandidate.isRemovalReference ? textSelection : null;
             if (validTextSelection && !visionResolution.selection.indices.includes(validTextSelection)) {
-              const error = new Error(`Gemini text selected attachment #${validTextSelection}, but the verified Vision poster set does not contain it. The poster set was not guessed.`);
-              error.stage = 'attachment-selection';
-              throw error;
+              const rationale = String(visionResolution.audit?.rationale || visionResolution.selection?.rationale || '');
+              const textSelectionWasRejected = new RegExp(String.raw`attachment\s*#?${validTextSelection}\b.*(?:remove|gỡ|xóa|old|screenshot|chụp|không\s*phải)`, 'i').test(rationale)
+                || isPopupRemovalAction(plan.ticket.popupAction)
+                || plan.ticket.popupAction === 'replace'
+                || hasAffirmativePopupRemoval(body);
+
+              if (textSelectionWasRejected && visionResolution.selection.indices.length > 0) {
+                progress('attachment-selection-corrected', `Gemini text chọn ảnh #${validTextSelection} (ảnh cũ/cần gỡ); Gemini Vision đã xác minh poster mới chính xác là #${visionResolution.selection.indices.join(', ')}`);
+                plan.ticket.popupAttachmentIndex = visionResolution.selection.indices[0];
+              } else {
+                const error = new Error(`Gemini text selected attachment #${validTextSelection}, but the verified Vision poster set does not contain it. The poster set was not guessed.`);
+                error.stage = 'attachment-selection';
+                throw error;
+              }
             }
             const multiIntent = hasMultiPosterIntent(body);
             if (!multiIntent && validTextSelection && visionResolution.selection.indices.includes(validTextSelection)) {
@@ -3376,6 +2769,7 @@ async function main() {
             visionPosterSchedules = (visionResolution.selection.posterSchedules || [])
               .filter((schedule) => plan.ticket.popupAttachmentIndexes.includes(schedule.attachmentIndex));
             plan.ticket.popupVisionSchedules = visionPosterSchedules;
+            applyArtworkSchedulePrecedence(plan.ticket, visionPosterSchedules);
             attachmentDecision = attachmentPlanForTicket({
               popupAction: plan.ticket.popupAction,
               attachmentCount: ticketContext.attachmentCandidates.length,
@@ -3436,7 +2830,7 @@ async function main() {
               });
               const preparedVision = await visionCandidatesFromDownloads(visionCandidateDownloads, ticketContext.attachmentCandidates, { page });
               if (preparedVision.candidates.length) {
-                progress('ticket-vision', 'Using Gemini Vision to verify the requested popup poster');
+                progress('ticket-vision', 'Đang dùng Gemini Vision để xác minh poster và đọc ngày hết hạn...');
                 const visionResolution = await resolveTicketVision(body, preparedVision.candidates);
                 plan.vision = {
                   ...visionResolution.audit,
@@ -3445,14 +2839,25 @@ async function main() {
                 if (visionResolution.selection) {
                   const textSelection = plan.ticket.popupAttachmentIndex || null;
                   if (textSelection && textSelection !== visionResolution.selection.index) {
-                    const error = new Error(`Gemini text selected attachment #${textSelection}, while Gemini Vision selected #${visionResolution.selection.index}. The poster was not guessed.`);
-                    error.stage = 'attachment-selection';
-                    throw error;
+                    const rationale = String(visionResolution.audit?.rationale || visionResolution.selection?.rationale || '');
+                    const textSelectionWasRejected = new RegExp(String.raw`attachment\s*#?${textSelection}\b.*(?:remove|gỡ|xóa|old|screenshot|chụp|không\s*phải)`, 'i').test(rationale)
+                      || isPopupRemovalAction(plan.ticket.popupAction)
+                      || plan.ticket.popupAction === 'replace'
+                      || hasAffirmativePopupRemoval(body);
+
+                    if (textSelectionWasRejected) {
+                      progress('attachment-selection-corrected', `Gemini text chọn ảnh #${textSelection} (ảnh cũ/cần gỡ); Gemini Vision đã xác minh poster mới chính xác là #${visionResolution.selection.index}`);
+                    } else {
+                      const error = new Error(`Gemini text selected attachment #${textSelection}, while Gemini Vision selected #${visionResolution.selection.index}. The poster was not guessed.`);
+                      error.stage = 'attachment-selection';
+                      throw error;
+                    }
                   }
                   plan.ticket.popupAttachmentIndex = visionResolution.selection.index;
                   plan.ticket.popupAttachmentSelection = 'gemini-vision';
                   visionPosterSchedules = visionResolution.selection.posterSchedules || [];
                   plan.ticket.popupVisionSchedules = visionPosterSchedules;
+                  applyArtworkSchedulePrecedence(plan.ticket, visionPosterSchedules, visionResolution.selection.index);
                 }
               } else {
                 plan.vision = {
@@ -3506,6 +2911,46 @@ async function main() {
           progress('attachment-downloaded', `Đã tải xong poster: ${downloadedAttachment.filename}`, { bytes: downloadedAttachment.bytes });
           if (!applyChanges) plan.safety = 'Poster was downloaded and validated locally. No CMS write action was attempted.';
           }
+
+          if (downloadedAttachments.length > 0 && (!visionPosterSchedules || visionPosterSchedules.length === 0) && (plan.ticket.popupAction === 'create' || plan.ticket.popupAction === 'replace')) {
+            try {
+              const localCandidates = downloadedAttachments
+                .map((att, i) => visionCandidateFromLocalImage(att, att.candidateIndex || (i + 1), 'Downloaded ticket poster'))
+                .filter(Boolean);
+              if (localCandidates.length > 0) {
+                progress('ticket-vision', 'Đang dùng Gemini Vision để đọc ngày hết hạn từ poster đã tải');
+                if (localCandidates.length === 1) {
+                  const visionResolution = await resolveTicketVision(body, localCandidates);
+                  if (visionResolution.selection?.posterSchedules?.length) {
+                    visionPosterSchedules = visionResolution.selection.posterSchedules;
+                    plan.ticket.popupVisionSchedules = visionPosterSchedules;
+                    applyArtworkSchedulePrecedence(plan.ticket, visionPosterSchedules, localCandidates[0].index);
+                  }
+                  if (visionResolution.audit) {
+                    plan.vision = {
+                      ...visionResolution.audit,
+                      warnings: [...(plan.vision?.warnings || []), ...(visionResolution.audit.warnings || [])]
+                    };
+                  }
+                } else {
+                  const visionResolution = await resolveTicketPopupVisionSet(body, localCandidates);
+                  if (visionResolution.selection?.posterSchedules?.length) {
+                    visionPosterSchedules = visionResolution.selection.posterSchedules;
+                    plan.ticket.popupVisionSchedules = visionPosterSchedules;
+                    applyArtworkSchedulePrecedence(plan.ticket, visionPosterSchedules);
+                  }
+                  if (visionResolution.audit) {
+                    plan.vision = {
+                      ...visionResolution.audit,
+                      warnings: [...(plan.vision?.warnings || []), ...(visionResolution.audit.warnings || [])]
+                    };
+                  }
+                }
+              }
+            } catch {
+              // Non-fatal
+            }
+          }
         }
         progress('cms', 'Đang mở NewZenSite');
         await page.goto(cmsUrl, { waitUntil: 'domcontentloaded', timeout: 45000 });
@@ -3517,9 +2962,16 @@ async function main() {
         await search.click();
         await search.fill('');
         await search.pressSequentially(plan.ticket.siteId, { delay: 60 });
-        await page.waitForTimeout(400);
+        await search.press('Enter').catch(() => {});
+        // Wait for CMS search debounce, network API, and card rendering
+        await page.getByText(plan.ticket.siteId, { exact: true }).first().waitFor({ state: 'visible', timeout: 4000 }).catch(() => {});
+        await page.waitForTimeout(1000);
         progress('project-search', `Đang tìm project ${plan.ticket.siteId}`);
-        const projectCandidates = await projectSearchCandidates(page, plan.ticket.siteId);
+        let projectCandidates = await projectSearchCandidates(page, plan.ticket.siteId);
+        if (!projectCandidates.length) {
+          await page.waitForTimeout(1500);
+          projectCandidates = await projectSearchCandidates(page, plan.ticket.siteId);
+        }
         const projectSelection = chooseProjectCandidate(projectCandidates);
         const selectedDomain = projectSelection.candidate?.domains.find((domain) => !isPreviewProjectDomain(domain))
           || projectSelection.candidate?.domains[0]
@@ -3617,6 +3069,61 @@ async function main() {
               } else {
                 plan.status = 'popup-removal-awaiting-build';
                 plan.nextAction = 'Popup removal was verified. Rerun with --apply --build to publish the removal.';
+              }
+            }
+          } else if (plan.ticket.popupAction === 'update-duration') {
+            plan.status = 'ready-to-update-duration';
+            const dur = plan.ticket.popupDuration;
+            plan.nextAction = `Ticket yêu cầu chỉnh thời gian popup hiển thị ${dur?.requestedSeconds}s (Time delay slider ${dur?.delaySliderSeconds}s). Rerun với --apply --build để cập nhật và build.`;
+            if (applyChanges) {
+              plan.safety = buildRequested
+                ? 'CMS popup duration update and Build/publish were explicitly requested.'
+                : 'CMS popup duration update was explicitly requested. Build/publish was not requested.';
+              progress('section-apply', 'Opening the Page editor and Popup settings');
+              plan.popupSection = await existingPopupSection(page, baseUrl, {
+                expectedPluginVersion: plan.plugin.version
+              });
+              await openPopupSection(page, plan.popupSection.sectionId);
+              await openPopupSettings(page, plan.popupSection.sectionId);
+              progress('popup-delay-slider', `Cài đặt Time delay slider: ${dur.delaySliderSeconds}s (thời gian yêu cầu ${dur.requestedSeconds}s + 3s mở popup)`);
+              const durationResult = await setTimeDelaySlider(page, dur.delaySliderSeconds);
+              if (durationResult.applied !== true) {
+                const error = new Error(`Time delay slider was not verified at ${dur.delaySliderSeconds}s (reported value: ${durationResult.value || 'empty'}). CMS Build was not started.`);
+                error.stage = 'popup-delay-slider-verification';
+                throw error;
+              }
+              plan.popup = {
+                durationConfigured: durationResult.applied !== false,
+                requestedSeconds: dur.requestedSeconds,
+                delaySliderSeconds: dur.delaySliderSeconds,
+                imageConfigured: true,
+                ticketPosterVerified: true
+              };
+              await page.screenshot({ path: path.join(runDir, 'popup-settings.png'), fullPage: false });
+              if (buildRequested) {
+                progress('build-start', 'Starting CMS Build after verified popup duration update');
+                plan.build = await buildWebsite(page, baseUrl, {
+                  fallbackDomain: plan.cms?.selectedDomain || null,
+                  progress
+                });
+                plan.website = plan.build.website;
+                plan.cmsStatus = plan.build.cmsStatus || null;
+                if (plan.build.status === 'success') {
+                  const websiteUrl = plan.website.liveUrl || plan.website.previewUrl || null;
+                  plan.status = 'popup-live';
+                  const statusNote = plan.cmsStatus?.summary ? ` · [${plan.cmsStatus.summary}]` : '';
+                  plan.nextAction = websiteUrl
+                    ? `Popup duration update completed successfully on website: ${websiteUrl}${statusNote}`
+                    : `Popup duration update completed successfully; CMS confirmed: ${plan.cmsStatus?.summary || 'Build COMPLETE'}`;
+                  progress('build-complete', plan.nextAction, { websiteUrl, cmsStatus: plan.cmsStatus });
+                } else {
+                  plan.status = 'build-unconfirmed';
+                  plan.nextAction = 'Popup duration was updated and CMS Build was started, but completion was not observed. Check CMS before declaring it live.';
+                  progress('build-unconfirmed', plan.nextAction, { websiteUrl: plan.website.liveUrl || plan.website.previewUrl || null, cmsStatus: plan.cmsStatus });
+                }
+              } else {
+                plan.status = 'awaiting-build-approval';
+                plan.nextAction = 'Popup duration setting was updated. Rerun with --apply --build to publish.';
               }
             }
           } else {
@@ -3840,19 +3347,21 @@ async function main() {
                 };
               }
             }
+            const shouldReplaceSection = replaceSectionAfterPluginUpdate || Boolean(recoveredMigration);
             progress(
               'section-apply',
-              replaceSectionAfterPluginUpdate
+              shouldReplaceSection
                 ? 'Replacing the old Annoucement Popup section with the current plugin section'
                 : 'Opening the Page editor and adding Annoucement Popup when needed'
             );
             try {
               plan.popupSection = await ensurePopupSection(page, baseUrl, {
-                replaceExisting: replaceSectionAfterPluginUpdate,
+                replaceExisting: shouldReplaceSection,
                 expectedPluginVersion: plan.plugin.version,
                 targetSectionIds: [
                   ...(legacyPopupSnapshot?.sectionIds || []),
-                  ...(sectionVersionInfo?.legacySectionIds || [])
+                  ...(sectionVersionInfo?.legacySectionIds || []),
+                  ...(recoveredMigration ? (sectionVersionInfo?.sections || []).map((s) => s.id).filter(Boolean) : [])
                 ]
               });
             } catch (error) {
@@ -3870,7 +3379,7 @@ async function main() {
               const configuredPopup = await configurePopup(page, downloadedAttachment?.uploadPath || downloadedAttachment?.path || null, popupSchedule, plan.timezone, {
                 replaceExisting: plan.ticket.popupAction === 'replace',
                 sectionId: plan.popupSection.sectionId,
-                legacyPopups: replaceSectionAfterPluginUpdate
+                legacyPopups: (legacyPopupSnapshot?.items?.length > 0)
                   ? legacyPopupSnapshot.items
                   : (recoveredMigration?.items || []),
                 repairOnly: repairExistingPopup,
@@ -3878,8 +3387,9 @@ async function main() {
                 ticketEntries: stagedTicketEntries,
                 popupPosition: plan.ticket.popupPosition || null,
                 duplicateMatches: matchingDuplicatePairs,
-                removalMatches: replaceSectionAfterPluginUpdate ? [] : removalMatches,
-                imageLink: plan.ticket.popupLink || null
+                removalMatches: (replaceSectionAfterPluginUpdate || recoveredMigration || legacyPopupSnapshot?.items?.length > 0) ? [] : removalMatches,
+                imageLink: plan.ticket.popupLink || null,
+                popupDuration: plan.ticket.popupDuration || null
               });
               plan.popup = {
                 imageConfigured: configuredPopup.imageConfigured !== false,
@@ -3903,7 +3413,10 @@ async function main() {
                 deduplicationMethod: configuredPopup.deduplicationMethod || null,
                 cmsImageUrl: configuredPopup.cmsImageUrl || null,
                 cmsImageUrls: configuredPopup.cmsImageUrls || (configuredPopup.cmsImageUrl ? [configuredPopup.cmsImageUrl] : []),
-                link: plan.ticket.popupLink || null
+                link: plan.ticket.popupLink || null,
+                delaySliderSeconds: configuredPopup.delaySliderSeconds || null,
+                requestedSeconds: plan.ticket.popupDuration?.requestedSeconds || null,
+                durationConfigured: configuredPopup.delaySlider ? configuredPopup.delaySlider.applied !== false : null
               };
             } catch (error) {
               error.stage ||= 'popup-settings';
@@ -4013,6 +3526,7 @@ module.exports = {
   resolveRemovalScopeFromAttachments,
   popupScheduleFromTicket,
   popupTicketEntriesFromDownloads,
+  applyArtworkSchedulePrecedence,
   shouldUseTicketVision,
   buildPopupEntries,
   buildPopupEntriesForTickets,
@@ -4022,6 +3536,12 @@ module.exports = {
   resolvePopupItemByImageAndSchedule,
   popupListItemCards,
   popupListItemsPanel,
+  waitForPopupListItemsPanel,
+  popupListItemEditorIsOpen,
+  ensurePopupSection,
+  openPopupSection,
+  openPopupSettings,
+  backToPopupSettings,
   readPopupListItems,
   openPopupListCard,
   collectPopupRemovalCandidates,
@@ -4037,7 +3557,11 @@ module.exports = {
   resolveTimezoneFromData,
   recoverInterruptedLegacyMigration,
   setPopupImageLink,
+  popupImageUploadControl,
+  popupImageUrls,
+  waitForPopupImageUpload,
   readBuildState,
   readCmsBuildStatus,
-  verifyFinalCmsStatus
+  verifyFinalCmsStatus,
+  popupItemsForReport
 };

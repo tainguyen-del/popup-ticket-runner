@@ -132,6 +132,42 @@ test('reports credential status without returning username or password', () => {
   }
 });
 
+test('reports a recoverable state when the stored DPAPI credential cannot be decrypted', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'popup-cms-credentials-'));
+  try {
+    fs.writeFileSync(credentialPath(directory, directory), 'encrypted-for-another-user');
+    const status = cmsCredentialStatus(directory, {
+      dataDirectory: directory,
+      env: {},
+      platform: 'win32',
+      execute: () => { throw new Error('DPAPI unavailable for this user'); }
+    });
+    assert.equal(status.configured, false);
+    assert.equal(status.source, null);
+    assert.equal(status.identifier, null);
+    assert.equal(status.hasPassword, false);
+    assert.equal(status.needsReconfigure, true);
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
+test('falls back to complete environment credentials when stored DPAPI credentials cannot be decrypted', () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'popup-cms-credentials-'));
+  try {
+    fs.writeFileSync(credentialPath(directory, directory), 'encrypted-for-another-user');
+    const credentials = getCmsCredentials(directory, {
+      dataDirectory: directory,
+      env: { CMS_EMAIL: 'operator@example.com', CMS_PASSWORD: 'environment-secret' },
+      platform: 'win32',
+      execute: () => { throw new Error('DPAPI unavailable for this user'); }
+    });
+    assert.deepEqual(credentials, { email: 'operator@example.com', password: 'environment-secret' });
+  } finally {
+    fs.rmSync(directory, { recursive: true, force: true });
+  }
+});
+
 test('removes only the app-owned CMS credential file', () => {
   const directory = fs.mkdtempSync(path.join(os.tmpdir(), 'popup-cms-credentials-'));
   const filePath = credentialPath(directory, directory);
