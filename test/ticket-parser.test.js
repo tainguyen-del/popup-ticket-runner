@@ -333,7 +333,7 @@ test('does not invent a start date when moving a matching legacy popup', () => {
   assert.equal(entries[0].schedule.end.date, '2026-11-30');
 });
 
-test('adds a second block only after the first popup entry', () => {
+test('places new ticket popup at the first entry when migrating to a new section', () => {
   const { entries } = buildPopupEntries(
     'C:/tmp/ticket.png',
     { start: null, end: null },
@@ -343,9 +343,23 @@ test('adds a second block only after the first popup entry', () => {
     ]
   );
   assert.equal(entries.length, 3);
-  assert.equal(entries[0].isTicket, false);
+  assert.equal(entries[0].isTicket, true);
   assert.equal(entries[1].isTicket, false);
-  assert.equal(entries[2].isTicket, true);
+  assert.equal(entries[2].isTicket, false);
+
+  const { entries: entriesLast } = buildPopupEntries(
+    'C:/tmp/ticket.png',
+    { start: null, end: null },
+    [
+      { imagePath: 'C:/tmp/legacy-1.webp', sourceImageUrl: 'https://cdn.example/legacy-1.webp', start: null, end: null },
+      { imagePath: 'C:/tmp/legacy-2.webp', sourceImageUrl: 'https://cdn.example/legacy-2.webp', start: null, end: null }
+    ],
+    { popupPosition: 'last' }
+  );
+  assert.equal(entriesLast.length, 3);
+  assert.equal(entriesLast[0].isTicket, false);
+  assert.equal(entriesLast[1].isTicket, false);
+  assert.equal(entriesLast[2].isTicket, true);
 });
 
 test('preserves the start date of an unmatched active legacy popup when migrating to a new section', () => {
@@ -361,12 +375,12 @@ test('preserves the start date of an unmatched active legacy popup when migratin
   );
   assert.equal(matchingLegacyIndex, -1);
   assert.equal(entries.length, 2);
-  assert.equal(entries[0].isTicket, false);
-  assert.equal(entries[0].schedule.start?.date, '2026-11-22');
-  assert.equal(entries[0].schedule.end?.date, '2026-11-26');
-  assert.equal(entries[1].isTicket, true);
-  assert.equal(entries[1].schedule.start, null);
-  assert.equal(entries[1].schedule.end?.date, '2027-02-01');
+  assert.equal(entries[0].isTicket, true);
+  assert.equal(entries[0].schedule.start, null);
+  assert.equal(entries[0].schedule.end?.date, '2027-02-01');
+  assert.equal(entries[1].isTicket, false);
+  assert.equal(entries[1].schedule.start?.date, '2026-11-22');
+  assert.equal(entries[1].schedule.end?.date, '2026-11-26');
 });
 
 test('replaces matching legacy block in-place when duplicateMatches is provided', () => {

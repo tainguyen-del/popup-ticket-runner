@@ -1798,9 +1798,9 @@ function buildPopupEntriesForTickets(ticketEntries, legacyPopups = [], duplicate
   };
 }
 
-function buildPopupEntries(imagePath, schedule, legacyPopups, { ticketFilename = null, replaceExisting = false } = {}) {
+function buildPopupEntries(imagePath, schedule, legacyPopups, { ticketFilename = null, replaceExisting = false, popupPosition = 'first' } = {}) {
   const tickets = normalizeTicketPopupEntries(null, imagePath, schedule, ticketFilename);
-  return buildPopupEntriesForTickets(tickets, legacyPopups, [], { replaceExisting });
+  return buildPopupEntriesForTickets(tickets, legacyPopups, [], { replaceExisting, popupPosition });
 }
 
 module.exports = {
