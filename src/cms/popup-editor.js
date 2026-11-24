@@ -876,7 +876,7 @@ async function openPopupListCard(page, targetIndex, description, { timeout = 100
   throw new Error(`${description} at popup item ${targetIndex + 1} was not available as a stable popup card${suffix}`);
 }
 
-async function readPopupListItems(page) {
+async function readPopupListItems(page, expectedCount = null) {
   let candidateCheckboxes = null;
 
   // Strategy 1: Find inside active Announcement Popup drawer
@@ -922,12 +922,12 @@ async function readPopupListItems(page) {
   const count = await checkboxes.count().catch(() => 0);
   if (!count) return { chooseAll: null, items: [] };
 
-  // Vue can retain several check-all inputs in one slideover: a current list
-  // plus stale transition snapshots such as `[]`. Picking `.last()` therefore
-  // occasionally made a populated list look empty and caused another Add block.
-  // Parse every scoped snapshot and use the most complete valid one. On equal
-  // length, prefer the last snapshot because it is the newest Vue render.
+  // Vue can retain several check-all inputs in one slideover during transitions.
+  // Parse scoped snapshots and select the newest valid render.
+  // If an expectedCount is requested (e.g. after a deletion or addition), immediately prefer it.
+  // Otherwise, among non-empty snapshots, prefer the latest one in DOM order.
   let selected = null;
+  let fallbackEmpty = null;
   for (let index = 0; index < count; index += 1) {
     const checkbox = checkboxes.nth(index);
     const name = await checkbox.getAttribute('name').catch(() => null);
@@ -938,13 +938,20 @@ async function readPopupListItems(page) {
     try {
       const items = JSON.parse(serialized || '[]');
       if (!Array.isArray(items)) continue;
-      if (!selected || items.length >= selected.items.length) {
+      if (expectedCount !== null && items.length === expectedCount) {
         selected = { chooseAll: checkbox, items };
+        break;
+      }
+      if (items.length > 0) {
+        selected = { chooseAll: checkbox, items };
+      } else if (!fallbackEmpty) {
+        fallbackEmpty = { chooseAll: checkbox, items };
       }
     } catch {
       // Ignore a stale/partially rendered serialized value and inspect others.
     }
   }
+  if (!selected && fallbackEmpty) selected = fallbackEmpty;
   if (selected) return selected;
   {
     const error = new Error('CMS popup item list could not be read safely. No popup was removed.');
@@ -957,7 +964,7 @@ async function waitForPopupListItemCount(page, expected, timeout = 5000) {
   const deadline = Date.now() + timeout;
   let lastItems = [];
   while (Date.now() < deadline) {
-    const { items } = await readPopupListItems(page);
+    const { items } = await readPopupListItems(page, expected);
     lastItems = items;
     if (items.length === expected) return items;
     await page.waitForTimeout(150);
@@ -1567,17 +1574,14 @@ async function waitForPersistedPopupItem(page, target, schedule, timezone, timeo
   throw error;
 }
 
-async function deletePopupItemAtIndex(page, targetIndex, expectedRemaining, description = 'Popup item') {
+async function deletePopupItemAtIndex(page, targetIndex, expectedRemaining, description = 'Popup item', targetImageUrl = null) {
   await ensureDesktopViewport(page);
-  const { items } = await readPopupListItems(page);
-  if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= items.length) {
-    throw new Error(`${description} was not found in the CMS list.`);
-  }
-  const targetItem = items[targetIndex];
-  const cards = await popupListItemCards(page, items.length);
+  const targetImage = targetImageUrl ? stableImageUrl(targetImageUrl) : null;
+  const cards = await popupListItemCards(page).catch(() => []);
   let card = null;
-  const targetImage = stableImageUrl(targetItem?.image || '');
-  if (targetImage) {
+
+  // 1. First, try to find the exact card by targetImage in the live DOM
+  if (targetImage && cards.length > 0) {
     for (const candidate of cards) {
       const sources = await candidate.locator('img').evaluateAll((images) => images.map((image) => image.src || image.getAttribute('src') || '')).catch(() => []);
       if (sources.some((source) => stableImageUrl(source) === targetImage)) {
@@ -1585,19 +1589,69 @@ async function deletePopupItemAtIndex(page, targetIndex, expectedRemaining, desc
         break;
       }
     }
-  } else if (isEmptyPopupItem(targetItem)) {
-    for (const candidate of cards) {
-      const text = await candidate.innerText().catch(() => '');
-      const sources = await candidate.locator('img').evaluateAll((images) => images.map((image) => image.src || image.getAttribute('src') || '')).catch(() => []);
-      const hasPoster = sources.some((source) => /(?:newzensite|gocheckin|\/media\/)/i.test(source));
-      if (/Not configured/i.test(text) && !hasPoster) {
-        card = candidate;
-        break;
+  }
+
+  // 2. If not found by targetImage, read items and resolve by targetIndex or empty card
+  if (!card) {
+    const { items } = await readPopupListItems(page, expectedRemaining + 1).catch(() => ({ items: [] }));
+    let resolvedIndex = targetIndex;
+    if ((!Number.isInteger(resolvedIndex) || resolvedIndex < 0 || resolvedIndex >= items.length) && targetImage) {
+      const found = items.findIndex((item) => stableImageUrl(item?.image) === targetImage);
+      if (found >= 0) resolvedIndex = found;
+    }
+    if (Number.isInteger(resolvedIndex) && resolvedIndex >= 0 && resolvedIndex < cards.length) {
+      card = cards[resolvedIndex];
+    } else if (Number.isInteger(resolvedIndex) && resolvedIndex >= 0 && resolvedIndex < items.length) {
+      const targetItem = items[resolvedIndex];
+      const fallbackImage = stableImageUrl(targetItem?.image || '');
+      if (fallbackImage) {
+        for (const candidate of cards) {
+          const sources = await candidate.locator('img').evaluateAll((images) => images.map((image) => image.src || image.getAttribute('src') || '')).catch(() => []);
+          if (sources.some((source) => stableImageUrl(source) === fallbackImage)) {
+            card = candidate;
+            break;
+          }
+        }
+      } else if (isEmptyPopupItem(targetItem)) {
+        for (const candidate of cards) {
+          const text = await candidate.innerText().catch(() => '');
+          const sources = await candidate.locator('img').evaluateAll((images) => images.map((image) => image.src || image.getAttribute('src') || '')).catch(() => []);
+          const hasPoster = sources.some((source) => /(?:newzensite|gocheckin|\/media\/)/i.test(source));
+          if (/Not configured/i.test(text) && !hasPoster) {
+            card = candidate;
+            break;
+          }
+        }
       }
     }
   }
+
+  // 3. Fallback retry: If card was not found, check if Popup_setting accordion needs re-expanding
   if (!card) {
-    throw new Error(`${description} was not matched to its exact popup card. No item was deleted.`);
+    try {
+      const popupSetting = await visibleMatch(page.getByText(/Popup[\s_]setting/i), null, true).catch(() => null);
+      if (popupSetting) {
+        await popupSetting.click({ force: true }).catch(() => {});
+        await page.waitForTimeout(400);
+        const retryCards = await popupListItemCards(page).catch(() => []);
+        if (targetImage && retryCards.length > 0) {
+          for (const candidate of retryCards) {
+            const sources = await candidate.locator('img').evaluateAll((images) => images.map((image) => image.src || image.getAttribute('src') || '')).catch(() => []);
+            if (sources.some((source) => stableImageUrl(source) === targetImage)) {
+              card = candidate;
+              break;
+            }
+          }
+        }
+        if (!card && Number.isInteger(targetIndex) && targetIndex >= 0 && targetIndex < retryCards.length) {
+          card = retryCards[targetIndex];
+        }
+      }
+    } catch {}
+  }
+
+  if (!card) {
+    throw new Error(`${description} was not found in the CMS list.`);
   }
   await card.evaluate((el) => {
     try {
@@ -1635,8 +1689,14 @@ async function deletePopupItemAtIndex(page, targetIndex, expectedRemaining, desc
     1500
   ).catch(() => null);
   if (confirm) await confirm.click({ force: true }).catch(() => {});
-  await page.keyboard.press('Escape').catch(() => {});
+  // Only press Escape if a modal overlay is still open; never press Escape unconditionally
+  // as it closes the slideover drawer / settings panel in NewZen CMS.
+  const modalStillOpen = await page.locator('.el-overlay:visible, .ant-modal-root:visible, [role="dialog"]:visible').count().catch(() => 0);
+  if (modalStillOpen > 0) {
+    await page.keyboard.press('Escape').catch(() => {});
+  }
   await waitForPopupListItemCount(page, expectedRemaining);
+  await page.waitForTimeout(300);
 }
 
 async function deleteOneEmptyPopupItem(page, expectedRemaining) {
@@ -1683,27 +1743,41 @@ async function repairExistingPopupSettings(page, schedule, timezone) {
 }
 
 function normalizeTicketPopupEntries(ticketEntries, imagePath, schedule, ticketFilename = null) {
-  const supplied = Array.isArray(ticketEntries) && ticketEntries.length
-    ? ticketEntries
-    : [{ imagePath, schedule, filename: ticketFilename }];
-  const usedIndexes = new Set();
-  return supplied.map((entry, index) => {
-    const ticketIndex = Number.isInteger(entry?.ticketIndex) ? entry.ticketIndex : index;
-    const entryImagePath = entry?.imagePath || null;
-    if (!entryImagePath) throw new Error(`Ticket popup poster ${index + 1} has no local image path.`);
-    if (usedIndexes.has(ticketIndex)) throw new Error(`Ticket popup poster index ${ticketIndex + 1} is duplicated.`);
-    usedIndexes.add(ticketIndex);
-    return {
-      ticketIndex,
-      candidateIndex: Number.isInteger(entry?.candidateIndex) ? entry.candidateIndex : null,
-      imagePath: entryImagePath,
-      filename: entry?.filename || ticketFilename || path.basename(entryImagePath),
+  if (Array.isArray(ticketEntries) && ticketEntries.length > 0) {
+    const usedIndexes = new Set();
+    return ticketEntries.map((entry, index) => {
+      const ticketIndex = Number.isInteger(entry?.ticketIndex) ? entry.ticketIndex : index;
+      const entryImagePath = entry?.imagePath || null;
+      if (!entryImagePath) throw new Error(`Ticket popup poster ${index + 1} has no local image path.`);
+      if (usedIndexes.has(ticketIndex)) throw new Error(`Ticket popup poster index ${ticketIndex + 1} is duplicated.`);
+      usedIndexes.add(ticketIndex);
+      return {
+        ticketIndex,
+        candidateIndex: Number.isInteger(entry?.candidateIndex) ? entry.candidateIndex : null,
+        imagePath: entryImagePath,
+        filename: entry?.filename || ticketFilename || path.basename(entryImagePath),
+        schedule: {
+          start: entry?.schedule?.start?.date ? { date: entry.schedule.start.date } : null,
+          end: entry?.schedule?.end?.date ? { date: entry.schedule.end.date } : null
+        }
+      };
+    });
+  }
+
+  if (imagePath) {
+    return [{
+      ticketIndex: 0,
+      candidateIndex: null,
+      imagePath,
+      filename: ticketFilename || path.basename(imagePath),
       schedule: {
-        start: entry?.schedule?.start?.date ? { date: entry.schedule.start.date } : null,
-        end: entry?.schedule?.end?.date ? { date: entry.schedule.end.date } : null
+        start: schedule?.start?.date ? { date: schedule.start.date } : null,
+        end: schedule?.end?.date ? { date: schedule.end.date } : null
       }
-    };
-  });
+    }];
+  }
+
+  return [];
 }
 
 function buildPopupEntriesForTickets(ticketEntries, legacyPopups = [], duplicateMatches = [], { replaceExisting = false, popupPosition = 'first', replacementMatches = [] } = {}) {

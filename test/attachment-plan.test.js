@@ -17,6 +17,15 @@ test('uses no attachment for actions that do not need a ticket image', () => {
   );
 });
 
+test('supports removal-topic when remove-one ticket has 0 image attachments', () => {
+  const plan = attachmentPlanForTicket({ popupAction: 'remove-one', attachmentCount: 0 });
+  assert.equal(plan.mode, 'removal-topic');
+  assert.equal(plan.required, false);
+  assert.equal(plan.ready, true);
+  assert.equal(plan.attachmentCount, 0);
+  assert.equal(plan.selectedIndex, null);
+});
+
 test('reports a missing required poster without guessing', () => {
   const plan = attachmentPlanForTicket({ popupAction: 'create', attachmentCount: 0 });
   assert.equal(plan.mode, 'none');

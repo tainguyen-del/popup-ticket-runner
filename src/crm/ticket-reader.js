@@ -386,12 +386,19 @@ async function readFullTicketContext(page, ticketUrl) {
   await revealTicketAttachmentArea(page, root);
   let items = await visibleTicketImageCandidates(root);
   let previousCount = items.length;
+  let stablePolls = 0;
   // In background tabs or throttled windows, comments and attachments take time to render
-  for (let poll = 0; poll < 12; poll += 1) {
+  for (let poll = 0; poll < 15; poll += 1) {
     await page.waitForTimeout(300);
     items = await visibleTicketImageCandidates(root);
     if (items.length > 0 && items.length === previousCount) {
-      break;
+      stablePolls += 1;
+      // Require at least 4 stable polls (~1200ms) AND at least poll >= 4 (~1500ms total) before breaking
+      if (stablePolls >= 4 && poll >= 4) {
+        break;
+      }
+    } else {
+      stablePolls = 0;
     }
     previousCount = items.length;
   }

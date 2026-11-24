@@ -56,6 +56,18 @@ function attachmentPlanForTicket({
     };
   }
 
+  if (action === 'remove-one' && count === 0) {
+    return {
+      mode: 'removal-topic',
+      required: false,
+      ready: true,
+      attachmentCount: 0,
+      selectedIndex: null,
+      selectedIndexes: [],
+      reason: 'removal-topic-no-attachment'
+    };
+  }
+
   if (count === 0) {
     return {
       mode: 'none',

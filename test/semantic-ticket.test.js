@@ -781,3 +781,113 @@ test('multiVisionPrompt and visionPrompt include dual-action rule for gỡ [A] x
   assert.match(semPrompt, /gỡ \[A\] xuống và pop up \[B\]/i);
   assert.match(semPrompt, /VERB meaning to create\/publish popup B/i);
 });
+
+test('Gemini correctly resolves ticket 1605715 topic removal without attachments', () => {
+  const ticketText = 'ID#4006 - Website Support\nNhờ team gỡ giúp em poster thông báo nghĩ lễ đang có trên cms và build web giúp em với ạ';
+  const { ticket, audit } = mergeSemanticTicket({ ...baseTicket, siteId: '4006' }, {
+    siteId: '4006',
+    popupRequested: true,
+    operation: 'remove',
+    actionSummary: 'Gỡ poster thông báo nghỉ lễ đang có trên CMS và Build web',
+    removalTopic: 'thông báo nghĩ lễ',
+    requiresAttachment: false,
+    popupPosition: null,
+    startDate: null,
+    endDate: null,
+    popupAttachmentIndex: null,
+    popupLink: null,
+    confidence: 0.98,
+    evidence: {
+      siteId: 'ID#4006',
+      operation: 'gỡ giúp em poster thông báo nghĩ lễ đang có trên cms',
+      popupPosition: null,
+      startDate: null,
+      endDate: null,
+      popupAttachmentIndex: null
+    },
+    warnings: []
+  }, ticketText, undefined, []);
+
+  assert.equal(ticket.siteId, '4006');
+  assert.equal(ticket.popupAction, 'remove-one');
+  assert.equal(ticket.removalScope, 'ticket-topic-remove-one');
+  assert.equal(ticket.requiresAttachment, false);
+  assert.equal(ticket.removalTopic, 'thông báo nghĩ lễ');
+  assert.equal(ticket.actionSummary, 'Gỡ poster thông báo nghỉ lễ đang có trên CMS và Build web');
+  assert.ok(audit.appliedFields.includes('popupAction'));
+});
+
+test('Gemini sets remove-all when ticket explicitly asks to remove all popups', () => {
+  const ticketText = 'ID#9999 - Website Support\nNhờ team xóa toàn bộ popup đang chạy trên cms';
+  const { ticket, audit } = mergeSemanticTicket({ ...baseTicket, siteId: '9999' }, {
+    siteId: '9999',
+    popupRequested: true,
+    operation: 'remove-all',
+    actionSummary: 'Xóa toàn bộ popup trên CMS',
+    removalTopic: 'toàn bộ popup',
+    requiresAttachment: false,
+    popupPosition: null,
+    startDate: null,
+    endDate: null,
+    popupAttachmentIndex: null,
+    popupLink: null,
+    confidence: 0.99,
+    evidence: {
+      siteId: 'ID#9999',
+      operation: 'xóa toàn bộ popup đang chạy trên cms',
+      popupPosition: null,
+      startDate: null,
+      endDate: null,
+      popupAttachmentIndex: null
+    },
+    warnings: []
+  }, ticketText, undefined, []);
+
+  assert.equal(ticket.siteId, '9999');
+  assert.equal(ticket.popupAction, 'remove-all');
+  assert.equal(ticket.hasInlineRemovalRequest, true);
+  assert.ok(audit.appliedFields.includes('popupAction'));
+});
+
+test('Gemini Vision removal selects multiple candidate indices for multiple holiday announcements', async () => {
+  const candidates = [
+    { index: 1, filename: 'cms-holiday-1.webp', mimeType: 'image/webp', base64: 'aG9saWRheTE=' },
+    { index: 2, filename: 'cms-discount.webp', mimeType: 'image/webp', base64: 'ZGlzY291bnQ=' },
+    { index: 3, filename: 'cms-service.webp', mimeType: 'image/webp', base64: 'c2VydmljZQ==' },
+    { index: 4, filename: 'cms-holiday-2.webp', mimeType: 'image/webp', base64: 'aG9saWRheTI=' }
+  ];
+  const result = await resolveTicketPopupRemovalVision('Xóa giúp poster pop up thông báo nghỉ trên website', null, candidates, {
+    apiKey: 'test-key-not-a-real-secret',
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        candidates: [{ content: { parts: [{ text: JSON.stringify({
+          outcome: 'matched',
+          popupCandidateIndex: 1,
+          popupCandidateIndices: [1, 4],
+          confidence: 0.96,
+          rationale: 'Cả ảnh #1 và #4 đều là thông báo nghỉ lễ Thanksgiving nên cần được gỡ.',
+          warnings: []
+        }) }] } }]
+      })
+    })
+  });
+
+  assert.equal(result.selection.index, 1);
+  assert.deepEqual(result.selection.indices, [1, 4]);
+  assert.equal(result.audit.status, 'selected');
+});
+
+test('visionPrompt and semanticPrompt include explicit rules for comment replacement poster precedence', () => {
+  const prompt = visionPrompt('Ticket text', [{ index: 1, filename: 'p1.png' }, { index: 2, filename: 'p2.png' }]);
+  assert.match(prompt, /Nhờ team thay bằng poster này giúp|thay bằng poster này/i);
+  assert.match(prompt, /REPLACES/);
+
+  const multiPrompt = multiVisionPrompt('Ticket text', [{ index: 1, filename: 'p1.png' }, { index: 2, filename: 'p2.png' }]);
+  assert.match(multiPrompt, /Nhờ team thay bằng poster này giúp|thay bằng poster này/i);
+
+  const semPrompt = semanticPrompt('Ticket text', [{ index: 1, filename: 'p1.png' }, { index: 2, filename: 'p2.png' }]);
+  assert.match(semPrompt, /Nhờ team thay bằng poster này giúp|thay bằng poster này/i);
+});
+

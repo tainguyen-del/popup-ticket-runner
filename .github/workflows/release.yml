@@ -46,6 +46,26 @@ jobs:
           body: |
             ## Popup Ticket Runner v${{ steps.pkg.outputs.version }}
             - Commit: `${{ github.sha }}`
+            - **Gỡ popup thông minh theo chủ đề & Tự động nâng cấp plugin lên 1.0.38 khi gỡ popup:**
+              - Hỗ trợ ticket yêu cầu gỡ popup chỉ bằng ngữ cảnh văn bản (không cần ảnh đính kèm, VD: *"xóa giúp poster thông báo nghỉ lễ trên website"*): Gemini tự nhận diện hành động (`remove-one` / `remove-all`), chủ đề cần gỡ (`removalTopic`) và trả về kế hoạch thực hiện (`actionSummary`).
+              - Hỗ trợ nhận diện và gỡ **cùng lúc nhiều popup** khớp yêu cầu từ Gemini Vision (VD: tiệm có 2 poster thông báo nghỉ lễ giống hoặc cùng chủ đề).
+              - **Tự động nâng cấp plugin & dọn dẹp section cũ khi gỡ popup:** Khi website còn dùng Announcement bản cũ (`1.0.34`, outdated) hoặc còn thẻ rác `N/A N/A`, tool tự động quét timezone, snapshot toàn bộ popup hiện có, loại bỏ các popup cần gỡ, nâng cấp Announcement plugin lên bản mới nhất (`1.0.38`), xóa sạch section cũ và thẻ `N/A`, tạo mới section `ANNOUNCEMENT 1038 (*)`, đưa các popup còn hạn được giữ lại sang section mới rồi tiến hành Build web.
+              - Tối ưu xóa trực tiếp trên bản `1.0.38`: sắp xếp xóa theo thứ tự từ dưới lên (descending index) để tránh lệch vị trí, khớp trực tiếp theo URL ảnh trong DOM, chỉ đọc snapshot Vue mới nhất (`readPopupListItems`) và giữ drawer mở xuyên suốt để tránh giật/lỗi DOM.
+            - **Nâng cấp đọc hiểu ngữ nghĩa Gemini & Ưu tiên comment cập nhật mới nhất:**
+              - Tăng cường cơ chế chờ AJAX comment CRM ổn định (`readFullTicketContext`), không bỏ sót comment hoặc ảnh gửi bổ sung sau cùng.
+              - Khi có comment bổ sung kiểu *"Nhờ team thay bằng poster này giúp"* / *"lấy poster này"*, Gemini và Vision tự động ưu tiên poster mới trong comment thay thế poster cũ ở note ban đầu.
+              - Phân biệt chính xác **ngày nghỉ lễ của tiệm** vs **ngày bắt đầu hẹn giờ đăng popup (`startDate`)**: không gán nhầm `startDate` khi note chỉ ghi lịch nghỉ (VD: *"tiệm nghỉ từ 24/11 đến 26/11"*), đồng thời vẫn trích xuất chuẩn `expiryDate`.
+              - Cho phép migrate các popup bảo lưu sang section mới ngay cả khi ticket không upload ảnh mới (`normalizeTicketPopupEntries`).
+            - **Ổn định giao diện NewZen CMS Page Editor & Popup Drawer:**
+              - Loại bỏ thẻ lỗi `N/A N/A` khi tìm Announcement section hợp lệ, tránh vô hiệu hóa cơ chế fallback tìm section theo ID.
+              - Sửa lỗi `returnToPageEditor` bị đánh lừa bởi breadcrumb `Content blocks` và giới hạn phạm vi nút `Back` trong drawer.
+              - Loại bỏ thao tác spam click gây đóng/mở drawer liên tục trong `openPopupSection`, nhận diện trạng thái drawer mở trực tiếp từ DOM bất kể vị trí cuộn.
+            - **Khắc phục triệt để lỗi chọn sai múi giờ (New York UTC-05:00):**
+              - Tự động nhận diện chính xác múi giờ từ `setting.json`, `footer.json` trong CMS `/files` hoặc từ HTML website live / preview.
+              - Hỗ trợ toàn diện các định dạng dấu câu trong địa chỉ: `CA 95605`, `CA, 95605`, `CA - 95605`, `California, 95605`.
+              - Tích hợp bảng tra cứu dải ZIP Code Hoa Kỳ 5 chữ số và Canada Postal Code: đầu số `95605` tự động phân giải thành **California (CA) -> Los Angeles (UTC-08:00)** kể cả khi không có chữ CA đứng trước.
+              - Quét đệ quy các trường JSON có cấu trúc (`city`, `state`, `zip`, `postal_code`) và trích xuất trọn vẹn từ Ace Editor NewZen, không bị cắt dòng do ảo hóa giao diện.
+              - Bổ sung cơ chế dự phòng đa tầng (Multi-tier fallback): CMS Files -> Live Website HTML/Schema -> Ticket Notes -> Default Timezone.
             - **Tự động đưa popup mới của ticket lên vị trí đầu tiên (Card 1):**
               - Mặc định mọi popup mới từ ticket đều được đưa lên vị trí đầu tiên (Card 1 / Top Priority) trong Popup settings.
               - Khi nâng cấp plugin / chuyển block (migration), tất cả các popup cũ còn hạn được giữ lại sẽ xếp nối tiếp phía sau (Card 2, 3, 4...) và bảo lưu 100% thứ tự tương đối ban đầu.
@@ -53,15 +73,11 @@ jobs:
             - **Tự động đọc ảnh poster bằng Gemini Vision để tìm ngày hết hạn (Promotion Period / Expiration Date):**
               - Gemini Vision luôn tự động quét ảnh poster để đọc ngày khuyến mãi / ngày kết thúc (kể cả định dạng độc lập không kèm năm như `Dec 31`, `November 22 – December 31`).
               - Chuẩn hóa thứ tự ưu tiên (Precedence): Nếu note ticket có ghi ngày -> ưu tiên dùng ngày note ticket; Nếu note ticket không ghi ngày -> tự động kế thừa ngày từ ảnh poster popup.
-            - **Tối ưu hóa và ổn định kết nối Gemini Vision:**
+            - **Tối ưu hóa và ổn định kết nối Gemini Vision & Giao diện UI:**
               - Chuyển sang model mặc định `gemini-flash-lite-latest` siêu nhanh (1.8s text, 4.5s vision) với hạn mức lớn, không bị chạm ngưỡng 20 lượt/ngày.
-              - Tự động xoay vòng model dự phòng (Auto-fallback) giữa `gemini-flash-lite-latest`, `gemini-3.1-flash-lite`, `gemini-3.5-flash` khi Google gặp lỗi quá tải (503) hoặc chạm hạn mức (429).
+              - Chuẩn hóa danh sách model dự phòng hợp lệ (`gemini-flash-lite-latest`, `gemini-2.0-flash-lite`, `gemini-2.0-flash`, `gemini-1.5-flash`) khi Google gặp lỗi quá tải (503) hoặc chạm hạn mức (429), đồng thời hiển thị chi tiết lỗi API nếu gặp sự cố.
+              - Hiển thị trực quan **Kế hoạch thực hiện (`actionSummary`)**, **Timezone đã cập nhật** và **Lý do gỡ popup** trên giao diện kết quả UI.
               - Tích hợp sẵn API key nội bộ hoạt động out-of-the-box cho mọi máy, không bắt buộc người dùng phải tự cấu hình key cá nhân.
-            - **Sửa lỗi Time delay slider:**
-              - Đảm bảo điền chính xác giá trị thời gian chờ slider (mặc định 5s hoặc theo ticket yêu cầu).
-            - **Cải tiến độ trễ tải ảnh CRM:**
-              - Tăng thời gian chờ CRM render upload card để không bị rớt ảnh đính kèm khi mạng chậm.
-              - Tự động quét Vision ngay trên file ảnh đã tải về máy qua cơ chế fallback.
             - **Tải file executable:** Tải file **`Popup Ticket Runner Final.exe`** ở mục Assets bên dưới để sử dụng trực tiếp không cần cài đặt.
           files: dist/Popup Ticket Runner Final.exe
           draft: false

@@ -51,6 +51,8 @@ const stages = [
   ['crm', 'Đọc ticket CRM'],
   ['crm-loaded', 'Phân tích nội dung ticket'],
   ['ticket-semantics', 'Gemini đang đọc ngữ nghĩa ticket'],
+  ['ticket-plan', 'Kế hoạch xử lý từ Gemini'],
+  ['popup-removal-topic', 'Nhận diện chủ đề popup cần gỡ'],
   ['attachment-comment-scan', 'Quét ảnh trong ticket và comment'],
   ['attachment-vision-download', 'Tải ảnh cục bộ để Gemini Vision kiểm tra'],
   ['ticket-vision', 'Gemini Vision đang xác minh poster'],
@@ -631,7 +633,12 @@ function renderResult(result) {
   if (result.legacyRecovery?.resumed) {
     field('Khôi phục migration', `Đã dùng lại ${result.legacyRecovery.preservedCount || 1} popup đã sao lưu; không xóa/tạo section lần nữa`);
   }
-  if (result.timezone) field('Popup timezone', result.timezone.iana || 'Không suy ra được');
+  if (result.ticket?.actionSummary) {
+    field('Kế hoạch thực hiện', result.ticket.actionSummary);
+  }
+  if (result.timezone && !result.popup) {
+    field('Popup timezone', result.timezone.cmsLabel || result.timezone.iana || 'Không suy ra được');
+  }
   if (result.popup) {
     const configuredCount = result.popup.ticketPosterCount || result.popup.cmsImageUrls?.length || (result.popup.imageConfigured ? 1 : 0);
     field('Poster đã cấu hình', result.popup.imageConfigured ? `Đã upload và lưu ${configuredCount} poster` : 'Chưa cấu hình');
@@ -643,7 +650,12 @@ function renderResult(result) {
     if (result.popup.ticketMergedWithLegacy) field('Ticket hiện tại', 'Ảnh trùng popup cũ; đã cập nhật thời hạn trên popup đã chuyển, không tạo bản sao');
     if (result.popup.start) field('Popup bắt đầu', result.popup.start);
     if (result.popup.expiry) field('Popup tắt', result.popup.expiry);
-    if (result.popup.timezone) field('Timezone đã lưu', result.popup.timezone);
+    const tzDisplay = result.popup.cmsLabel || result.timezone?.cmsLabel || result.popup.timezone;
+    if (tzDisplay) {
+      const isUpdated = result.popup.timezoneControl?.applied;
+      const tzField = isUpdated ? 'Timezone đã cập nhật' : 'Timezone';
+      field(tzField, tzDisplay);
+    }
     if (result.popup.timezoneControl && !result.popup.timezoneControl.supported) {
       field('Timezone trong plugin', 'Plugin phiên bản mới không có selector; tool dùng timezone từ địa chỉ project để tính ngày');
     }
@@ -660,11 +672,18 @@ function renderResult(result) {
     field('Đối chiếu ảnh gỡ popup', label);
   }
   if (result.popupRemoval) {
-    const scope = result.popupRemoval.scope === 'all' ? 'toàn bộ popup' : 'popup khớp ảnh ticket';
+    const count = result.popupRemoval.removedCount || 1;
+    const isTopic = result.ticket?.removalScope === 'ticket-topic-remove-one' || !result.attachment;
+    const topicLabel = result.ticket?.removalTopic ? `thông báo "${result.ticket.removalTopic}"` : 'thông báo';
+    const scope = result.popupRemoval.scope === 'all'
+      ? 'toàn bộ popup'
+      : (isTopic
+        ? (count > 1 ? `${count} popup ${topicLabel}` : `popup ${topicLabel}`)
+        : (count > 1 ? `${count} popup khớp ảnh ticket` : 'popup khớp ảnh ticket'));
     field('Gỡ popup', result.popupRemoval.changed
-      ? `Đã gỡ ${result.popupRemoval.removedCount || 1} ${scope}`
+      ? `Đã gỡ ${scope}`
       : `Không có ${scope} để gỡ`);
-    if (result.popupRemoval.visionRationale) field('Lý do khớp ảnh', result.popupRemoval.visionRationale);
+    if (result.popupRemoval.visionRationale) field('Lý do gỡ popup', result.popupRemoval.visionRationale);
   }
   if (result.build) {
     field('CMS Build', result.build.status === 'success' ? 'Thành công' : result.build.status || 'Chưa xác nhận');
@@ -679,7 +698,15 @@ function renderResult(result) {
     if (websiteUrl) linkField('Website popup', websiteUrl, websiteUrl);
     else field('Website popup', 'CMS chưa trả về Live URL');
   }
-  nextAction.textContent = result.nextAction || '';
+  const isSuccess = ['popup-live', 'popup-removed'].includes(result?.status);
+  const actionText = (result?.nextAction || '').trim();
+  if (isSuccess || !actionText || actionText === resultSummary.textContent.trim()) {
+    nextAction.textContent = '';
+    nextAction.hidden = true;
+  } else {
+    nextAction.textContent = actionText;
+    nextAction.hidden = false;
+  }
 }
 
 function renderOutcome(job) {

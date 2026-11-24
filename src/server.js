@@ -84,6 +84,8 @@ function safePlan(plan) {
         startDate: item.startDate || null,
         expiryDate: item.expiryDate || null
       })) : [],
+      actionSummary: plan.ticket.actionSummary || plan.semantic?.actionSummary || null,
+      removalTopic: plan.ticket.removalTopic || null,
       removalScope: plan.ticket.removalScope || null
     } : null,
     attachmentPlan: plan.attachmentPlan ? {
@@ -186,6 +188,7 @@ function safePlan(plan) {
       start: plan.popup.start || null,
       expiry: plan.popup.expiry || null,
       timezone: plan.popup.timezone || null,
+      cmsLabel: plan.popup.cmsLabel || plan.timezone?.cmsLabel || null,
       timezoneControl: plan.popup.timezoneControl ? {
         applied: Boolean(plan.popup.timezoneControl.applied),
         supported: Boolean(plan.popup.timezoneControl.supported)

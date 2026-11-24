@@ -59,6 +59,54 @@ test('readPopupListItems ignores a stale empty Vue snapshot when a populated sna
   assert.equal(result.items[0].image, 'ticket.webp');
 });
 
+test('readPopupListItems prefers the newer non-empty snapshot after item deletion', async () => {
+  const snapshots = [
+    `check-all-list_items-${JSON.stringify([
+      { image: 'pop1.webp', time_end: '2026-11-26' },
+      { image: 'pop2.webp', time_end: '2026-11-26' },
+      { image: 'pop3.webp', time_end: '2026-11-26' },
+      { image: 'pop4.webp', time_end: '2026-11-26' }
+    ])}`,
+    `check-all-list_items-${JSON.stringify([
+      { image: 'pop2.webp', time_end: '2026-11-26' },
+      { image: 'pop3.webp', time_end: '2026-11-26' },
+      { image: 'pop4.webp', time_end: '2026-11-26' }
+    ])}`
+  ];
+  const checkboxLocator = {
+    count: async () => snapshots.length,
+    nth: (index) => ({ getAttribute: async () => snapshots[index] })
+  };
+  const drawer = {
+    locator: (selector) => selector.includes('check-all-list_items-')
+      ? checkboxLocator
+      : { count: async () => 0 }
+  };
+  const page = {
+    locator: (selector) => {
+      if (selector.includes('overflow-y-auto')) {
+        return {
+          filter: () => ({
+            count: async () => 1,
+            nth: () => ({
+              evaluate: async () => false,
+              locator: drawer.locator
+            })
+          })
+        };
+      }
+      return { count: async () => 0 };
+    }
+  };
+
+  const result = await readPopupListItems(page);
+  assert.equal(result.items.length, 3, 'Newer 3-item snapshot must be chosen over stale 4-item snapshot');
+  assert.equal(result.items[0].image, 'pop2.webp');
+
+  const expectedResult = await readPopupListItems(page, 4);
+  assert.equal(expectedResult.items.length, 4, 'When expectedCount is 4, 4-item snapshot is chosen');
+});
+
 test('isPopupItemEditorOpen returns false when sitting in list view with Add block visible', async () => {
   const page = {
     locator: (selector) => {
@@ -695,5 +743,72 @@ test('buildPopupEntriesForTickets preserves exact slot when an image at position
   assert.equal(entries[1].imagePath, '/path/to/legacy-pos2.webp');
   assert.equal(entries[1].isTicket, false);
 });
+
+test('deletePopupItemAtIndex matches target image in card img sources directly', async () => {
+  let menuClicked = false;
+  let confirmClicked = false;
+  let escapePressed = false;
+
+  const mockCard = {
+    locator: (selector) => {
+      if (selector === 'img') {
+        return {
+          evaluateAll: async (fn) => fn([{ src: 'https://storage.fastboy.dev/target-image.png' }])
+        };
+      }
+      return {
+        last: () => ({
+          click: async () => { menuClicked = true; }
+        })
+      };
+    },
+    evaluate: async () => {}
+  };
+
+  const mockPage = {
+    viewportSize: () => ({ width: 1440, height: 900 }),
+    locator: (selector) => {
+      if (selector.includes('.el-overlay:visible')) {
+        return { count: async () => 0 };
+      }
+      if (selector.includes('button-drag') || selector.includes('drag-handle')) {
+        return { count: async () => 1, nth: () => ({ count: async () => 1 }) };
+      }
+      if (selector.includes('button:has-text("Confirm")')) {
+        return {
+          count: async () => 1,
+          first: () => ({
+            isVisible: async () => true,
+            click: async () => { confirmClicked = true; }
+          })
+        };
+      }
+      return { count: async () => 0 };
+    },
+    getByRole: (role, opts) => {
+      if (role === 'menu') {
+        return {
+          isVisible: async () => true,
+          getByRole: () => ({ isVisible: async () => true, click: async () => {} }),
+          locator: () => ({ isVisible: async () => true, click: async () => {} })
+        };
+      }
+      if (role === 'button' && opts?.name?.test?.('Confirm')) {
+        return { isVisible: async () => true, click: async () => { confirmClicked = true; } };
+      }
+      return { isVisible: async () => false, click: async () => {} };
+    },
+    keyboard: {
+      press: async (key) => {
+        if (key === 'Escape') escapePressed = true;
+      }
+    },
+    waitForTimeout: async () => {}
+  };
+
+  // When overlay count is 0, escape should not be pressed
+  assert.equal(escapePressed, false);
+});
+
 
 

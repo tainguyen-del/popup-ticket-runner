@@ -322,11 +322,13 @@ function visionCandidateFromLocalImage(image, index, context = '') {
 
 function preparePopupRemovalVision(referenceImage, popupImages) {
   const MAX_TOTAL_BYTES = 15 * 1024 * 1024;
-  const reference = visionCandidateFromLocalImage(referenceImage, 0, 'Reference image from this CRM ticket.');
-  if (!reference) {
+  const reference = referenceImage
+    ? visionCandidateFromLocalImage(referenceImage, 0, 'Reference image from this CRM ticket.')
+    : null;
+  if (referenceImage && !reference) {
     return { reference: null, candidates: [], complete: false, warnings: ['The ticket reference image is not a supported PNG, JPEG, or WebP under 4 MB.'] };
   }
-  let totalBytes = reference.bytes;
+  let totalBytes = reference ? reference.bytes : 0;
   const candidates = [];
   const warnings = [];
   for (const image of popupImages) {

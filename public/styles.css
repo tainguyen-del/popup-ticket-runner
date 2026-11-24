@@ -472,6 +472,11 @@ button:disabled {
     line-height: 1.5;
 }
 
+.next-action:empty,
+.next-action[hidden] {
+    display: none;
+}
+
 .result-panel[data-outcome="error"] .next-action {
     border-top-color: #f1c8d0;
     color: #7e2940;

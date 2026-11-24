@@ -21,7 +21,7 @@ const {
   mustCreateFreshAnnouncementSection
 } = require('../src/run');
 const { hasWebsiteIdHeader } = require('../src/crm/ticket-reader');
-const { extractPopupLink, normalizeExpiry } = require('../src/ticket-parser');
+const { extractPopupLink, normalizeExpiry, popupActionNeedsTicketImage } = require('../src/ticket-parser');
 
 function parsed(text, ticketNumber) {
   return ticketData(text, `https://crm.fastboy.dev/tickets/detail/${ticketNumber}`);
@@ -919,6 +919,26 @@ test('pure remove-all without add still sets popupAction to remove-all', () => {
   assert.equal(ticket.hasInlineRemovalRequest, false);
 });
 
+test('recognizes Vietnamese removal phrasing "xóa giúp poster pop up thông báo nghỉ" (ticket 1605715)', () => {
+  const ticket = parsed([
+    'ID#4006 - Website Support',
+    '#1605715',
+    'Hi team,',
+    'Nhờ team xóa giúp poster pop up thông báo nghỉ trên website',
+    'Tiệm đổi thời gian nghỉ lễ',
+    'Thanks team'
+  ].join('\n'), 1605715);
+  assert.equal(ticket.popupAction, 'remove-one');
+  assert.equal(ticket.popupRequested, true);
+});
+
+test('popupActionNeedsTicketImage returns false for remove-one when attachmentCount is 0', () => {
+  assert.equal(popupActionNeedsTicketImage('remove-one', 0), false);
+  assert.equal(popupActionNeedsTicketImage('remove-one', 1), true);
+  assert.equal(popupActionNeedsTicketImage('create', 0), true);
+  assert.equal(popupActionNeedsTicketImage('remove-all', 0), false);
+});
+
 // ─── Popup link extraction ───────────────────────────────────────────────────
 
 test('extractPopupLink returns URL after a "link" keyword', () => {
@@ -1015,17 +1035,43 @@ test('ticketData extracts expiry date for "thông báo tiệm nghỉ ngày 26/11
   assert.equal(schedule.end?.date, `${currentYear}-11-26`);
 });
 
-test('ticketData extracts date range for holiday closure "tiệm nghỉ từ 24/11 đến 26/11"', () => {
+test('ticketData does not set startDate for holiday closure "tiệm nghỉ từ 24/11 đến 26/11" but extracts expiry', () => {
   const currentYear = new Date().getUTCFullYear();
   const ticket = parsed([
     'ID#18781 - Support',
     'Nhờ team pop up poster tiệm nghỉ từ 24/11 đến 26/11.'
   ].join('\n'), 1601784);
-  assert.equal(ticket.startDate, `${currentYear}-11-24`);
+  assert.equal(ticket.startDate, null);
   assert.equal(ticket.expiryDate, `${currentYear}-11-26`);
   const schedule = popupScheduleFromTicket(ticket);
-  assert.equal(schedule.start?.date, `${currentYear}-11-24`);
+  assert.equal(schedule.start, null);
   assert.equal(schedule.end?.date, `${currentYear}-11-26`);
+});
+
+test('does not set startDate when note mentions holiday closure or promotion without explicit popup launch date', () => {
+  const currentYear = new Date().getUTCFullYear();
+  const t1 = parsed('ID#100 - Support\nNhờ team up poster thông báo tiệm nghỉ từ 24/11 đến 26/11.', 100);
+  assert.equal(t1.startDate, null);
+  assert.equal(t1.expiryDate, `${currentYear}-11-26`);
+
+  const t2 = parsed('ID#100 - Support\nNhờ team lên popup khuyến mãi từ 20/11 đến 30/11.', 101);
+  assert.equal(t2.startDate, null);
+  assert.equal(t2.expiryDate, `${currentYear}-11-30`);
+});
+
+test('sets startDate only when note explicitly requests popup start date', () => {
+  const currentYear = new Date().getUTCFullYear();
+  const t1 = parsed('ID#100 - Support\nNhờ team hẹn ngày 12/01/2026 mới lên popup, hạn tới 12/25/2026.', 102);
+  assert.equal(t1.startDate, `${currentYear}-12-01`);
+  assert.equal(t1.expiryDate, `${currentYear}-12-25`);
+
+  const t2 = parsed('ID#100 - Support\nPopup start date: 12/01/2026\nEnd date: 12/25/2026', 103);
+  assert.equal(t2.startDate, '2026-12-01');
+  assert.equal(t2.expiryDate, '2026-12-25');
+
+  const t3 = parsed('ID#100 - Support\nĐăng popup từ ngày 12/01/2026 đến ngày 12/25/2026', 104);
+  assert.equal(t3.startDate, '2026-12-01');
+  assert.equal(t3.expiryDate, '2026-12-25');
 });
 
 test('extractPopupDuration parses requested seconds and adds 3s open delay', () => {

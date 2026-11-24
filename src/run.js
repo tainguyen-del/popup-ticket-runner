@@ -182,9 +182,10 @@ function popupTicketEntriesFromDownloads(downloadedAttachments, schedule, poster
     // Ticket/comment dates and the explicit CLI expiry override are stronger
     // evidence than poster OCR. When the ticket requests an indefinite / open-ended schedule
     // ("đến khi khách tắt"), poster OCR must not invent dates. Otherwise, fall back to
-    // the validated artwork schedule independently for each missing field, so two posters
-    // can have different validity windows without sharing dates accidentally.
-    const startDate = schedule?.start?.date || artworkSchedule?.startDate || null;
+    // the validated artwork schedule independently for missing expiry. Per user requirements,
+    // do NOT adopt artwork startDate — popups display immediately unless the ticket note
+    // explicitly requests a scheduled start date.
+    const startDate = schedule?.start?.date || null;
     const endDate = schedule?.end?.date || artworkSchedule?.endDate || null;
     entries.push({
       ticketIndex: entries.length,
@@ -223,10 +224,8 @@ function applyArtworkSchedulePrecedence(ticket, visionPosterSchedules, targetInd
   }
   if (matched.startDate) {
     ticket.artworkStartDate = matched.startDate;
-    if (!ticket.startDate && !ticket.isIndefinite) {
-      ticket.startDate = matched.startDate;
-      ticket.start = matched.evidence || matched.startDate;
-    }
+    // Per user requirement: Do NOT adopt startDate from artwork poster schedule.
+    // Popups display immediately unless the ticket note explicitly requested a start date.
   }
 }
 
@@ -714,22 +713,45 @@ async function visiblePopupSection(page, description = null) {
   return visibleMatch(page.getByText(/^(?:Annoucement|Announcement) Popup$/), description, true);
 }
 
-async function popupSectionCards(page) {
+async function popupSectionCards(page, { includeCorrupted = false } = {}) {
   const cards = page.locator('div[id^="item_block_section#"]');
-  const result = [];
+  const validCards = [];
+  const corruptedCards = [];
   for (let index = 0; index < await cards.count(); index += 1) {
     const card = cards.nth(index);
     if (!await card.isVisible().catch(() => false)) continue;
     const text = (await card.innerText().catch(() => '')).trim();
-    if (/(?:^|\n)(?:Annoucement|Announcement) Popup(?:\n|$)/.test(text)) result.push(card);
+    if (/(?:^|\n)(?:Annoucement|Announcement) Popup(?:\n|$)/.test(text)) validCards.push(card);
+    else if (/^N\/?A[\s\n]+N\/?A$/i.test(text) || text === 'N/A') corruptedCards.push(card);
   }
-  return result;
+  if (includeCorrupted) {
+    return [...validCards, ...corruptedCards];
+  }
+  // When valid Announcement sections exist, ignore corrupted N/A sections
+  return validCards.length > 0 ? validCards : corruptedCards;
 }
 
 async function popupSectionCardById(page, sectionId) {
-  const cards = await popupSectionCards(page);
-  for (const card of cards) {
-    if (await card.getAttribute('id') === sectionId) return card;
+  for (let attempt = 0; attempt < 25; attempt += 1) {
+    const cards = await popupSectionCards(page);
+    if (sectionId) {
+      for (const card of cards) {
+        if (await card.getAttribute('id') === sectionId) return card;
+      }
+    }
+    // If exact sectionId is not found or changed, but valid Announcement Popup cards exist:
+    if (cards.length === 1) return cards[0];
+    if (cards.length > 1) {
+      // Prefer card explicitly showing Announcement Popup and not N/A
+      for (const card of cards) {
+        const text = await card.innerText().catch(() => '');
+        if (/(?:Annoucement|Announcement) Popup/i.test(text) && !/^N\/?A/i.test(text)) {
+          return card;
+        }
+      }
+      return cards.at(-1);
+    }
+    await page.waitForTimeout(200);
   }
   return null;
 }
@@ -813,13 +835,13 @@ async function deleteLegacyPopupSections(page, targetSectionIds = []) {
   }
 
   // 2. Delete any sections that still match Announcement popup cards
-  let cards = await popupSectionCards(page);
+  let cards = await popupSectionCards(page, { includeCorrupted: true });
   while (cards.length) {
     const card = cards.at(-1);
     const deleted = await deleteSectionCard(page, card).catch(() => false);
     if (!deleted) break;
     removedCount += 1;
-    cards = await popupSectionCards(page);
+    cards = await popupSectionCards(page, { includeCorrupted: true });
   }
 
   // 3. Delete any orphaned N/A section cards in the editor left behind by plugin upgrade
@@ -828,7 +850,7 @@ async function deleteLegacyPopupSections(page, targetSectionIds = []) {
     const card = allCards.nth(i);
     if (!await card.isVisible().catch(() => false)) continue;
     const text = (await card.innerText().catch(() => '')).trim();
-    if (/^N\/A\s+N\/A$/i.test(text) || text === 'N/A') {
+    if (/^N\/?A[\s\n]+N\/?A$/i.test(text) || text === 'N/A') {
       const deleted = await deleteSectionCard(page, card).catch(() => false);
       if (deleted) removedCount += 1;
     }
@@ -881,6 +903,16 @@ async function ensurePopupSection(page, baseUrl, { replaceExisting = false, expe
   if (!createdCard) {
     throw new Error(`CMS did not render a new Announcement section for plugin ${expectedPluginVersion || 'version unknown'}.`);
   }
+  // Clean up any remaining orphaned N/A section cards in the editor
+  const orphanCards = page.locator('div[id^="item_block_section#"]');
+  for (let i = (await orphanCards.count()) - 1; i >= 0; i -= 1) {
+    const card = orphanCards.nth(i);
+    if (!await card.isVisible().catch(() => false)) continue;
+    const text = (await card.innerText().catch(() => '')).trim();
+    if (/^N\/?A[\s\n]+N\/?A$/i.test(text) || text === 'N/A') {
+      await deleteSectionCard(page, card).catch(() => false);
+    }
+  }
   return {
     exists: true,
     sectionId: await createdCard.getAttribute('id'),
@@ -920,47 +952,83 @@ async function existingPopupSection(page, baseUrl, { expectedPluginVersion = nul
   };
 }
 
+async function isPopupSectionEditorAlreadyOpen(page) {
+  return page.evaluate(() => {
+    // 1. Check for Add block button in DOM
+    const buttons = Array.from(document.querySelectorAll('button, [role="button"], .el-button'));
+    if (buttons.some((b) => /Add\s*block/i.test(b.textContent || ''))) return true;
+
+    // 2. Check for check-all list items input
+    if (document.querySelector('input[name^="check-all-list_items-"], input[type="checkbox"][name*="list_items"]')) return true;
+
+    // 3. Check for section setting headers/labels
+    const elements = Array.from(document.querySelectorAll('span, div, p, label, h3, h4'));
+    if (elements.some((el) => {
+      const text = el.textContent || '';
+      return /Popup[\s_]setting/i.test(text)
+        || /Slide direction style/i.test(text)
+        || /Time delay slider/i.test(text)
+        || /List\s*items/i.test(text);
+    })) return true;
+
+    return false;
+  }).catch(() => false);
+}
+
 async function openPopupSection(page, sectionId = null) {
   // If Announcement Popup editor is already open (Preview / Slide direction style / Add block / Popup_setting),
   // do not re-click the background section card in the page editor. Clicking the background card while
   // the section drawer is open causes Playwright to fail with a 30s timeout because the drawer overlay
   // (absolute inset-0 z-10) intercepts pointer events.
-  const alreadyOpen = await waitForVisibleMatch(
-    page.getByText(/Popup[\s_]setting/i),
-    null,
-    true,
-    500
-  ).catch(() => null) || await visibleMatch(
-    page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")'),
-    null,
-    true
-  ) || await visibleMatch(
-    page.getByText('Slide direction style', { exact: true }),
-    null,
-    true
-  ) || await visibleMatch(
-    page.getByText(/Slide direction style/i),
-    null,
-    true
-  );
-  if (alreadyOpen) return alreadyOpen;
+  if (await isPopupSectionEditorAlreadyOpen(page)) {
+    const settingsCard = await visibleMatch(page.getByText(/Popup[\s_]setting/i), null, true).catch(() => null)
+      || await visibleMatch(page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")'), null, true).catch(() => null)
+      || page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")').first();
+    return settingsCard;
+  }
 
-  if (sectionId) {
-    const card = await popupSectionCardById(page, sectionId);
-    if (!card) throw new Error(`Announcement section ${sectionId} was not found in the Page editor.`);
-    const section = await visibleMatch(card.getByText(/^(?:Annoucement|Announcement) Popup$/), 'Announcement section', true);
-    if (!section) throw new Error(`Announcement section ${sectionId} could not be opened.`);
-    await section.click();
+  // Ensure section cards are present
+  let card = await popupSectionCardById(page, sectionId);
+  if (!card) {
+    await returnToPageEditor(page);
+    card = await popupSectionCardById(page, sectionId);
+  }
+
+  if (card) {
+    const section = await visibleMatch(card.getByText(/^(?:Annoucement|Announcement) Popup$/), 'Announcement section', true)
+      || await visibleMatch(card.locator('span, div, p').filter({ hasText: /^N\/A$/ }), 'Announcement section', true)
+      || card;
+    if (section) {
+      await section.click();
+      await page.waitForTimeout(400);
+    }
+  }
+
+  // Wait for drawer to open without spamming clicks in a loop!
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    if (await isPopupSectionEditorAlreadyOpen(page)) {
+      const settingsCard = await visibleMatch(page.getByText(/Popup[\s_]setting/i), null, true).catch(() => null)
+        || await visibleMatch(page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")'), null, true).catch(() => null)
+        || page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")').first();
+      return settingsCard;
+    }
     await page.waitForTimeout(250);
   }
-  for (let attempt = 0; attempt < 20; attempt += 1) {
-    const settingsCard = await visibleMatch(page.getByText(/Popup[\s_]setting/i), null)
-      || await visibleMatch(page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")'), null);
-    if (settingsCard) return settingsCard;
-    const section = await visiblePopupSection(page, null);
-    if (section) await section.click();
-    await page.waitForTimeout(250);
+
+  // If still not open after 10s, attempt a single fallback click
+  const retrySection = await visiblePopupSection(page, null);
+  if (retrySection) {
+    await retrySection.click().catch(() => {});
+    const retryDeadline = Date.now() + 5000;
+    while (Date.now() < retryDeadline) {
+      if (await isPopupSectionEditorAlreadyOpen(page)) {
+        return page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")').first();
+      }
+      await page.waitForTimeout(250);
+    }
   }
+
   throw new Error('Popup section editor did not open after the section was added.');
 }
 
@@ -1585,16 +1653,21 @@ async function restoreMigratedPopupOrder(page, orderedImageUrls) {
 }
 
 async function returnToPageEditor(page) {
-  for (let attempt = 0; attempt < 4; attempt += 1) {
-    const contentBlocks = await visibleMatch(page.getByText('Content blocks', { exact: true }), null, true);
-    if (contentBlocks) return;
-    const back = await visibleMatch(page.getByRole('button', { name: /back/i }), null, true)
-      || await visibleMatch(page.locator('button:has-text("Back"), [role="button"]:has-text("Back"), .el-button:has-text("Back")'), null, true);
-    if (!back) break;
-    await back.click({ force: true }).catch(() => {});
-    await page.waitForTimeout(250);
+  const isDrawerOpen = await isPopupSectionEditorAlreadyOpen(page);
+  if (!isDrawerOpen) return;
+
+  // Find the Back button scoped strictly to the drawer or slideover
+  const backBtn = page.locator(
+    '.el-drawer:visible button:has-text("Back"), [role="dialog"]:visible button:has-text("Back"), div[class*="overflow-y-auto"]:visible button:has-text("Back"), div.absolute.inset-0:visible button:has-text("Back"), .el-page-header__left button, [class*="icon-back"]'
+  ).first();
+
+  if (await backBtn.isVisible().catch(() => false)) {
+    await backBtn.click({ force: true }).catch(() => {});
+    await page.waitForTimeout(400);
+  } else {
+    await page.keyboard.press('Escape');
+    await page.waitForTimeout(300);
   }
-  await waitForVisibleMatch(page.getByText('Content blocks', { exact: true }), 'Page editor after popup action', true, 5000);
 }
 
 async function collectPopupRemovalCandidates(page, baseUrl, runDir) {
@@ -1604,7 +1677,8 @@ async function collectPopupRemovalCandidates(page, baseUrl, runDir) {
   fs.mkdirSync(assetDir, { recursive: true });
   const items = [];
   let visionIndex = 1;
-  for (const card of cards) {
+  for (let cardIndex = 0; cardIndex < cards.length; cardIndex += 1) {
+    const card = cards[cardIndex];
     const sectionId = await card.getAttribute('id');
     if (!sectionId) continue;
     await openPopupSettings(page, sectionId);
@@ -1624,7 +1698,10 @@ async function collectPopupRemovalCandidates(page, baseUrl, runDir) {
       });
       visionIndex += 1;
     }
-    await returnToPageEditor(page);
+    // Keep drawer open for the subsequent removal if this was the last card
+    if (cardIndex < cards.length - 1) {
+      await returnToPageEditor(page);
+    }
   }
   return { sectionCount: cards.length, items };
 }
@@ -1682,49 +1759,135 @@ async function removeOnePopupItem(page, baseUrl, target) {
   return { sectionId: target.sectionId, itemIndex: targetIndex, imageUrl: target.sourceImageUrl, removedCount: 1, changed: true };
 }
 
+async function removeMatchingPopupItems(page, baseUrl, targets) {
+  if (!Array.isArray(targets) || targets.length === 0) {
+    return { sectionCount: 0, removedCount: 0, changed: false };
+  }
+  const isDrawerOpen = await isPopupSectionEditorAlreadyOpen(page);
+  const hasCards = (await page.locator('div[id^="item_block_section#"]').count().catch(() => 0)) > 0;
+  if (!isDrawerOpen && !hasCards) {
+    await openPageEditor(page, baseUrl);
+  }
+  if (!isDrawerOpen) {
+    await waitForPopupSectionCardCount(page, 1).catch(() => {});
+  }
+  const targetsBySection = new Map();
+  for (const target of targets) {
+    if (!targetsBySection.has(target.sectionId)) {
+      targetsBySection.set(target.sectionId, []);
+    }
+    targetsBySection.get(target.sectionId).push(target);
+  }
+  let totalRemoved = 0;
+  for (const [sectionId, sectionTargets] of targetsBySection) {
+    await openPopupSettings(page, sectionId);
+    let { items } = await readPopupListItems(page);
+
+    // Map targets with their current index in CMS items list
+    const targetsWithIndices = sectionTargets.map((target) => {
+      const targetImage = stableImageUrl(target.sourceImageUrl);
+      const initialIndex = items.findIndex((item) => stableImageUrl(item?.image) === targetImage);
+      return { target, targetImage, initialIndex };
+    });
+
+    // CRITICAL: Sort descending by initial index so higher-index popups are deleted first.
+    // Deleting higher-index items first guarantees that lower-index items do NOT shift!
+    targetsWithIndices.sort((a, b) => b.initialIndex - a.initialIndex);
+
+    for (const { target, targetImage } of targetsWithIndices) {
+      // Re-ensure the popup settings drawer is open and ready before EACH deletion
+      await openPopupSettings(page, sectionId);
+      await waitForPopupListItemsPanel(page, 4000).catch(() => {});
+
+      // Re-read fresh items before each deletion to reflect exact current state
+      let fresh = await readPopupListItems(page).catch(() => ({ items: [] }));
+      if (fresh.items.length === 0) {
+        await page.waitForTimeout(300);
+        await openPopupSettings(page, sectionId);
+        fresh = await readPopupListItems(page).catch(() => ({ items: [] }));
+      }
+      items = fresh.items;
+      let currentIndex = items.findIndex((item) => stableImageUrl(item?.image) === targetImage);
+      const remainingCount = items.length > 0 ? items.length - 1 : Math.max(0, targetsWithIndices.length - 1 - totalRemoved);
+      await deletePopupItemAtIndex(
+        page,
+        currentIndex >= 0 ? currentIndex : 0,
+        remainingCount,
+        `Gemini-matched popup item #${target.visionIndex}`,
+        target.sourceImageUrl
+      );
+      totalRemoved += 1;
+      await page.waitForTimeout(300);
+      ({ items } = await readPopupListItems(page).catch(() => ({ items: [] })));
+    }
+    await returnToPageEditor(page);
+  }
+  return {
+    sectionId: targets[0]?.sectionId || null,
+    itemIndex: targets[0]?.visionIndex ? targets[0].visionIndex - 1 : 0,
+    imageUrl: targets[0]?.sourceImageUrl || null,
+    removedCount: totalRemoved,
+    changed: totalRemoved > 0
+  };
+}
+
 async function removePopupForTicket(page, baseUrl, runDir, ticketText, action, referenceImage) {
   if (action === 'remove-all') {
     progress('popup-removal-all', 'Removing every current popup item requested by the ticket');
     return { scope: 'all', ...(await removeAllPopupItems(page, baseUrl)), vision: null };
   }
-  if (action !== 'remove-one' || !referenceImage?.path) {
-    const error = new Error('A remove-one popup ticket needs one locally downloaded reference image from CRM.');
+  if (action !== 'remove-one') {
+    const error = new Error('A popup removal ticket requires remove-one or remove-all.');
     error.stage = 'popup-removal-ambiguous';
     throw error;
   }
-  progress('popup-removal-scan', 'Downloading current CMS popup images for Gemini Vision comparison');
+  progress('popup-removal-scan', 'Downloading current CMS popup images for Gemini Vision inspection');
   const available = await collectPopupRemovalCandidates(page, baseUrl, runDir);
   if (!available.items.length) {
-    const error = new Error('No configured CMS popup image exists that matches the ticket image. Nothing was removed and CMS Build was not started.');
+    const error = new Error('No configured CMS popup image exists that matches the ticket removal request. Nothing was removed and CMS Build was not started.');
     error.stage = 'popup-removal-not-found';
     throw error;
   }
   const prepared = preparePopupRemovalVision(referenceImage, available.items);
-  if (!prepared.reference || !prepared.candidates.length || prepared.complete !== true || prepared.candidates.length !== available.items.length) {
+  if (!prepared.candidates.length || prepared.complete !== true || prepared.candidates.length !== available.items.length) {
     const error = new Error(prepared.warnings.join(' ') || 'CMS popup images could not be prepared for Gemini Vision comparison.');
     error.stage = 'popup-removal-ambiguous';
     throw error;
   }
-  progress('popup-removal-vision', 'Gemini Vision is matching the ticket image to the current CMS popup');
+  progress('popup-removal-vision', referenceImage
+    ? 'Gemini Vision is matching the ticket image to the current CMS popup'
+    : 'Gemini Vision đang đọc nội dung các popup trên CMS để xác định popup thông báo cần gỡ');
   const resolution = await resolveTicketPopupRemovalVision(ticketText, prepared.reference, prepared.candidates);
   if (!resolution.selection) {
     const notFound = resolution.audit?.status === 'not-found';
+    const auditWarning = resolution.audit?.warnings?.join(' ') || '';
     const error = new Error(notFound
-      ? 'No current CMS popup matches the ticket image. No popup was removed and CMS Build was not started.'
-      : 'The tool could not identify one unique CMS popup matching the ticket image. No popup was removed and CMS Build was not started.');
+      ? 'No current CMS popup matches the ticket request. No popup was removed and CMS Build was not started.'
+      : (auditWarning ? `The tool could not identify CMS popups matching the ticket request (${auditWarning}). No popup was removed and CMS Build was not started.` : 'The tool could not identify CMS popups matching the ticket request. No popup was removed and CMS Build was not started.'));
     error.stage = notFound ? 'popup-removal-not-found' : 'popup-removal-ambiguous';
     error.vision = resolution.audit;
     throw error;
   }
-  const target = available.items.find((item) => item.visionIndex === resolution.selection.index);
-  if (!target) {
-    const error = new Error('Gemini Vision selected a CMS popup that was not in the local candidate set. No popup was removed.');
+  const targetIndices = Array.isArray(resolution.selection.indices) && resolution.selection.indices.length > 0
+    ? resolution.selection.indices
+    : [resolution.selection.index];
+  const targets = targetIndices
+    .map((idx) => available.items.find((item) => item.visionIndex === idx))
+    .filter(Boolean);
+  if (!targets.length) {
+    const error = new Error('Gemini Vision selected CMS popups that were not in the local candidate set. No popup was removed.');
     error.stage = 'popup-removal-ambiguous';
     throw error;
   }
-  progress('popup-removal-apply', 'Removing the uniquely Gemini-matched popup from CMS');
-  const removal = await removeOnePopupItem(page, baseUrl, target);
-  return { scope: 'one', ...removal, vision: resolution.audit, visionRationale: resolution.selection.rationale, warnings: prepared.warnings };
+  progress('popup-removal-apply', `Đang gỡ ${targets.length} popup được Gemini Vision xác nhận: ${targets.map((t) => '#' + t.visionIndex).join(', ')}`);
+  const removal = await removeMatchingPopupItems(page, baseUrl, targets);
+  return {
+    scope: targets.length > 1 ? 'multiple' : 'one',
+    ...removal,
+    vision: resolution.audit,
+    visionRationale: resolution.selection.rationale,
+    warnings: prepared.warnings
+  };
 }
 
 async function configurePopup(page, imagePath, schedule, timezone, {
@@ -2397,6 +2560,25 @@ const US_TIMEZONE_BY_STATE = {
   WY: ['America/Denver', 'Denver (UTC-07:00)']
 };
 
+const CA_TIMEZONE_BY_PROVINCE = {
+  ON: ['America/Toronto', 'New York (UTC-05:00)'],
+  QC: ['America/Montreal', 'New York (UTC-05:00)'],
+  BC: ['America/Vancouver', 'Los Angeles (UTC-08:00)'],
+  AB: ['America/Edmonton', 'Denver (UTC-07:00)'],
+  MB: ['America/Winnipeg', 'Chicago (UTC-06:00)'],
+  SK: ['America/Regina', 'Chicago (UTC-06:00)'],
+  NS: ['America/Halifax', 'New York (UTC-05:00)'],
+  NB: ['America/Moncton', 'New York (UTC-05:00)'],
+  NL: ['America/St_Johns', 'New York (UTC-05:00)'],
+  PE: ['America/Halifax', 'New York (UTC-05:00)']
+};
+
+const CA_PROVINCE_CODES_BY_NAME = {
+  ontario: 'ON', quebec: 'QC', 'british columbia': 'BC', alberta: 'AB',
+  manitoba: 'MB', saskatchewan: 'SK', 'nova scotia': 'NS', 'new brunswick': 'NB',
+  newfoundland: 'NL', 'prince edward island': 'PE'
+};
+
 const US_STATE_CODES_BY_NAME = {
   alabama: 'AL', alaska: 'AK', arizona: 'AZ', arkansas: 'AR', california: 'CA', colorado: 'CO',
   connecticut: 'CT', delaware: 'DE', florida: 'FL', georgia: 'GA', hawaii: 'HI', idaho: 'ID',
@@ -2425,15 +2607,110 @@ function escapePattern(value) {
   return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
+function usStateFromZip(zip) {
+  const match = String(zip || '').match(/\b\d{5}\b/);
+  if (!match) return null;
+  const num = parseInt(match[0], 10);
+  if (!num) return null;
+  if (num >= 35000 && num <= 36999) return 'AL';
+  if (num >= 99500 && num <= 99999) return 'AK';
+  if (num >= 85000 && num <= 86599) return 'AZ';
+  if (num >= 71600 && num <= 72999) return 'AR';
+  if (num >= 90000 && num <= 96199) return 'CA'; // West Sacramento, CA 95605
+  if (num >= 80000 && num <= 81699) return 'CO';
+  if (num >= 6000 && num <= 6999) return 'CT';
+  if (num >= 19700 && num <= 19999) return 'DE';
+  if (num >= 20000 && num <= 20599) return 'DC';
+  if (num >= 32000 && num <= 34999) return 'FL';
+  if (num >= 30000 && num <= 31999) return 'GA';
+  if (num >= 96700 && num <= 96899) return 'HI';
+  if (num >= 83200 && num <= 83899) return 'ID';
+  if (num >= 60000 && num <= 62999) return 'IL';
+  if (num >= 46000 && num <= 47999) return 'IN';
+  if (num >= 50000 && num <= 52899) return 'IA';
+  if (num >= 66000 && num <= 67999) return 'KS';
+  if (num >= 40000 && num <= 42799) return 'KY';
+  if (num >= 70000 && num <= 71499) return 'LA';
+  if (num >= 3900 && num <= 4999) return 'ME';
+  if (num >= 20600 && num <= 21999) return 'MD';
+  if (num >= 1000 && num <= 2799) return 'MA';
+  if (num >= 48000 && num <= 49999) return 'MI';
+  if (num >= 55000 && num <= 56799) return 'MN';
+  if (num >= 38600 && num <= 39799) return 'MS';
+  if (num >= 63000 && num <= 65899) return 'MO';
+  if (num >= 59000 && num <= 59999) return 'MT';
+  if (num >= 68000 && num <= 69399) return 'NE';
+  if (num >= 88900 && num <= 89899) return 'NV';
+  if (num >= 3000 && num <= 3899) return 'NH';
+  if (num >= 7000 && num <= 8999) return 'NJ';
+  if (num >= 87000 && num <= 88499) return 'NM';
+  if (num >= 10000 && num <= 14999) return 'NY';
+  if (num >= 27000 && num <= 28999) return 'NC';
+  if (num >= 58000 && num <= 58899) return 'ND';
+  if (num >= 43000 && num <= 45999) return 'OH';
+  if (num >= 73000 && num <= 74999) return 'OK';
+  if (num >= 97000 && num <= 97999) return 'OR';
+  if (num >= 15000 && num <= 19699) return 'PA';
+  if (num >= 2800 && num <= 2999) return 'RI';
+  if (num >= 29000 && num <= 29999) return 'SC';
+  if (num >= 57000 && num <= 57799) return 'SD';
+  if (num >= 37000 && num <= 38599) return 'TN';
+  if (num >= 75000 && num <= 79999) return 'TX';
+  if (num >= 84000 && num <= 84799) return 'UT';
+  if (num >= 5000 && num <= 5999) return 'VT';
+  if (num >= 22000 && num <= 24699) return 'VA';
+  if (num >= 98000 && num <= 99499) return 'WA';
+  if (num >= 24700 && num <= 26999) return 'WV';
+  if (num >= 53000 && num <= 54999) return 'WI';
+  if (num >= 82000 && num <= 83199) return 'WY';
+  return null;
+}
+
 function usStateFromAddress(address) {
   const text = String(address || '');
-  const code = /\b([A-Za-z]{2})\s+\d{5}(?:-\d{4})?\b/.exec(text)?.[1]?.toUpperCase() || null;
+  if (!text.trim()) return null;
+
+  // Do not parse media filenames or URLs as addresses
+  if (/\.(?:webp|png|jpe?g|gif|svg|ico|css|js)(?:\?.*)?$/i.test(text.trim())) {
+    return null;
+  }
+
+  // 1. Check state code before zip with any delimiter: spaces, comma, dash, dot
+  // e.g. "CA 95605", "CA, 95605", "CA - 95605", "CA. 95605", "CA,  95605"
+  const code = /\b([A-Za-z]{2})[,\s\-.]+\d{5}(?:-\d{4})?\b/.exec(text)?.[1]?.toUpperCase() || null;
   if (code && US_TIMEZONE_BY_STATE[code]) return code;
+
+  // 2. Check full state name before zip with any delimiter
+  // e.g. "California, 95605", "California 95605", "California - 95605"
   const names = Object.entries(US_STATE_CODES_BY_NAME).sort(([left], [right]) => right.length - left.length);
   for (const [name, stateCode] of names) {
-    const pattern = new RegExp(`\\b${escapePattern(name)}\\b(?=\\s+\\d{5}(?:-\\d{4})?\\b)`, 'i');
+    const pattern = new RegExp(`\\b${escapePattern(name)}\\b(?=[,\\s\\-.]+\\d{5}(?:-\\d{4})?\\b)`, 'i');
     if (pattern.test(text)) return stateCode;
   }
+
+  // 3. Check 5-digit zip code in text when accompanied by address context or state name
+  const zipMatch = /\b(\d{5})(?:-\d{4})?\b/.exec(text);
+  if (zipMatch) {
+    const stateFromZip = usStateFromZip(zipMatch[1]);
+    if (stateFromZip) {
+      const hasAddressContext = /\b(?:st|street|ave|avenue|blvd|boulevard|rd|road|dr|drive|hwy|highway|pkwy|parkway|way|ct|court|ln|lane|suite|ste|ste\.|unit|box|top|nail|spa|salon|west|east|north|south|sacramento|miami|dallas|houston|chicago|orlando|tampa|phoenix|denver|seattle|portland|boston|atlanta)\b/i.test(text);
+      const hasStateMention = new RegExp(`\\b${stateFromZip}\\b`, 'i').test(text);
+      if (hasAddressContext || hasStateMention) {
+        return stateFromZip;
+      }
+    }
+  }
+
+  // 4. Check Canadian province code + postal code e.g. "ON L4M 5K3" or "ON, L4N 7T9"
+  const caCode = /\b([A-Za-z]{2})[,\s\-.]+[A-Za-z]\d[A-Za-z][\s\-.]?\d[A-Za-z]\d\b/.exec(text)?.[1]?.toUpperCase() || null;
+  if (caCode && CA_TIMEZONE_BY_PROVINCE[caCode]) return caCode;
+
+  // 5. Check full Canadian province name e.g. "Ontario, L4N 7T9"
+  for (const [name, provCode] of Object.entries(CA_PROVINCE_CODES_BY_NAME)) {
+    const pattern = new RegExp(`\\b${escapePattern(name)}\\b(?=[,\\s\\-.]+[A-Za-z]\\d[A-Za-z][\\s\\-.]?\\d[A-Za-z]\\d\\b)`, 'i');
+    if (pattern.test(text)) return provCode;
+  }
+
   return null;
 }
 
@@ -2487,60 +2764,247 @@ function repairWrappedJson(raw) {
 }
 
 function resolveTimezoneFromData(data) {
+  if (!data) {
+    return { address: null, state: null, iana: null, cmsLabel: null, source: null };
+  }
   const strings = flattenStrings(data).map((item) => item.replace(/<br\s*\/?>/gi, ', ').replace(/\s+/g, ' ').trim());
-  // Media filenames often contain five digits (for example
-  // `footer-preview-57321.webp`). Only accept a string as an address after
-  // it also yields a valid US state before the ZIP code.
-  const address = strings.find((item) => Boolean(usStateFromAddress(item))) || null;
-  const state = usStateFromAddress(address);
-  const mapped = state ? US_TIMEZONE_BY_STATE[state] : null;
+
+  // 1. Check direct strings for address (handles comma, dash, full state name)
+  let address = strings.find((item) => Boolean(usStateFromAddress(item))) || null;
+  let state = usStateFromAddress(address);
+
+  // 2. Check structured object fields if string search didn't find a full address
+  if (!state && typeof data === 'object') {
+    const scanObject = (obj) => {
+      if (!obj || typeof obj !== 'object') return null;
+      const stateVal = (obj.state || obj.stateCode || obj.state_code || obj.province || '').toString().trim().toUpperCase();
+      const zipVal = (obj.zip || obj.zipcode || obj.zip_code || obj.postalCode || obj.postal_code || '').toString().trim();
+
+      if (stateVal && (US_TIMEZONE_BY_STATE[stateVal] || CA_TIMEZONE_BY_PROVINCE[stateVal])) {
+        return {
+          state: stateVal,
+          address: `${obj.address || ''}, ${obj.city || ''}, ${stateVal} ${zipVal}`.replace(/^[,\s]+|[,\s]+$/g, '')
+        };
+      }
+      if (stateVal && US_STATE_CODES_BY_NAME[stateVal.toLowerCase()]) {
+        const mapped = US_STATE_CODES_BY_NAME[stateVal.toLowerCase()];
+        return {
+          state: mapped,
+          address: `${obj.address || ''}, ${obj.city || ''}, ${mapped} ${zipVal}`.replace(/^[,\s]+|[,\s]+$/g, '')
+        };
+      }
+      if (stateVal && CA_PROVINCE_CODES_BY_NAME[stateVal.toLowerCase()]) {
+        const mapped = CA_PROVINCE_CODES_BY_NAME[stateVal.toLowerCase()];
+        return {
+          state: mapped,
+          address: `${obj.address || ''}, ${obj.city || ''}, ${mapped} ${zipVal}`.replace(/^[,\s]+|[,\s]+$/g, '')
+        };
+      }
+      if (zipVal && /^\d{5}/.test(zipVal)) {
+        const fromZip = usStateFromZip(zipVal);
+        if (fromZip) {
+          return {
+            state: fromZip,
+            address: `${obj.address || ''}, ${obj.city || ''}, ${fromZip} ${zipVal}`.replace(/^[,\s]+|[,\s]+$/g, '')
+          };
+        }
+      }
+      for (const val of Object.values(obj)) {
+        if (val && typeof val === 'object') {
+          const res = scanObject(val);
+          if (res) return res;
+        }
+      }
+      return null;
+    };
+    const structured = scanObject(data);
+    if (structured) {
+      state = structured.state;
+      address = structured.address || address;
+    }
+  }
+
+  // 3. Fallback: Check all strings for any 5-digit zip code that maps to a state
+  if (!state) {
+    for (const str of strings) {
+      if (/\.(?:webp|png|jpe?g|gif|svg|ico|css|js)(?:\?.*)?$/i.test(str)) continue;
+      const z = usStateFromZip(str);
+      if (z) {
+        state = z;
+        address = str;
+        break;
+      }
+    }
+  }
+
+  const mapped = state ? (US_TIMEZONE_BY_STATE[state] || CA_TIMEZONE_BY_PROVINCE[state]) : null;
   return mapped ? { address, state, iana: mapped[0], cmsLabel: mapped[1], source: 'data/setting.json' } : { address, state, iana: null, cmsLabel: null, source: null };
 }
 
-async function discoverProjectTimezone(page, baseUrl) {
+async function fetchTimezoneFromWebsite(siteUrl) {
+  if (!siteUrl) return null;
+  const target = siteUrl.replace(/\/+$/, '');
+
+  // Try 1: Fetch /data/setting.json on the website
+  try {
+    const jsonRes = await fetch(`${target}/data/setting.json`, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(4000) });
+    if (jsonRes.ok) {
+      const parsed = await jsonRes.json().catch(() => null);
+      if (parsed) {
+        const tz = resolveTimezoneFromData(parsed);
+        if (tz.iana) return { ...tz, source: `${target}/data/setting.json` };
+      }
+    }
+  } catch {}
+
+  // Try 2: Fetch /data/footer.json on the website
+  try {
+    const jsonRes = await fetch(`${target}/data/footer.json`, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(4000) });
+    if (jsonRes.ok) {
+      const parsed = await jsonRes.json().catch(() => null);
+      if (parsed) {
+        const tz = resolveTimezoneFromData(parsed);
+        if (tz.iana) return { ...tz, source: `${target}/data/footer.json` };
+      }
+    }
+  } catch {}
+
+  // Try 3: Fetch website homepage HTML (Schema streetAddress or footer)
+  try {
+    const htmlRes = await fetch(target, { headers: { 'User-Agent': 'Mozilla/5.0' }, signal: AbortSignal.timeout(5000) });
+    if (htmlRes.ok) {
+      const html = await htmlRes.text();
+      const addressMatch = html.match(/itemprop=["']streetAddress["'][^>]*>([^<]+)<\/span>/i)
+        || html.match(/\b\d{1,5}\s+[\w\s.,#-]+,\s*[A-Za-z]{2}[,\s\-.]+\d{5}\b/i);
+      const addressText = addressMatch ? (addressMatch[1] || addressMatch[0]) : html;
+      const state = usStateFromAddress(addressText) || usStateFromZip(html);
+      if (state && US_TIMEZONE_BY_STATE[state]) {
+        const mapped = US_TIMEZONE_BY_STATE[state];
+        return {
+          address: addressMatch ? (addressMatch[1] || addressMatch[0]) : `State detected from ${target}`,
+          state,
+          iana: mapped[0],
+          cmsLabel: mapped[1],
+          source: `${target} (website)`
+        };
+      }
+    }
+  } catch {}
+
+  return null;
+}
+
+async function discoverProjectTimezone(page, baseUrl, { selectedDomain = null, website = null, ticketText = null } = {}) {
   let fallback = { address: null, iana: null, cmsLabel: null, source: null };
   const filenames = ['setting.json', 'settings.json', 'footer.json'];
 
-  if (!page.url().startsWith(`${baseUrl}/files`)) {
-    await page.goto(`${baseUrl}/files`, { waitUntil: 'domcontentloaded', timeout: 45000 });
-  }
-  const dataFolder = await waitForVisibleMatch(page.getByText('data', { exact: true }), 'data folder', true, 8000).catch(() => null);
-  if (!dataFolder) {
-    return {
-      address: null,
-      state: null,
-      iana: DEFAULT_US_TIMEZONE.iana,
-      cmsLabel: DEFAULT_US_TIMEZONE.cmsLabel,
-      source: 'default-us-timezone'
-    };
-  }
-  await dataFolder.click();
-  await page.waitForTimeout(300);
+  try {
+    if (!page.url().startsWith(`${baseUrl}/files`)) {
+      await page.goto(`${baseUrl}/files`, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    }
+    const folder = await waitForVisibleMatch(
+      page.locator('text=/^\\s*(?:data|content)\\s*$/i').first(),
+      'data or content folder',
+      true,
+      4000
+    ).catch(() => null);
 
-  for (const filename of filenames) {
-    const file = page.getByText(filename, { exact: true }).first();
-    const isVisible = await file.isVisible().catch(() => false);
-    if (!isVisible) continue;
-
-    await file.click();
-    await page.locator('.jsoneditor, .ace_editor, pre, code, [class*="editor"]').first().waitFor({ state: 'visible', timeout: 2000 }).catch(() => {});
-    const body = await page.locator('body').innerText();
-    const marker = body.lastIndexOf(filename);
-    const raw = extractJsonObject(marker >= 0 ? body.slice(marker) : body);
-    let parsed = null;
-    try { parsed = JSON.parse(repairWrappedJson(raw)); } catch { /* ignore */ }
-
-    if (parsed) {
-      const timezone = { ...resolveTimezoneFromData(parsed), source: `data/${filename}` };
-      if (timezone.address) fallback = timezone;
-      if (timezone.iana) return timezone;
+    if (folder) {
+      await folder.dblclick().catch(() => folder.click().catch(() => {}));
+      await page.waitForTimeout(300);
     }
 
-    await page.goBack({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => {});
-    await page.waitForTimeout(200);
-  }
+    for (const filename of filenames) {
+      const file = page.getByText(filename, { exact: true }).first();
+      const isVisible = await file.isVisible().catch(() => false);
+      if (!isVisible) continue;
+
+      await file.click();
+      await page.locator('.jsoneditor, .ace_editor, pre, code, [class*="editor"]').first().waitFor({ state: 'visible', timeout: 2000 }).catch(() => {});
+
+      // Extract full text from Ace / Monaco / JSONEditor / textarea if available
+      const editorValue = await page.evaluate(() => {
+        const aceEl = document.querySelector('.ace_editor');
+        if (aceEl) {
+          if (aceEl.env?.editor?.getValue) return aceEl.env.editor.getValue();
+          if (window.ace?.edit) {
+            try { return window.ace.edit(aceEl).getValue(); } catch {}
+          }
+        }
+        if (window.monaco?.editor?.getEditors) {
+          const eds = window.monaco.editor.getEditors();
+          if (eds.length > 0 && eds[0].getValue) return eds[0].getValue();
+        }
+        const jsonEl = document.querySelector('.jsoneditor');
+        if (jsonEl?.jsoneditor?.getText) return jsonEl.jsoneditor.getText();
+        const ta = document.querySelector('textarea:not(.ace_text-input)');
+        if (ta && ta.value) return ta.value;
+        const pre = document.querySelector('pre, code');
+        if (pre && pre.innerText) return pre.innerText;
+        return null;
+      }).catch(() => null);
+
+      const body = await page.locator('body').innerText();
+      const marker = body.lastIndexOf(filename);
+      const raw = editorValue || extractJsonObject(marker >= 0 ? body.slice(marker) : body);
+      let parsed = null;
+      try { parsed = JSON.parse(repairWrappedJson(raw)); } catch { /* ignore */ }
+
+      if (parsed) {
+        const timezone = { ...resolveTimezoneFromData(parsed), source: `data/${filename}` };
+        if (timezone.address) fallback = timezone;
+        if (timezone.iana) return timezone;
+      } else if (raw) {
+        // Even if JSON parsing failed, attempt to find state/zip in raw text
+        const rawState = usStateFromAddress(raw) || usStateFromZip(raw);
+        if (rawState && US_TIMEZONE_BY_STATE[rawState]) {
+          const mapped = US_TIMEZONE_BY_STATE[rawState];
+          return {
+            address: `Extracted from raw ${filename}`,
+            state: rawState,
+            iana: mapped[0],
+            cmsLabel: mapped[1],
+            source: `data/${filename}`
+          };
+        }
+      }
+
+      await page.goBack({ waitUntil: 'domcontentloaded', timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(200);
+    }
+  } catch {}
 
   if (fallback.iana) return fallback;
+
+  // Layer 2: Check website live URL, preview URL, or selected domain
+  const siteUrls = [
+    selectedDomain ? (selectedDomain.startsWith('http') ? selectedDomain : `https://${selectedDomain}`) : null,
+    website?.liveUrl,
+    website?.previewUrl
+  ].filter(Boolean);
+
+  for (const siteUrl of siteUrls) {
+    try {
+      const siteTz = await fetchTimezoneFromWebsite(siteUrl);
+      if (siteTz?.iana) return siteTz;
+    } catch {}
+  }
+
+  // Layer 3: Check ticket text
+  if (ticketText) {
+    const ticketState = usStateFromAddress(ticketText) || usStateFromZip(ticketText);
+    if (ticketState && US_TIMEZONE_BY_STATE[ticketState]) {
+      const mapped = US_TIMEZONE_BY_STATE[ticketState];
+      return {
+        address: 'Extracted from ticket notes',
+        state: ticketState,
+        iana: mapped[0],
+        cmsLabel: mapped[1],
+        source: 'ticket-text'
+      };
+    }
+  }
+
   return {
     address: fallback.address,
     state: fallback.state || null,
@@ -2554,25 +3018,77 @@ async function setPopupTimezone(page, timezone) {
   // Announcement 1.0.38 moved away from the per-popup Timezone selector.
   // Keep using the project-address timezone for date calculations, but do
   // not fail the workflow when this older control is absent from the new UI.
-  const label = await visibleLabel(page, 'Timezone', true).catch(() => null);
-  if (!label) return { applied: false, supported: false };
-  const id = await label.getAttribute('for');
-  if (!id) throw new Error('The "Timezone" control has no associated ID.');
-  const control = await visibleMatch(page.locator(`[id="${id}"]`), 'The "Timezone" control', true);
-  if (!control) throw new Error('The "Timezone" control was not found.');
-  if ((await control.innerText()).trim() === timezone.cmsLabel) return { applied: false, supported: true };
+  let label = await visibleLabel(page, 'Timezone', true).catch(() => null);
+  if (!label) {
+    const customLabels = page.locator('label, div, span, p').filter({ hasText: /^Timezone$/i });
+    const count = await customLabels.count().catch(() => 0);
+    for (let i = count - 1; i >= 0; i -= 1) {
+      const c = customLabels.nth(i);
+      if (await isElementDisplayed(c)) {
+        label = c;
+        break;
+      }
+    }
+  }
+
+  let control = null;
+  let id = null;
+  if (label) {
+    id = await label.getAttribute('for').catch(() => null);
+    if (id) {
+      control = await visibleMatch(page.locator(`[id="${id}"]`), null, true).catch(() => null);
+    }
+    if (!control) {
+      const container = label.locator('xpath=ancestor::div[.//button[normalize-space()="Save"] or contains(@class, "form-item")][1]');
+      control = await visibleMatch(container.locator('[role="combobox"], input, .el-select, button').filter({ hasNotText: /^Save$/i }), null, true).catch(() => null);
+    }
+  }
+  if (!control) {
+    const direct = page.locator('[role="combobox"]:has-text("UTC"), input[value*="UTC"], button:has-text("UTC"), .el-select:has-text("UTC")');
+    if (await direct.count().catch(() => 0) > 0) {
+      control = direct.first();
+    }
+  }
+  if (!control) return { applied: false, supported: false, cmsLabel: timezone?.cmsLabel || null };
+
+  const currentText = (await control.innerText().catch(() => '')).trim()
+    || (await control.inputValue().catch(() => '')).trim();
+  if (currentText.includes(timezone.cmsLabel.split(' (')[0])) {
+    return { applied: false, supported: true, cmsLabel: timezone.cmsLabel };
+  }
+
   await control.click();
-  const search = await visibleMatch(page.locator('input[placeholder="Search timezone..."]'), 'Timezone search', true);
-  await search.fill(timezone.cmsLabel.split(' (')[0]);
-  const option = await visibleMatch(page.getByText(timezone.cmsLabel, { exact: true }), 'Timezone option', true);
-  await option.click();
-  await page.waitForFunction(({ fieldId, label }) => document.getElementById(fieldId)?.innerText.trim() === label, { fieldId: id, label: timezone.cmsLabel }, { timeout: 5000 });
+  await page.waitForTimeout(300);
+  const search = await visibleMatch(page.locator('input[placeholder*="Search timezone" i], input[placeholder*="timezone" i], input[placeholder*="Search" i]'), null, true).catch(() => null);
+  if (search) {
+    await search.fill(timezone.cmsLabel.split(' (')[0]);
+    await page.waitForTimeout(200);
+  }
+  const option = await visibleMatch(
+    page.getByText(timezone.cmsLabel, { exact: true }),
+    null,
+    true
+  ).catch(() => null) || await visibleMatch(
+    page.locator('.el-select-dropdown__item, [role="option"], li').filter({ hasText: timezone.cmsLabel.split(' (')[0] }),
+    'Timezone option',
+    true
+  ).catch(() => null);
+
+  if (option) await option.click();
+  await page.waitForTimeout(300);
+
   // Timezone is a project setting. Commit it before interacting with any date
   // picker so NewZen serializes start/end values in the intended timezone.
-  const save = await waitForSaveEnabled(page);
-  await save.click();
+  const tzContainer = control.locator('xpath=ancestor::div[.//button[normalize-space()="Save"]][1]');
+  const tzSave = tzContainer.locator('button', { hasText: /^Save$/ }).first();
+  if (await tzSave.count() > 0 && await isElementDisplayed(tzSave)) {
+    await tzSave.click();
+  } else {
+    const save = await waitForSaveEnabled(page).catch(() => null);
+    if (save) await save.click();
+  }
   await page.waitForTimeout(600);
-  return { applied: true, supported: true };
+  return { applied: true, supported: true, cmsLabel: timezone.cmsLabel };
 }
 async function main() {
   const ticketUrl = httpsUrl(value('--ticket-url'), '--ticket-url');
@@ -2645,6 +3161,13 @@ async function main() {
       );
       plan.ticket.attachmentCount = ticketContext.attachmentCandidates.length;
       plan.ticket = resolveRemovalScopeFromAttachments(plan.ticket, ticketContext.attachmentCandidates);
+      if (plan.ticket.actionSummary) {
+        progress('ticket-plan', `Kế hoạch thực hiện: ${plan.ticket.actionSummary}`, {
+          action: plan.ticket.popupAction,
+          summary: plan.ticket.actionSummary,
+          topic: plan.ticket.removalTopic || null
+        });
+      }
       if (ticketContext.attachmentCandidates.length === 1 && !plan.ticket.popupAttachmentIndex) {
         // A sole visible image attachment is unambiguous even if Gemini is
         // unavailable. Retain the numbered choice so the downloader cannot
@@ -2677,7 +3200,10 @@ async function main() {
           });
         }
         progress('site-id', `Đã nhận diện Website ID ${plan.ticket.siteId}`, { siteId: plan.ticket.siteId });
-        const actionNeedsTicketImage = popupActionNeedsTicketImage(plan.ticket.popupAction);
+        const actionNeedsTicketImage = popupActionNeedsTicketImage(
+          plan.ticket.popupAction,
+          ticketContext.attachmentCandidates.length
+        );
         let attachmentDecision = attachmentPlanForTicket({
           popupAction: plan.ticket.popupAction,
           attachmentCount: ticketContext.attachmentCandidates.length,
@@ -3010,25 +3536,164 @@ async function main() {
           plan.popupSection = { exists: null, sectionId: null, checked: false };
 
           if (isPopupRemovalAction(plan.ticket.popupAction)) {
-            // A removal must never install/update a plugin, replace a section,
-            // or infer a timezone. It operates only on the existing popup
-            // items the ticket asks to remove.
+            const isTopicRemoval = plan.ticket.popupAction === 'remove-one' && !downloadedAttachment;
             plan.status = 'ready-to-remove-popup';
             plan.nextAction = plan.ticket.popupAction === 'remove-all'
               ? 'Ticket requests removal of every current popup. Apply will delete existing popup items and Build only after verification.'
-              : 'Ticket includes a popup reference image. Apply will use Gemini Vision to match exactly one current CMS popup before deleting it.';
+              : isTopicRemoval
+                ? 'Ticket requests removal of a specific popup described in the note. Apply will use Gemini Vision to inspect current CMS popups and delete the matching one.'
+                : 'Ticket includes a popup reference image. Apply will use Gemini Vision to match exactly one current CMS popup before deleting it.';
             if (applyChanges) {
               plan.safety = buildRequested
                 ? 'CMS popup-removal and Build/publish were explicitly requested.'
                 : 'CMS popup-removal was explicitly requested. Build/publish was not requested.';
-              const removal = await removePopupForTicket(
-                page,
-                baseUrl,
-                runDir,
-                body,
-                plan.ticket.popupAction,
-                downloadedAttachment
-              );
+
+              let sectionVersionInfo = { expectedToken: null, sections: [], legacySectionIds: [] };
+              try {
+                sectionVersionInfo = await inspectAnnouncementSectionVersions(page, baseUrl, plan.plugin.version);
+                plan.legacySection = {
+                  expectedVersion: sectionVersionInfo.expectedToken,
+                  legacyCount: sectionVersionInfo.legacySectionIds.length
+                };
+              } catch (error) {
+                // Section version check fallback
+              }
+
+              const pluginStateBeforeApply = plan.plugin.state;
+              const mustUpgrade = pluginStateBeforeApply === 'outdated'
+                || pluginStateBeforeApply === 'missing'
+                || sectionVersionInfo.legacySectionIds.length > 0
+                || (plan.plugin.version && announcementSectionVersionToken(plan.plugin.version) !== '1038');
+
+              let removal;
+              if (mustUpgrade) {
+                progress('timezone-check', 'Reading project address to resolve popup timezone');
+                plan.timezone = await discoverProjectTimezone(page, baseUrl, {
+                  selectedDomain: plan.cms?.selectedDomain,
+                  website: plan.website,
+                  ticketText: plan.ticket?.raw
+                });
+
+                progress('legacy-popup-snapshot', 'Reading active popups before plugin update and section replacement');
+                const legacyPopupSnapshot = await snapshotActiveLegacyPopups(page, baseUrl, plan.timezone, runDir, {
+                  preserveActive: true
+                });
+
+                if (!legacyPopupSnapshot.scannedItems.length) {
+                  removal = { scope: 'all', sectionCount: 0, removedCount: 0, changed: false };
+                } else if (plan.ticket.popupAction === 'remove-all') {
+                  progress('popup-removal-all', 'Removing every current popup item requested by the ticket');
+                  progress('plugin-apply', 'Updating Announcement plugin to latest version');
+                  plan.plugin = await ensureAnnouncementPlugin(page, baseUrl);
+                  progress('section-apply', 'Recreating Announcement section on latest plugin version');
+                  plan.popupSection = await ensurePopupSection(page, baseUrl, {
+                    replaceExisting: true,
+                    expectedPluginVersion: plan.plugin.version,
+                    targetSectionIds: sectionVersionInfo.legacySectionIds
+                  });
+                  try {
+                    await openPopupSettings(page, plan.popupSection.sectionId);
+                    await deleteOneEmptyPopupItem(page, 0).catch(() => {});
+                  } catch {}
+                  removal = {
+                    scope: 'all',
+                    changed: true,
+                    removedCount: legacyPopupSnapshot.scannedItems.length,
+                    sectionCount: 1,
+                    sectionId: plan.popupSection.sectionId,
+                    vision: null
+                  };
+                } else {
+                  // remove-one
+                  const popupCandidates = legacyPopupSnapshot.scannedItems.map((item, idx) => ({
+                    ...item,
+                    visionIndex: idx + 1,
+                    sectionId: 'cms',
+                    itemIndex: idx
+                  }));
+
+                  const prepared = preparePopupRemovalVision(downloadedAttachment, popupCandidates);
+                  if (!prepared.candidates.length || prepared.complete !== true || prepared.candidates.length !== popupCandidates.length) {
+                    const error = new Error(prepared.warnings.join(' ') || 'CMS popup images could not be prepared for Gemini Vision comparison.');
+                    error.stage = 'popup-removal-ambiguous';
+                    throw error;
+                  }
+
+                  progress('popup-removal-vision', downloadedAttachment
+                    ? 'Gemini Vision is matching the ticket image to the current CMS popup'
+                    : 'Gemini Vision đang đọc nội dung các popup trên CMS để xác định popup thông báo cần gỡ');
+                  const resolution = await resolveTicketPopupRemovalVision(body, prepared.reference, prepared.candidates);
+                  if (!resolution.selection) {
+                    const notFound = resolution.audit?.status === 'not-found';
+                    const auditWarning = resolution.audit?.warnings?.join(' ') || '';
+                    const error = new Error(notFound
+                      ? 'No current CMS popup matches the ticket request. No popup was removed and CMS Build was not started.'
+                      : (auditWarning ? `The tool could not identify CMS popups matching the ticket request (${auditWarning}). No popup was removed and CMS Build was not started.` : 'The tool could not identify CMS popups matching the ticket request. No popup was removed and CMS Build was not started.'));
+                    error.stage = notFound ? 'popup-removal-not-found' : 'popup-removal-ambiguous';
+                    error.vision = resolution.audit;
+                    throw error;
+                  }
+
+                  const targetIndices = new Set(
+                    (Array.isArray(resolution.selection?.indices) && resolution.selection.indices.length > 0
+                      ? resolution.selection.indices
+                      : [resolution.selection?.index]
+                    ).map((idx) => idx - 1)
+                  );
+
+                  const preservedPopups = legacyPopupSnapshot.items.filter((item) => {
+                    const scannedIdx = legacyPopupSnapshot.scannedItems.indexOf(item);
+                    return !targetIndices.has(scannedIdx);
+                  });
+
+                  progress('plugin-apply', 'Updating Announcement plugin to latest version');
+                  plan.plugin = await ensureAnnouncementPlugin(page, baseUrl);
+
+                  progress('section-apply', 'Recreating Announcement section on latest plugin version');
+                  plan.popupSection = await ensurePopupSection(page, baseUrl, {
+                    replaceExisting: true,
+                    expectedPluginVersion: plan.plugin.version,
+                    targetSectionIds: sectionVersionInfo.legacySectionIds
+                  });
+
+                  if (preservedPopups.length > 0) {
+                    progress('popup-migrate', `Đang đưa ${preservedPopups.length} popup còn lại sang section Announcement 1038 mới`);
+                    await configurePopup(page, null, null, plan.timezone, {
+                      replaceExisting: false,
+                      sectionId: plan.popupSection.sectionId,
+                      legacyPopups: preservedPopups
+                    });
+                  } else {
+                    try {
+                      await openPopupSettings(page, plan.popupSection.sectionId);
+                      await deleteOneEmptyPopupItem(page, 0).catch(() => {});
+                    } catch {}
+                  }
+
+                  const firstTargetIdx = Array.from(targetIndices)[0] ?? 0;
+                  removal = {
+                    scope: targetIndices.size > 1 ? 'multiple' : 'one',
+                    changed: targetIndices.size > 0,
+                    removedCount: targetIndices.size,
+                    sectionCount: 1,
+                    sectionId: plan.popupSection.sectionId,
+                    itemIndex: firstTargetIdx,
+                    imageUrl: legacyPopupSnapshot.scannedItems[firstTargetIdx]?.sourceImageUrl || null,
+                    vision: resolution.audit,
+                    visionRationale: resolution.selection.rationale,
+                    warnings: prepared.warnings
+                  };
+                }
+              } else {
+                removal = await removePopupForTicket(
+                  page,
+                  baseUrl,
+                  runDir,
+                  body,
+                  plan.ticket.popupAction,
+                  downloadedAttachment
+                );
+              }
               plan.popupRemoval = {
                 scope: removal.scope,
                 changed: removal.changed,
@@ -3128,7 +3793,11 @@ async function main() {
             }
           } else {
             progress('timezone-check', 'Reading project address to resolve popup timezone');
-            plan.timezone = await discoverProjectTimezone(page, baseUrl);
+            plan.timezone = await discoverProjectTimezone(page, baseUrl, {
+              selectedDomain: plan.cms?.selectedDomain,
+              website: plan.website,
+              ticketText: plan.ticket?.raw
+            });
 
           if (plan.plugin.state === 'missing') {
             plan.status = 'plugin-install-required';
@@ -3400,7 +4069,9 @@ async function main() {
                 positionMoved: configuredPopup.positionMoved === true,
                 start: configuredPopup.start,
                 expiry: configuredPopup.end,
-                timezone: plan.timezone.iana,
+                timezone: plan.timezone.cmsLabel || plan.timezone.iana,
+                cmsLabel: plan.timezone.cmsLabel,
+                timezoneIana: plan.timezone.iana,
                 timezoneControl: configuredPopup.timezoneControl,
                 replaced: configuredPopup.replacement.removed,
                 removedPopup: configuredPopup.replacement.previous || null,
@@ -3539,6 +4210,9 @@ module.exports = {
   waitForPopupListItemsPanel,
   popupListItemEditorIsOpen,
   ensurePopupSection,
+  openPageEditor,
+  popupSectionCards,
+  popupSectionCardById,
   openPopupSection,
   openPopupSettings,
   backToPopupSettings,
@@ -3554,7 +4228,11 @@ module.exports = {
   mustCreateFreshAnnouncementSection,
   extractJsonObject,
   repairWrappedJson,
+  usStateFromZip,
+  usStateFromAddress,
   resolveTimezoneFromData,
+  fetchTimezoneFromWebsite,
+  discoverProjectTimezone,
   recoverInterruptedLegacyMigration,
   setPopupImageLink,
   popupImageUploadControl,

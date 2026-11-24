@@ -111,10 +111,11 @@ function actionIsNegated(text, actionIndex) {
 
 function hasAffirmativePopupRemoval(text) {
   const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim();
-  const entity = String.raw`(?:pop[\s-]*ups?|announcements?|posters?|banners?|halloween|holiday)`;
+  const entity = String.raw`(?:pop[\s-]*ups?|announcements?|posters?|banners?|halloween|holiday|thong\s*bao(?:\s*nghi(?:\s*le)?)?)`;
   if (!new RegExp(String.raw`\b${entity}\b`, 'i').test(folded)) return false;
   const patterns = [
-    new RegExp(String.raw`\b(?:go|xoa|tat|thay)\s+(?:(?:toan\s+bo|tat\s+ca)\s+)?${entity}\b`, 'gi'),
+    new RegExp(String.raw`\b(?:go|xoa)\s+(?:giup|ho|dum|gium)?\s*(?:(?:em|e|team|ad|admin)\s*)?(?:(?:toan\s+bo|tat\s+ca|het)\s+)?${entity}\b`, 'gi'),
+    new RegExp(String.raw`\b(?:tat|thay)\s+(?:(?:toan\s+bo|tat\s+ca)\s+)?${entity}\b`, 'gi'),
     new RegExp(String.raw`\b(?:remove|delete|replace|turn\s+off)\b[^.;]{0,40}\b${entity}\b`, 'gi'),
     /\b(?:remove|delete|turn\s+off)\b[^.;]{0,20}\b(?:this|that|attached)\s+(?:one|image)\b/gi
   ];
@@ -493,6 +494,11 @@ function extractPopupLink(text) {
   return null;
 }
 
+function hasExplicitPopupStartDate(text) {
+  const folded = foldTicketText(text).toLowerCase();
+  return /\b(?:time\s*start|start\s*(?:date|time)|popup\s*start|show\s+from|display\s+from|(?:dang|len|hien|show)\s*(?:pop\s*up|poster|banner)?\s*tu\s*ngay|hen\s*(?:ngay|gio|lich)?.*(?:moi\s*)?(?:len|dang|hien|pop\s*up)|ngay\s*(?:bat\s*dau\s*)?(?:len|dang|hien)\s*popup|\b\d{1,2}[/.]\d{1,2}(?:[/.]\d{2,4})?\s*moi\s*(?:len|dang|hien|pop\s*up))\b/i.test(folded);
+}
+
 function ticketData(body, ticketUrl) {
   const raw = String(body || '');
   const text = raw.replace(/\s+/g, ' ').trim();
@@ -515,20 +521,21 @@ function ticketData(body, ticketUrl) {
   const expiry = isIndefinite ? null : (/\b(?:exp(?:\.|\b)|expiry\b|expiration\b|expires?\b|end\s*date\b)\s*[:\-]?\s*([^|\n]{3,50})/i.exec(text)?.[1]?.trim() || null);
   const fromPattern = String.raw`\bfrom\s*(?:date|time)?\s*[:=-]|\bfrom\s+(?:date|time)\b|\bfrom(?=\s+(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s*)?(?:${DATE_TOKEN_SOURCE}))`;
   const start = isIndefinite ? null : findTicketDate(raw, [
-    String.raw`\b(?:time\s*start|start\s*(?:date|time)?|popup\s*start|ngay\s*(?:bat\s*dau|dang|hien)|thoi\s*gian\s*(?:bat\s*dau|hien)|tu\s+ngay)\b`,
+    String.raw`\b(?:time\s*start|start\s*(?:date|time)?|popup\s*start|ngay\s*(?:bat\s*dau|dang|hien)|thoi\s*gian\s*(?:bat\s*dau|hien)|tu\s+ngay|hen(?:\s+(?:ngay|gio|lich))?)\b`,
     fromPattern
   ], [String.raw`\b(?:time\s*end|end\s*(?:date|time)?|exp(?:iry|iration)?|expires?|ngay\s*(?:het\s*han|ket\s*thuc)|den\s*(?:het|ngay)|toi\s*het|until)\b`]);
   const holidayClosureLabel = String.raw`\b(?:thong\s*bao\s*nghi\s*(?:le\s*)?(?:ngay)?|tiem\s*nghi\s*(?:le\s*)?(?:ngay)?|nghi\s*(?:le\s*)?(?:ngay)?|dong\s*cua\s*(?:ngay)?|closed\s*(?:on|for)?|closure\s*(?:on|for)?)\b`;
   const parsedExpiry = isIndefinite ? null : (findTicketDate(raw, [
-    String.raw`\b(?:time\s*end|end\s*(?:date|time)?|exp(?:iry|iration)?|expires?|popup\s*(?:end|expiry)|ngay\s*(?:het\s*han|ket\s*thuc)|thoi\s*gian\s*(?:het\s*han|ket\s*thuc)|den\s*(?:het|ngay)|toi\s*het|until|through|schedule\s*(?:go|remove|end)|lich\s*go|hen\s*(?:gio\s*)?go|go\s*(?:pop\s*up\s*)?vao(?:\s+cuoi)?\s*ngay|remove(?:\s+popup)?\s+on|(?:an|tat|go)\s*sau(?:\s*ngay)?|sau\s*ngay|(?:an|tat|go)\s*(?:vao\s*ngay|ngay|vao)|(?:hide|turn\s*off|take\s*down)\s*(?:after|on))\b`,
+    String.raw`\b(?:time\s*end|end\s*(?:date|time)?|exp(?:iry|iration)?|expires?|popup\s*(?:end|expiry)|ngay\s*(?:het\s*han|ket\s*thuc)|thoi\s*gian\s*(?:het\s*han|ket\s*thuc)|den\s*(?:het|ngay)|toi\s*het|han\s*(?:toi|den)|until|through|schedule\s*(?:go|remove|end)|lich\s*go|hen\s*(?:gio\s*)?go|go\s*(?:pop\s*up\s*)?vao(?:\s+cuoi)?\s*ngay|remove(?:\s+popup)?\s+on|(?:an|tat|go)\s*sau(?:\s*ngay)?|sau\s*ngay|(?:an|tat|go)\s*(?:vao\s*ngay|ngay|vao)|(?:hide|turn\s*off|take\s*down)\s*(?:after|on))\b`,
     holidayClosureLabel
   ]) || expiry);
+  const hasExplicitStart = !isIndefinite && hasExplicitPopupStartDate(raw);
   const range = isIndefinite ? null : popupRangeFromText(text);
   const holidayExpiry = isIndefinite ? null : findHolidayClosureExpiry(raw);
-  const popupStart = range?.start || start;
+  const popupStart = hasExplicitStart ? (range?.start || start) : null;
   const inferredMonthEnd = isIndefinite ? null : endOfMonthExpiryFromTicket(text);
   const popupEnd = range?.end || parsedExpiry || holidayExpiry || inferredMonthEnd?.date || null;
-  const popupStartDate = normalizeExpiry(popupStart);
+  const popupStartDate = hasExplicitStart ? normalizeExpiry(popupStart) : null;
   const popupEndDate = normalizeExpiry(popupEnd) || inferredMonthEnd?.date || null;
   const rangeState = isIndefinite
     ? { startDate: null, endDate: null, yearRolledOver: false, error: null }
@@ -587,8 +594,13 @@ function isPopupRemovalAction(action) {
   return action === 'remove-one' || action === 'remove-all';
 }
 
-function popupActionNeedsTicketImage(action) {
-  return action === 'create' || action === 'replace' || action === 'remove-one';
+function popupActionNeedsTicketImage(action, attachmentCount = null) {
+  if (action === 'create' || action === 'replace') return true;
+  if (action === 'remove-one') {
+    if (attachmentCount !== null) return attachmentCount > 0;
+    return true;
+  }
+  return false;
 }
 
 function resolveRemovalScopeFromAttachments(ticket, attachmentCandidates) {
@@ -618,6 +630,7 @@ function popupScheduleFromTicket(ticket, expiryOverride = null) {
 }
 
 module.exports = {
+  actionIsNegated,
   DATE_TOKEN_SOURCE,
   MONTH_NUMBERS,
   calendarDate,
@@ -637,6 +650,7 @@ module.exports = {
   reconcilePopupRange,
   endOfMonthExpiryFromTicket,
   extractPopupLink,
+  hasExplicitPopupStartDate,
   ticketData,
   isPopupRemovalAction,
   popupActionNeedsTicketImage,
