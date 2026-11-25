@@ -16,7 +16,9 @@ const {
   isEmptyPopupItem,
   resolveAddedPopupItemTarget,
   buildPopupEntriesForTickets,
-  setTimeDelaySlider
+  setTimeDelaySlider,
+  calendarMonthStart,
+  calendarHeading
 } = require('../src/cms/popup-editor');
 const {
   sectionCardLocatorById,
@@ -944,6 +946,46 @@ test('existingPopupSection waits for async Vue section card mount and matches AN
   });
   assert.equal(section.exists, true);
   assert.equal(section.sectionId, 'item_block_section#9');
+});
+
+test('calendarHeading reads active v-calendar month atomically without hanging on transient nth(1) titles', async () => {
+  const parsedUpper = calendarMonthStart('DECEMBER\n  2026');
+  assert.equal(parsedUpper.toISOString().slice(0, 10), '2026-12-01');
+
+  let positionalLocatorRead = false;
+  const mockCalendar = {
+    evaluate: async () => 'December 2026',
+    locator: () => {
+      positionalLocatorRead = true;
+      return { count: async () => 0 };
+    }
+  };
+
+  const heading = await calendarHeading(mockCalendar);
+  assert.equal(heading, 'December 2026');
+  assert.equal(positionalLocatorRead, false);
+
+  // Fallback path when evaluate is unavailable uses short innerText timeout and handles vanishing nth(1) gracefully
+  let calls = 0;
+  const transientTitle = {
+    isVisible: async () => true,
+    innerText: async (opts) => {
+      assert.equal(opts?.timeout, 1500);
+      if (calls === 0) {
+        calls += 1;
+        throw new Error('Timeout 1500ms exceeded waiting for nth(1)');
+      }
+      return 'November 2026';
+    }
+  };
+  const fallbackCalendar = {
+    locator: (sel) => ({
+      count: async () => 1,
+      nth: () => (sel === '.vc-header' ? { ...transientTitle, innerText: async () => 'November 2026' } : transientTitle)
+    })
+  };
+  const fallbackHeading = await calendarHeading(fallbackCalendar);
+  assert.equal(fallbackHeading, 'November 2026');
 });
 
 

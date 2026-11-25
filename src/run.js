@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { runDirectoryRoots } = require('./app-paths');
-const { launchToolBrowser, closeToolBrowser } = require('./browser-session');
+const { launchToolBrowser, closeToolBrowser, acquireSinglePage } = require('./browser-session');
 const {
   resolveTicketSemantics,
   resolveTicketVision,
@@ -3211,7 +3211,7 @@ async function main() {
     context = launched.context;
     profileDirectory = launched.profileDirectory;
     cleanupProfile = Boolean(launched.cleanupProfile);
-    const page = context.pages()[0] || await context.newPage();
+    const page = await acquireSinglePage(context);
     progress('crm', 'Đang mở ticket CRM');
     await openTicketDetails(page, ticketUrl);
     progress('crm-loaded', 'Đã tải nội dung ticket');

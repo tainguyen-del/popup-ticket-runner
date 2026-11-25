@@ -40,9 +40,11 @@ function todayInTimezone(iana) {
 }
 
 function calendarMonthStart(heading) {
-  const match = /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})$/.exec(heading);
+  const normalized = String(heading || '').replace(/\s+/g, ' ').trim();
+  const match = /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{4})$/i.exec(normalized);
   if (!match) return null;
-  const month = ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December'].indexOf(match[1]);
+  const months = ['january', 'february', 'march', 'april', 'may', 'june', 'july', 'august', 'september', 'october', 'november', 'december'];
+  const month = months.indexOf(match[1].toLowerCase());
   return new Date(Date.UTC(Number(match[2]), month, 1, 12));
 }
 
@@ -77,24 +79,85 @@ async function trySetPopupDateInput(page, control, id, date, defaultTime) {
   return false;
 }
 
-async function popupCalendar(page) {
-  const candidates = page.locator('.vc-date-picker-content, .vc-container');
-  const count = await candidates.count();
-  for (let index = count - 1; index >= 0; index -= 1) {
-    const candidate = candidates.nth(index);
-    if (!await candidate.isVisible().catch(() => false)) continue;
-    const title = await visibleMatch(candidate.locator('.vc-header .vc-title'), null, true);
-    if (title) return candidate;
-  }
+async function popupCalendar(page, timeout = 3500) {
+  const deadline = Date.now() + timeout;
+  const selector = '.vc-popover-content .vc-date-picker-content, .vc-popover-content .vc-container, .vc-date-picker-content, .vc-container';
+  do {
+    const candidates = page.locator(selector);
+    const count = await candidates.count().catch(() => 0);
+    for (let index = count - 1; index >= 0; index -= 1) {
+      const candidate = candidates.nth(index);
+      if (!await candidate.isVisible().catch(() => false)) continue;
+      if (typeof candidate.evaluate === 'function') {
+        const hasVisibleHeader = await candidate.evaluate((root) => {
+          const nodes = root.querySelectorAll('.vc-header .vc-title, .vc-title, .vc-header');
+          for (const node of nodes) {
+            const style = window.getComputedStyle(node);
+            const rect = node.getBoundingClientRect();
+            if (style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0) {
+              return true;
+            }
+          }
+          return false;
+        }).catch(() => false);
+        if (hasVisibleHeader) return candidate;
+      } else {
+        const title = await visibleMatch(candidate.locator('.vc-header .vc-title'), null, true);
+        if (title) return candidate;
+      }
+    }
+    if (Date.now() >= deadline) break;
+    await pageDelay(page, 100);
+  } while (Date.now() < deadline);
   throw new Error('Popup date calendar was not found.');
 }
 
 async function calendarHeading(calendar) {
+  // Read the active month/year heading atomically inside one evaluate() call so
+  // v-calendar's Vue transition removing an outgoing duplicate .vc-title (.nth(1))
+  // cannot leave Playwright hanging 30s on an unmounted positional locator.
+  if (calendar && typeof calendar.evaluate === 'function') {
+    const evaluated = await calendar.evaluate((root) => {
+      if (!root) return null;
+      const monthRe = /^(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}$/i;
+      const selectorGroups = ['.vc-header .vc-title', '.vc-title', '.vc-header'];
+      for (const selector of selectorGroups) {
+        const nodes = Array.from(root.querySelectorAll(selector));
+        const mountedNodes = nodes.filter((node) => {
+          const style = window.getComputedStyle(node);
+          if (style.display === 'none' || style.visibility === 'hidden') return false;
+          const rect = node.getBoundingClientRect();
+          return rect.width > 0 && rect.height > 0;
+        });
+        const nonTransparent = mountedNodes.filter((node) => window.getComputedStyle(node).opacity !== '0');
+        const activeNodes = nonTransparent.length > 0 ? nonTransparent : mountedNodes;
+        const visibleTexts = activeNodes
+          .map((node) => (node.innerText || node.textContent || '').replace(/\s+/g, ' ').trim())
+          .filter(Boolean);
+        const monthMatch = [...visibleTexts].reverse().find((text) => monthRe.test(text));
+        if (monthMatch) return monthMatch;
+        if (visibleTexts.length > 0) return visibleTexts[visibleTexts.length - 1];
+      }
+      return null;
+    }).catch(() => null);
+    if (evaluated) return evaluated;
+  }
+
   const title = await visibleMatch(calendar.locator('.vc-header .vc-title'), null, true)
     || await visibleMatch(calendar.locator('.vc-title'), null, true);
-  if (title) return (await title.innerText()).trim();
+  if (title) {
+    let text = await title.innerText({ timeout: 1500 }).catch(() => '');
+    if (!text || !text.trim()) {
+      const retryTitle = await visibleMatch(calendar.locator('.vc-header .vc-title'), null, false)
+        || await visibleMatch(calendar.locator('.vc-title'), null, false);
+      if (retryTitle) text = await retryTitle.innerText({ timeout: 1000 }).catch(() => '');
+    }
+    if (text && text.trim()) return text.replace(/\s+/g, ' ').trim();
+  }
   const header = await visibleMatch(calendar.locator('.vc-header'), 'Popup calendar month', true);
-  return (await header.innerText()).trim();
+  const headerText = await header.innerText({ timeout: 1500 }).catch(() => '');
+  if (!headerText || !headerText.trim()) throw new Error('Popup calendar month was not found.');
+  return headerText.replace(/\s+/g, ' ').trim();
 }
 
 async function calendarMoveControl(calendar, forward) {
@@ -137,10 +200,10 @@ async function popupCalendarDay(calendar, date) {
 }
 
 async function waitForCalendarMonthChange(page, calendar, before) {
-  for (let attempt = 0; attempt < 15; attempt += 1) {
+  for (let attempt = 0; attempt < 20; attempt += 1) {
     await page.waitForTimeout(100);
     const after = await calendarHeading(calendar).catch(() => null);
-    if (after && after !== before) return after;
+    if (after && after !== before && calendarMonthStart(after) !== null) return after;
   }
   throw new Error(`Popup calendar arrow did not change month from ${before}.`);
 }
@@ -151,22 +214,37 @@ async function setPopupDate(page, labelText, date, defaultTime) {
   if (currentValue && currentValue.includes(date)) return;
   if (await trySetPopupDateInput(page, control, id, date, defaultTime)) return;
   await control.click();
-  const calendar = await popupCalendar(page);
+  let calendar = await popupCalendar(page);
   for (let move = 0; move < 25; move += 1) {
     const day = await popupCalendarDay(calendar, date);
     if (day) {
-      await day.click();
+      await day.click({ timeout: 5000 }).catch(async () => {
+        calendar = await popupCalendar(page);
+        const retryDay = await popupCalendarDay(calendar, date);
+        if (!retryDay) throw new Error(`${labelText} date ${date} was no longer visible in the calendar.`);
+        await retryDay.click({ timeout: 5000 });
+      });
       await page.waitForFunction(({ fieldId, expected }) => document.getElementById(fieldId)?.value.startsWith(expected), { fieldId: id, expected: date }, { timeout: 5000 });
       return;
     }
-    const current = await calendarHeading(calendar);
+    let current = await calendarHeading(calendar).catch(() => null);
+    if (!current || calendarMonthStart(current) === null) {
+      await pageDelay(page, 150);
+      calendar = await popupCalendar(page);
+      current = await calendarHeading(calendar);
+    }
     const distance = calendarMonthDistance(current, date);
     if (distance === null) throw new Error(`Popup calendar month could not be read: ${current}`);
     if (distance === 0) throw new Error(`${labelText} date ${date} is missing from the visible CMS calendar month.`);
     const forward = distance > 0;
-    const arrow = await calendarMoveControl(calendar, forward);
+    let arrow = await calendarMoveControl(calendar, forward);
     if (!arrow) throw new Error(`Popup calendar ${forward ? 'next' : 'previous'} month arrow was not found.`);
-    await arrow.click({ force: true });
+    await arrow.click({ force: true, timeout: 5000 }).catch(async () => {
+      calendar = await popupCalendar(page);
+      arrow = await calendarMoveControl(calendar, forward);
+      if (!arrow) throw new Error(`Popup calendar ${forward ? 'next' : 'previous'} month arrow was not found.`);
+      await arrow.click({ force: true, timeout: 5000 });
+    });
     await waitForCalendarMonthChange(page, calendar, current);
   }
   throw new Error(`${labelText} date ${date} was not available in the calendar.`);
@@ -208,6 +286,10 @@ async function clearPopupDateControl(page, labelText) {
     await control.fill('').catch(() => {});
   }
   await page.waitForFunction((fieldId) => !(document.getElementById(fieldId)?.value || '').trim(), id, { timeout: 3000 }).catch(() => {});
+  if (typeof control.evaluate === 'function') {
+    await control.evaluate((el) => el.blur?.()).catch(() => {});
+  }
+  await pageDelay(page, 150);
   return true;
 }
 

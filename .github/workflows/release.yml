@@ -46,6 +46,12 @@ jobs:
           body: |
             ## Popup Ticket Runner v${{ steps.pkg.outputs.version }}
             - Commit: `${{ github.sha }}`
+            - **Sửa lỗi timeout 30s ở bộ chọn ngày `v-calendar` trong Popup settings (Ticket #1609262):**
+              - Đọc tiêu đề tháng/năm (`calendarHeading`) nguyên tử qua `evaluate()` trên DOM đang hiển thị, bổ sung timeout ngắn và cơ chế retry thay vì treo 30s trên `.vc-title.nth(1)` khi Vue vừa unmount node transition.
+              - Bổ sung chờ popover lịch (`popupCalendar`), chuẩn hóa `calendarMonthStart`, retry khi click ngày/nút chuyển tháng và blur input sau `Clear` (`clearPopupDateControl`).
+            - **Sửa lỗi mở 2 tab (1 tab trống + 1 tab chạy ticket) thành chỉ mở 1 tab duy nhất:**
+              - Giữ cờ mặc định `--no-startup-window` ở nhánh non-persistent và bỏ `--new-window` dư thừa trong `launchToolBrowser` (`src/browser-session.js`), tránh Chrome tự mở thêm tab trống `chrome://newtab/`.
+              - Bổ sung `acquireSinglePage(context)` trong `src/run.js` để đóng mọi tab dư thừa khi khởi chạy ticket, chỉ giữ đúng 1 tab hoạt động (vẫn giữ nguyên luồng đăng nhập 2 tab).
             - **Sửa triệt để lỗi `popup-section-not-found` & nhận diện đúng ticket chỉnh thời gian vs tạo popup mới (Ticket #1608801):**
               - Loại trừ số địa chỉ hướng Nam (`15 S Main St`), thập niên (`80s`, `90s`) và chỉ số slider website (`slider 1`, `slider 2`) khỏi bộ lọc nhận diện thời lượng `extractPopupDuration` để tránh phân loại nhầm ticket tạo popup thành `update-duration`.
               - Mở rộng `hasAffirmativePosterUpload` và `mergeSemanticTicket` cho các cách diễn đạt tạo/up popup mới; khi ticket có ảnh đính kèm mới và có yêu cầu thời gian hiển thị, tool tự động chạy luồng upload poster kèm cài đặt `Time delay slider` thay vì chặn bởi luồng duration-only.

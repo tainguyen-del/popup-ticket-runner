@@ -9,6 +9,7 @@ const {
   clearStoredSession,
   launchToolBrowser,
   launchLoginBrowser,
+  acquireSinglePage,
   closeToolBrowser,
   persistActiveLoginProfile,
   clearActiveLoginProfile,
@@ -79,9 +80,7 @@ test('creates an isolated browser context and loads storage state only when requ
       assert.deepEqual(launchOptions, {
         channel: 'chrome',
         headless: false,
-        ignoreDefaultArgs: ['--no-startup-window'],
         args: [
-          '--new-window',
           '--start-maximized',
           '--disable-background-timer-throttling',
           '--disable-backgrounding-occluded-windows',
@@ -128,7 +127,6 @@ test('reopens the verified app-owned login profile visibly for a ticket run', as
         acceptDownloads: true,
         viewport: null,
         args: [
-          '--new-window',
           '--start-maximized',
           '--disable-background-timer-throttling',
           '--disable-backgrounding-occluded-windows',
@@ -214,4 +212,36 @@ test('skips native window focus outside Windows', async () => {
   } finally {
     fs.rmSync(loginProfile, { recursive: true, force: true });
   }
+});
+
+test('acquireSinglePage keeps one active tab and closes extra startup or restored tabs', async () => {
+  const closed = [];
+  let newPageCalls = 0;
+  const firstPage = { id: 'first', isClosed: () => false, close: async () => { closed.push('first'); } };
+  const blankTab = { id: 'blank', isClosed: () => false, close: async () => { closed.push('blank'); } };
+  const alreadyClosed = { id: 'dead', isClosed: () => true, close: async () => { closed.push('dead'); } };
+  const singleContext = {
+    pages: () => [alreadyClosed, firstPage, blankTab],
+    newPage: async () => {
+      newPageCalls += 1;
+      return { id: 'created', isClosed: () => false, close: async () => {} };
+    }
+  };
+
+  const selected = await acquireSinglePage(singleContext);
+  assert.equal(selected, firstPage);
+  assert.equal(newPageCalls, 0);
+  assert.deepEqual(closed, ['blank']);
+
+  const createdPage = { id: 'created', isClosed: () => false, close: async () => {} };
+  const emptyContext = {
+    pages: () => [],
+    newPage: async () => {
+      newPageCalls += 1;
+      return createdPage;
+    }
+  };
+  const fallbackSelected = await acquireSinglePage(emptyContext);
+  assert.equal(fallbackSelected, createdPage);
+  assert.equal(newPageCalls, 1);
 });

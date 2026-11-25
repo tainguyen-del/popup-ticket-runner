@@ -54,12 +54,14 @@ async function launchToolBrowser(root, {
   // normal, visible Chrome window. It is never the operator's Chrome profile.
   const profileDirectory = !headless && !fresh ? readActiveLoginProfile(root) : null;
   if (profileDirectory) {
+    // launchPersistentContext already passes about:blank to open Chrome's initial
+    // window; avoid --new-window so Chrome does not spawn an extra blank tab/window.
     const context = await browserType.launchPersistentContext(profileDirectory, {
       channel: 'chrome',
       headless: false,
       acceptDownloads,
       viewport: null,
-      args: ['--new-window', '--start-maximized', ...BACKGROUND_OPTIMIZATION_ARGS]
+      args: ['--start-maximized', ...BACKGROUND_OPTIMIZATION_ARGS]
     });
     return {
       browser: context.browser(),
@@ -71,11 +73,10 @@ async function launchToolBrowser(root, {
   }
   const launchOptions = { channel: 'chrome', headless };
   if (!headless) {
-    // A non-persistent browser receives --no-startup-window by default.
-    // Removing only that flag makes the fallback window visible while still
-    // allowing Playwright storageState to be loaded into its isolated context.
-    launchOptions.ignoreDefaultArgs = ['--no-startup-window'];
-    launchOptions.args = ['--new-window', '--start-maximized', ...BACKGROUND_OPTIMIZATION_ARGS];
+    // Keep Playwright's default --no-startup-window so Chrome does not open an
+    // unmanaged chrome://newtab/ window alongside the Playwright context window
+    // created by browser.newContext() + context.newPage().
+    launchOptions.args = ['--start-maximized', ...BACKGROUND_OPTIMIZATION_ARGS];
   }
   const browser = await browserType.launch(launchOptions);
   try {
@@ -261,6 +262,18 @@ async function persistStoredSession(context, root) {
   return statePath;
 }
 
+/**
+ * Acquire a single active page from context and close any extra startup or restored tabs.
+ */
+async function acquireSinglePage(context) {
+  const openPages = context.pages().filter((candidate) => !candidate?.isClosed?.());
+  const page = openPages[0] || await context.newPage();
+  for (const extraPage of openPages.slice(1)) {
+    await extraPage.close().catch(() => {});
+  }
+  return page;
+}
+
 async function closeToolBrowser({ browser, context, profileDirectory, cleanupProfile = false } = {}) {
   if (context) await context.close().catch(() => {});
   if (browser) await browser.close().catch(() => {});
@@ -272,6 +285,7 @@ module.exports = {
   clearStoredSession,
   launchToolBrowser,
   launchLoginBrowser,
+  acquireSinglePage,
   persistStoredSession,
   readActiveLoginProfile,
   persistActiveLoginProfile,
