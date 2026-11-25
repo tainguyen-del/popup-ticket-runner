@@ -9,6 +9,7 @@ const {
   cmsSafeUploadFilename,
   stageCmsUploadImage,
   geminiVisionMimeType,
+  isImageContainerComplete,
   visionCandidatesFromDownloads,
   visionCandidateFromLocalImage,
   preparePopupRemovalVision
@@ -166,4 +167,28 @@ test('creates a vision preview when a candidate exceeds MAX_IMAGE_BYTES and page
   assert.equal(prepared.candidates.length, 1);
   assert.equal(prepared.candidates[0].index, 1);
   assert.equal(prepared.candidates[0].mimeType, 'image/jpeg');
+});
+
+test('isImageContainerComplete detects valid vs truncated PNG and repairs truncated PNG via preview when page is provided', async (t) => {
+  const { directory, poster } = fixture(t);
+  assert.equal(isImageContainerComplete(PNG, 'image/png'), true);
+  // Truncate the last 10 bytes (removes IEND)
+  const truncatedPng = path.join(directory, 'truncated-chat.png');
+  fs.writeFileSync(truncatedPng, PNG.subarray(0, PNG.length - 10));
+  assert.equal(isImageContainerComplete(fs.readFileSync(truncatedPng), 'image/png'), false);
+
+  const download = { ...validateDownloadedImage(truncatedPng), candidateIndex: 5 };
+  let previewCalled = false;
+  const mockPage = {
+    evaluate: async () => {
+      previewCalled = true;
+      return { base64: PNG.toString('base64'), mimeType: 'image/jpeg' };
+    }
+  };
+
+  const prepared = await visionCandidatesFromDownloads([download], [{ index: 5, context: 'Chat screenshot' }], { page: mockPage });
+  assert.equal(previewCalled, true);
+  assert.equal(prepared.candidates.length, 1);
+  assert.equal(prepared.candidates[0].mimeType, 'image/jpeg');
+  assert.equal(prepared.warnings.length, 0);
 });

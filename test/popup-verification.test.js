@@ -209,3 +209,39 @@ test('popupItemsForReport maps CMS items safely for error reporting', () => {
   assert.equal(report[1].image, null);
   assert.equal(report[1].empty, true);
 });
+
+test('verifyPersistedPopupItem refuses stale pre-replacement image URL until Vue commits the new image', () => {
+  const schedule = { start: null, end: { date: '2026-11-26' } };
+  const oldUrl = 'https://cdn.example/monday-special.webp';
+  const newUrl = 'https://cdn.example/thanksgiving.webp';
+
+  const stale = verifyPersistedPopupItem({
+    afterItems: [
+      { image: 'https://cdn.example/other.webp', time_start: '', time_end: '' },
+      { image: oldUrl, time_start: '', time_end: '2026-11-26' }
+    ],
+    targetIndex: 1,
+    expectedCount: 2,
+    schedule,
+    timezone,
+    previewImageUrl: 'blob:https://cms.newzensite.com/temp-preview-id',
+    previousImageUrl: oldUrl
+  });
+  assert.equal(stale.ok, false);
+  assert.equal(stale.reason, 'target-image-not-updated');
+
+  const updated = verifyPersistedPopupItem({
+    afterItems: [
+      { image: 'https://cdn.example/other.webp', time_start: '', time_end: '' },
+      { image: newUrl, time_start: '', time_end: '2026-11-26' }
+    ],
+    targetIndex: 1,
+    expectedCount: 2,
+    schedule,
+    timezone,
+    previewImageUrl: 'blob:https://cms.newzensite.com/temp-preview-id',
+    previousImageUrl: oldUrl
+  });
+  assert.equal(updated.ok, true);
+  assert.equal(updated.item.image, newUrl);
+});

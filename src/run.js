@@ -9,7 +9,8 @@ const {
   resolveTicketSemantics,
   resolveTicketVision,
   resolveTicketPopupVisionSet,
-  resolveTicketPopupRemovalVision
+  resolveTicketPopupRemovalVision,
+  resolveVisualDuplicateConfirmation
 } = require('./semantic-ticket');
 const {
   foldTicketText,
@@ -713,6 +714,16 @@ async function visiblePopupSection(page, description = null) {
   return visibleMatch(page.getByText(/^(?:Annoucement|Announcement) Popup$/), description, true);
 }
 
+function sectionCardLocatorById(page, sectionId) {
+  const safeId = String(sectionId || '').replace(/"/g, '\\"');
+  return page.locator(`div[id="${safeId}"]`);
+}
+
+function isCorruptedSectionText(text) {
+  const trimmed = String(text || '').trim();
+  return /^N\/?A[\s\n]+N\/?A$/i.test(trimmed) || trimmed === 'N/A';
+}
+
 async function popupSectionCards(page, { includeCorrupted = false } = {}) {
   const cards = page.locator('div[id^="item_block_section#"]');
   const validCards = [];
@@ -721,8 +732,10 @@ async function popupSectionCards(page, { includeCorrupted = false } = {}) {
     const card = cards.nth(index);
     if (!await card.isVisible().catch(() => false)) continue;
     const text = (await card.innerText().catch(() => '')).trim();
-    if (/(?:^|\n)(?:Annoucement|Announcement) Popup(?:\n|$)/.test(text)) validCards.push(card);
-    else if (/^N\/?A[\s\n]+N\/?A$/i.test(text) || text === 'N/A') corruptedCards.push(card);
+    const cardId = await card.getAttribute('id').catch(() => null);
+    const stableCard = cardId ? sectionCardLocatorById(page, cardId).first() : card;
+    if (/(?:^|\n)(?:Annoucement|Announcement) Popup(?:\n|$)/.test(text)) validCards.push(stableCard);
+    else if (isCorruptedSectionText(text)) corruptedCards.push(stableCard);
   }
   if (includeCorrupted) {
     return [...validCards, ...corruptedCards];
@@ -827,7 +840,7 @@ async function deleteLegacyPopupSections(page, targetSectionIds = []) {
 
   // 1. Delete sections by target ID recorded before plugin update (even if CMS renamed them to N/A)
   for (const id of targetIds) {
-    const card = page.locator(`div#${id}`);
+    const card = sectionCardLocatorById(page, id).first();
     if (await card.isVisible().catch(() => false)) {
       const deleted = await deleteSectionCard(page, card).catch(() => false);
       if (deleted) removedCount += 1;
@@ -850,7 +863,7 @@ async function deleteLegacyPopupSections(page, targetSectionIds = []) {
     const card = allCards.nth(i);
     if (!await card.isVisible().catch(() => false)) continue;
     const text = (await card.innerText().catch(() => '')).trim();
-    if (/^N\/?A[\s\n]+N\/?A$/i.test(text) || text === 'N/A') {
+    if (isCorruptedSectionText(text)) {
       const deleted = await deleteSectionCard(page, card).catch(() => false);
       if (deleted) removedCount += 1;
     }
@@ -903,19 +916,22 @@ async function ensurePopupSection(page, baseUrl, { replaceExisting = false, expe
   if (!createdCard) {
     throw new Error(`CMS did not render a new Announcement section for plugin ${expectedPluginVersion || 'version unknown'}.`);
   }
-  // Clean up any remaining orphaned N/A section cards in the editor
+  // Clean up any remaining orphaned N/A section cards before resolving final sectionId
+  // so deleting an N/A card above cannot shift positional locators of the new section.
   const orphanCards = page.locator('div[id^="item_block_section#"]');
   for (let i = (await orphanCards.count()) - 1; i >= 0; i -= 1) {
     const card = orphanCards.nth(i);
     if (!await card.isVisible().catch(() => false)) continue;
     const text = (await card.innerText().catch(() => '')).trim();
-    if (/^N\/?A[\s\n]+N\/?A$/i.test(text) || text === 'N/A') {
+    if (isCorruptedSectionText(text)) {
       await deleteSectionCard(page, card).catch(() => false);
     }
   }
+  const finalCards = await popupSectionCards(page);
+  const finalCard = (await popupSectionCardForVersion(finalCards, expectedToken)) || createdCard || finalCards.at(-1);
   return {
     exists: true,
-    sectionId: await createdCard.getAttribute('id'),
+    sectionId: await finalCard.getAttribute('id'),
     created: true,
     replaced: removedCount > 0,
     removedCount
@@ -975,7 +991,7 @@ async function isPopupSectionEditorAlreadyOpen(page) {
   }).catch(() => false);
 }
 
-async function openPopupSection(page, sectionId = null) {
+async function openPopupSection(page, sectionId = null, { openTimeoutMs = 15000 } = {}) {
   // If Announcement Popup editor is already open (Preview / Slide direction style / Add block / Popup_setting),
   // do not re-click the background section card in the page editor. Clicking the background card while
   // the section drawer is open causes Playwright to fail with a 30s timeout because the drawer overlay
@@ -994,46 +1010,65 @@ async function openPopupSection(page, sectionId = null) {
     card = await popupSectionCardById(page, sectionId);
   }
 
-  if (card) {
-    const section = await visibleMatch(card.getByText(/^(?:Annoucement|Announcement) Popup$/), 'Announcement section', true)
-      || await visibleMatch(card.locator('span, div, p').filter({ hasText: /^N\/A$/ }), 'Announcement section', true)
-      || card;
-    if (section) {
-      await section.click();
-      await page.waitForTimeout(400);
+  const findSectionClickTarget = async (targetCard) => {
+    if (!targetCard) return null;
+    return await visibleMatch(targetCard.getByText(/^(?:Annoucement|Announcement) Popup$/), null, true).catch(() => null)
+      || await visibleMatch(targetCard.locator('span, div, p').filter({ hasText: /^N\/A$/ }), null, true).catch(() => null)
+      || targetCard;
+  };
+
+  const section = await findSectionClickTarget(card);
+  if (section) {
+    if (typeof section.scrollIntoViewIfNeeded === 'function') {
+      await section.scrollIntoViewIfNeeded().catch(() => {});
     }
+    await section.click().catch(async () => {
+      if (typeof section.evaluate === 'function') {
+        await section.evaluate((el) => el.click()).catch(() => {});
+      }
+    });
+    await page.waitForTimeout(300);
   }
 
-  // Wait for drawer to open without spamming clicks in a loop!
-  const deadline = Date.now() + 10000;
-  while (Date.now() < deadline) {
+  // Wait for drawer to open; if still closed after an initial wait, retry cleanly
+  // with fresh card lookup + forced/DOM click before waiting out the full timeout.
+  const overallDeadline = Date.now() + openTimeoutMs;
+  const firstPhaseDeadline = Math.min(overallDeadline, Date.now() + Math.min(4000, Math.max(400, openTimeoutMs)));
+  while (Date.now() < firstPhaseDeadline) {
     if (await isPopupSectionEditorAlreadyOpen(page)) {
       const settingsCard = await visibleMatch(page.getByText(/Popup[\s_]setting/i), null, true).catch(() => null)
         || await visibleMatch(page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")'), null, true).catch(() => null)
         || page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")').first();
       return settingsCard;
     }
-    await page.waitForTimeout(250);
+    await page.waitForTimeout(200);
   }
 
-  // If still not open after 10s, attempt a single fallback click
-  const retrySection = await visiblePopupSection(page, null);
-  if (retrySection) {
-    await retrySection.click().catch(() => {});
-    const retryDeadline = Date.now() + 5000;
-    while (Date.now() < retryDeadline) {
-      if (await isPopupSectionEditorAlreadyOpen(page)) {
-        return page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")').first();
+  // Retry once if still within timeout budget
+  if (Date.now() < overallDeadline) {
+    const retryCard = await popupSectionCardById(page, sectionId).catch(() => null);
+    const retryTarget = (await findSectionClickTarget(retryCard)) || (await visiblePopupSection(page, null).catch(() => null));
+    if (retryTarget) {
+      await retryTarget.click({ force: true }).catch(async () => {
+        await retryTarget.click().catch(() => {});
+      });
+      if (typeof retryTarget.evaluate === 'function' && !await isPopupSectionEditorAlreadyOpen(page)) {
+        await retryTarget.evaluate((el) => el.click()).catch(() => {});
       }
-      await page.waitForTimeout(250);
+      while (Date.now() < overallDeadline) {
+        if (await isPopupSectionEditorAlreadyOpen(page)) {
+          return page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")').first();
+        }
+        await page.waitForTimeout(250);
+      }
     }
   }
 
   throw new Error('Popup section editor did not open after the section was added.');
 }
 
-async function openPopupSettings(page, sectionId = null) {
-  await openPopupSection(page, sectionId);
+async function openPopupSettings(page, sectionId = null, options = {}) {
+  await openPopupSection(page, sectionId, options);
   const isAddBlockVisible = async () => {
     return isElementDisplayed(page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")').first());
   };
@@ -1130,10 +1165,13 @@ async function snapshotActiveLegacyPopups(page, baseUrl, timezone, runDir, { pre
   await openPageEditor(page, baseUrl);
   const cards = await popupSectionCards(page);
   const targetSectionIds = [];
+  const corruptedSectionIds = new Set();
   for (const card of cards) {
     const sectionId = await card.getAttribute('id');
+    const text = await card.innerText().catch(() => '');
     if (sectionId && !targetSectionIds.includes(sectionId)) {
       targetSectionIds.push(sectionId);
+      if (isCorruptedSectionText(text)) corruptedSectionIds.add(sectionId);
     }
   }
   const sectionIds = [];
@@ -1145,17 +1183,26 @@ async function snapshotActiveLegacyPopups(page, baseUrl, timezone, runDir, { pre
   fs.mkdirSync(assetDir, { recursive: true });
   for (let sIdx = 0; sIdx < targetSectionIds.length; sIdx += 1) {
     const sectionId = targetSectionIds[sIdx];
+    const isCorrupted = corruptedSectionIds.has(sectionId);
     if (sIdx > 0) {
       await openPageEditor(page, baseUrl);
       await waitForVisibleMatch(
-        page.locator(`div#${sectionId}`),
+        sectionCardLocatorById(page, sectionId),
         `Legacy announcement section ${sectionId}`,
         true,
         8000
       ).catch(() => {});
     }
     sectionIds.push(sectionId);
-    await openPopupSettings(page, sectionId);
+    try {
+      await openPopupSettings(page, sectionId, isCorrupted ? { openTimeoutMs: 4000 } : undefined);
+    } catch (error) {
+      if (isCorrupted) {
+        warnings.push(`Broken N/A section ${sectionId} could not be opened (${error.message}); queued for replacement.`);
+        continue;
+      }
+      throw error;
+    }
     const sectionDefaults = await page.evaluate(() => {
       const findVal = (field) => {
         const inputs = Array.from(document.querySelectorAll('input'));
@@ -1489,8 +1536,18 @@ async function popupPositionPersisted(page, beforeItems, imageUrl, position, tim
 }
 
 async function dragPopupImageToPosition(page, imageUrl, position) {
-  const before = await readPopupListItems(page);
-  const plan = planPopupPosition(before.items, [imageUrl], position);
+  let before = await readPopupListItems(page);
+  let plan = planPopupPosition(before.items, [imageUrl], position);
+  if (!plan.ok && plan.reason === 'target-image-match-count-0') {
+    // Wait briefly in case Vue list state is still committing after editing or cleaning blank cards.
+    const settleDeadline = Date.now() + 2500;
+    while (Date.now() < settleDeadline) {
+      await page.waitForTimeout(250);
+      before = await readPopupListItems(page);
+      plan = planPopupPosition(before.items, [imageUrl], position);
+      if (plan.ok || plan.reason !== 'target-image-match-count-0') break;
+    }
+  }
   if (!plan.ok) {
     const error = new Error(`Popup image position is ambiguous (${plan.reason}). CMS Build was not started.`);
     error.stage = 'popup-position-verification';
@@ -3224,23 +3281,50 @@ async function main() {
             visionCandidateDownloads = await downloadTicketCandidateImages(page, ticketUrl, runDir, {
               expectedAttachmentCount: ticketContext.attachmentCandidates.length
             });
-            const preparedVision = await visionCandidatesFromDownloads(visionCandidateDownloads, ticketContext.attachmentCandidates, { page });
-            if (preparedVision.candidates.length < 2) {
-              const error = new Error('Ticket contains multiple image attachments, but fewer than two could be validated locally. No CMS change was attempted.');
-              error.stage = 'attachment-selection';
-              throw error;
-            }
             progress('ticket-vision', 'Using Gemini Vision to verify the complete popup-poster set');
-            const visionResolution = await resolveTicketPopupVisionSet(body, preparedVision.candidates);
+            const { preparedVision, visionResolution } = await (async () => {
+              let prepared = await visionCandidatesFromDownloads(visionCandidateDownloads, ticketContext.attachmentCandidates, { page });
+              if (prepared.candidates.length < 2) {
+                const error = new Error('Ticket contains multiple image attachments, but fewer than two could be validated locally. No CMS change was attempted.');
+                error.stage = 'attachment-selection';
+                throw error;
+              }
+              let resolution = await resolveTicketPopupVisionSet(body, prepared.candidates);
+              const needsImageRecovery = !resolution.selection
+                && resolution.audit?.status === 'unavailable'
+                && (
+                  resolution.audit.errorCode === 'gemini-invalid-image'
+                  || /unable to process input image|http 400/i.test(String(resolution.audit.errorDetail || ''))
+                );
+              if (needsImageRecovery) {
+                progress('ticket-vision-retry', 'Đang chuẩn hóa lại định dạng ảnh đính kèm qua trình duyệt và thử lại Gemini Vision...');
+                const recovered = await visionCandidatesFromDownloads(visionCandidateDownloads, ticketContext.attachmentCandidates, { page, forcePreview: true });
+                if (recovered.candidates.length >= 2) {
+                  prepared = recovered;
+                  resolution = await resolveTicketPopupVisionSet(body, prepared.candidates);
+                }
+              }
+              return { preparedVision: prepared, visionResolution: resolution };
+            })();
             plan.vision = {
               ...visionResolution.audit,
               warnings: [...preparedVision.warnings, ...(visionResolution.audit.warnings || [])]
             };
             if (!visionResolution.selection) {
-              const message = visionResolution.audit.status === 'disabled'
-                ? 'Gemini Vision API key is not configured on this computer. Configure Gemini in the app before running a multi-poster ticket. No CMS change was attempted.'
-                : visionResolution.audit.status === 'unavailable'
-                  ? 'Gemini Vision could not be reached from this computer. Check the API key and network, then retry. No CMS change was attempted.'
+              const audit = visionResolution.audit || {};
+              const detail = audit.errorDetail || audit.warnings?.[0] || null;
+              const isKeyError = audit.status === 'disabled'
+                || audit.errorCode === 'gemini-key-missing'
+                || audit.errorCode === 'gemini-key-invalid';
+              const isNetworkError = /(?:fetch failed|network(?:\s+error)?|econn(?:reset|refused)|eai_again|enotfound|socket hang up|timed?\s*out|abort)/i.test(String(detail || ''));
+              const message = isKeyError
+                ? (audit.errorCode === 'gemini-key-invalid'
+                  ? 'Gemini Vision API key không hợp lệ hoặc đã hết hạn (Google báo: API key not valid). Hãy cấu hình API key mới.'
+                  : 'Gemini Vision API key is not configured on this computer. Configure Gemini in the app before running a multi-poster ticket. No CMS change was attempted.')
+                : audit.status === 'unavailable'
+                  ? (isNetworkError || !detail
+                    ? 'Gemini Vision could not be reached from this computer. Check the API key and network, then retry. No CMS change was attempted.'
+                    : `Gemini Vision failed (${detail}). No CMS change was attempted.`)
                   : 'Gemini Vision could not identify every requested popup poster with sufficient confidence. No CMS change was attempted.';
               const error = new Error(message);
               error.stage = 'attachment-selection';
@@ -3354,10 +3438,23 @@ async function main() {
               visionCandidateDownloads = await downloadTicketCandidateImages(page, ticketUrl, runDir, {
                 expectedAttachmentCount: ticketContext.attachmentCandidates.length
               });
-              const preparedVision = await visionCandidatesFromDownloads(visionCandidateDownloads, ticketContext.attachmentCandidates, { page });
+              let preparedVision = await visionCandidatesFromDownloads(visionCandidateDownloads, ticketContext.attachmentCandidates, { page });
               if (preparedVision.candidates.length) {
                 progress('ticket-vision', 'Đang dùng Gemini Vision để xác minh poster và đọc ngày hết hạn...');
-                const visionResolution = await resolveTicketVision(body, preparedVision.candidates);
+                let visionResolution = await resolveTicketVision(body, preparedVision.candidates);
+                const needsSingleRecovery = !visionResolution.selection
+                  && visionResolution.audit?.status === 'unavailable'
+                  && (
+                    visionResolution.audit.errorCode === 'gemini-invalid-image'
+                    || /unable to process input image|http 400/i.test(String(visionResolution.audit.errorDetail || ''))
+                  );
+                if (needsSingleRecovery) {
+                  const recovered = await visionCandidatesFromDownloads(visionCandidateDownloads, ticketContext.attachmentCandidates, { page, forcePreview: true });
+                  if (recovered.candidates.length) {
+                    preparedVision = recovered;
+                    visionResolution = await resolveTicketVision(body, preparedVision.candidates);
+                  }
+                }
                 plan.vision = {
                   ...visionResolution.audit,
                   warnings: [...preparedVision.warnings, ...(visionResolution.audit.warnings || [])]
@@ -3566,133 +3663,138 @@ async function main() {
                 || (plan.plugin.version && announcementSectionVersionToken(plan.plugin.version) !== '1038');
 
               let removal;
-              if (mustUpgrade) {
-                progress('timezone-check', 'Reading project address to resolve popup timezone');
-                plan.timezone = await discoverProjectTimezone(page, baseUrl, {
-                  selectedDomain: plan.cms?.selectedDomain,
-                  website: plan.website,
-                  ticketText: plan.ticket?.raw
-                });
-
-                progress('legacy-popup-snapshot', 'Reading active popups before plugin update and section replacement');
-                const legacyPopupSnapshot = await snapshotActiveLegacyPopups(page, baseUrl, plan.timezone, runDir, {
-                  preserveActive: true
-                });
-
-                if (!legacyPopupSnapshot.scannedItems.length) {
-                  removal = { scope: 'all', sectionCount: 0, removedCount: 0, changed: false };
-                } else if (plan.ticket.popupAction === 'remove-all') {
-                  progress('popup-removal-all', 'Removing every current popup item requested by the ticket');
-                  progress('plugin-apply', 'Updating Announcement plugin to latest version');
-                  plan.plugin = await ensureAnnouncementPlugin(page, baseUrl);
-                  progress('section-apply', 'Recreating Announcement section on latest plugin version');
-                  plan.popupSection = await ensurePopupSection(page, baseUrl, {
-                    replaceExisting: true,
-                    expectedPluginVersion: plan.plugin.version,
-                    targetSectionIds: sectionVersionInfo.legacySectionIds
-                  });
-                  try {
-                    await openPopupSettings(page, plan.popupSection.sectionId);
-                    await deleteOneEmptyPopupItem(page, 0).catch(() => {});
-                  } catch {}
-                  removal = {
-                    scope: 'all',
-                    changed: true,
-                    removedCount: legacyPopupSnapshot.scannedItems.length,
-                    sectionCount: 1,
-                    sectionId: plan.popupSection.sectionId,
-                    vision: null
-                  };
-                } else {
-                  // remove-one
-                  const popupCandidates = legacyPopupSnapshot.scannedItems.map((item, idx) => ({
-                    ...item,
-                    visionIndex: idx + 1,
-                    sectionId: 'cms',
-                    itemIndex: idx
-                  }));
-
-                  const prepared = preparePopupRemovalVision(downloadedAttachment, popupCandidates);
-                  if (!prepared.candidates.length || prepared.complete !== true || prepared.candidates.length !== popupCandidates.length) {
-                    const error = new Error(prepared.warnings.join(' ') || 'CMS popup images could not be prepared for Gemini Vision comparison.');
-                    error.stage = 'popup-removal-ambiguous';
-                    throw error;
-                  }
-
-                  progress('popup-removal-vision', downloadedAttachment
-                    ? 'Gemini Vision is matching the ticket image to the current CMS popup'
-                    : 'Gemini Vision đang đọc nội dung các popup trên CMS để xác định popup thông báo cần gỡ');
-                  const resolution = await resolveTicketPopupRemovalVision(body, prepared.reference, prepared.candidates);
-                  if (!resolution.selection) {
-                    const notFound = resolution.audit?.status === 'not-found';
-                    const auditWarning = resolution.audit?.warnings?.join(' ') || '';
-                    const error = new Error(notFound
-                      ? 'No current CMS popup matches the ticket request. No popup was removed and CMS Build was not started.'
-                      : (auditWarning ? `The tool could not identify CMS popups matching the ticket request (${auditWarning}). No popup was removed and CMS Build was not started.` : 'The tool could not identify CMS popups matching the ticket request. No popup was removed and CMS Build was not started.'));
-                    error.stage = notFound ? 'popup-removal-not-found' : 'popup-removal-ambiguous';
-                    error.vision = resolution.audit;
-                    throw error;
-                  }
-
-                  const targetIndices = new Set(
-                    (Array.isArray(resolution.selection?.indices) && resolution.selection.indices.length > 0
-                      ? resolution.selection.indices
-                      : [resolution.selection?.index]
-                    ).map((idx) => idx - 1)
-                  );
-
-                  const preservedPopups = legacyPopupSnapshot.items.filter((item) => {
-                    const scannedIdx = legacyPopupSnapshot.scannedItems.indexOf(item);
-                    return !targetIndices.has(scannedIdx);
+              try {
+                if (mustUpgrade) {
+                  progress('timezone-check', 'Reading project address to resolve popup timezone');
+                  plan.timezone = await discoverProjectTimezone(page, baseUrl, {
+                    selectedDomain: plan.cms?.selectedDomain,
+                    website: plan.website,
+                    ticketText: plan.ticket?.raw
                   });
 
-                  progress('plugin-apply', 'Updating Announcement plugin to latest version');
-                  plan.plugin = await ensureAnnouncementPlugin(page, baseUrl);
-
-                  progress('section-apply', 'Recreating Announcement section on latest plugin version');
-                  plan.popupSection = await ensurePopupSection(page, baseUrl, {
-                    replaceExisting: true,
-                    expectedPluginVersion: plan.plugin.version,
-                    targetSectionIds: sectionVersionInfo.legacySectionIds
+                  progress('legacy-popup-snapshot', 'Reading active popups before plugin update and section replacement');
+                  const legacyPopupSnapshot = await snapshotActiveLegacyPopups(page, baseUrl, plan.timezone, runDir, {
+                    preserveActive: true
                   });
 
-                  if (preservedPopups.length > 0) {
-                    progress('popup-migrate', `Đang đưa ${preservedPopups.length} popup còn lại sang section Announcement 1038 mới`);
-                    await configurePopup(page, null, null, plan.timezone, {
-                      replaceExisting: false,
-                      sectionId: plan.popupSection.sectionId,
-                      legacyPopups: preservedPopups
+                  if (!legacyPopupSnapshot.scannedItems.length) {
+                    removal = { scope: 'all', sectionCount: 0, removedCount: 0, changed: false };
+                  } else if (plan.ticket.popupAction === 'remove-all') {
+                    progress('popup-removal-all', 'Removing every current popup item requested by the ticket');
+                    progress('plugin-apply', 'Updating Announcement plugin to latest version');
+                    plan.plugin = await ensureAnnouncementPlugin(page, baseUrl);
+                    progress('section-apply', 'Recreating Announcement section on latest plugin version');
+                    plan.popupSection = await ensurePopupSection(page, baseUrl, {
+                      replaceExisting: true,
+                      expectedPluginVersion: plan.plugin.version,
+                      targetSectionIds: sectionVersionInfo.legacySectionIds
                     });
-                  } else {
                     try {
                       await openPopupSettings(page, plan.popupSection.sectionId);
                       await deleteOneEmptyPopupItem(page, 0).catch(() => {});
                     } catch {}
-                  }
+                    removal = {
+                      scope: 'all',
+                      changed: true,
+                      removedCount: legacyPopupSnapshot.scannedItems.length,
+                      sectionCount: 1,
+                      sectionId: plan.popupSection.sectionId,
+                      vision: null
+                    };
+                  } else {
+                    // remove-one
+                    const popupCandidates = legacyPopupSnapshot.scannedItems.map((item, idx) => ({
+                      ...item,
+                      visionIndex: idx + 1,
+                      sectionId: 'cms',
+                      itemIndex: idx
+                    }));
 
-                  const firstTargetIdx = Array.from(targetIndices)[0] ?? 0;
-                  removal = {
-                    scope: targetIndices.size > 1 ? 'multiple' : 'one',
-                    changed: targetIndices.size > 0,
-                    removedCount: targetIndices.size,
-                    sectionCount: 1,
-                    sectionId: plan.popupSection.sectionId,
-                    itemIndex: firstTargetIdx,
-                    imageUrl: legacyPopupSnapshot.scannedItems[firstTargetIdx]?.sourceImageUrl || null,
-                    vision: resolution.audit,
-                    visionRationale: resolution.selection.rationale,
-                    warnings: prepared.warnings
-                  };
+                    const prepared = preparePopupRemovalVision(downloadedAttachment, popupCandidates);
+                    if (!prepared.candidates.length || prepared.complete !== true || prepared.candidates.length !== popupCandidates.length) {
+                      const error = new Error(prepared.warnings.join(' ') || 'CMS popup images could not be prepared for Gemini Vision comparison.');
+                      error.stage = 'popup-removal-ambiguous';
+                      throw error;
+                    }
+
+                    progress('popup-removal-vision', downloadedAttachment
+                      ? 'Gemini Vision is matching the ticket image to the current CMS popup'
+                      : 'Gemini Vision đang đọc nội dung các popup trên CMS để xác định popup thông báo cần gỡ');
+                    const resolution = await resolveTicketPopupRemovalVision(body, prepared.reference, prepared.candidates);
+                    if (!resolution.selection) {
+                      const notFound = resolution.audit?.status === 'not-found';
+                      const auditWarning = resolution.audit?.warnings?.join(' ') || '';
+                      const error = new Error(notFound
+                        ? 'No current CMS popup matches the ticket request. No popup was removed and CMS Build was not started.'
+                        : (auditWarning ? `The tool could not identify CMS popups matching the ticket request (${auditWarning}). No popup was removed and CMS Build was not started.` : 'The tool could not identify CMS popups matching the ticket request. No popup was removed and CMS Build was not started.'));
+                      error.stage = notFound ? 'popup-removal-not-found' : 'popup-removal-ambiguous';
+                      error.vision = resolution.audit;
+                      throw error;
+                    }
+
+                    const targetIndices = new Set(
+                      (Array.isArray(resolution.selection?.indices) && resolution.selection.indices.length > 0
+                        ? resolution.selection.indices
+                        : [resolution.selection?.index]
+                      ).map((idx) => idx - 1)
+                    );
+
+                    const preservedPopups = legacyPopupSnapshot.items.filter((item) => {
+                      const scannedIdx = legacyPopupSnapshot.scannedItems.indexOf(item);
+                      return !targetIndices.has(scannedIdx);
+                    });
+
+                    progress('plugin-apply', 'Updating Announcement plugin to latest version');
+                    plan.plugin = await ensureAnnouncementPlugin(page, baseUrl);
+
+                    progress('section-apply', 'Recreating Announcement section on latest plugin version');
+                    plan.popupSection = await ensurePopupSection(page, baseUrl, {
+                      replaceExisting: true,
+                      expectedPluginVersion: plan.plugin.version,
+                      targetSectionIds: sectionVersionInfo.legacySectionIds
+                    });
+
+                    if (preservedPopups.length > 0) {
+                      progress('popup-migrate', `Đang đưa ${preservedPopups.length} popup còn lại sang section Announcement 1038 mới`);
+                      await configurePopup(page, null, null, plan.timezone, {
+                        replaceExisting: false,
+                        sectionId: plan.popupSection.sectionId,
+                        legacyPopups: preservedPopups
+                      });
+                    } else {
+                      try {
+                        await openPopupSettings(page, plan.popupSection.sectionId);
+                        await deleteOneEmptyPopupItem(page, 0).catch(() => {});
+                      } catch {}
+                    }
+
+                    const firstTargetIdx = Array.from(targetIndices)[0] ?? 0;
+                    removal = {
+                      scope: targetIndices.size > 1 ? 'multiple' : 'one',
+                      changed: targetIndices.size > 0,
+                      removedCount: targetIndices.size,
+                      sectionCount: 1,
+                      sectionId: plan.popupSection.sectionId,
+                      itemIndex: firstTargetIdx,
+                      imageUrl: legacyPopupSnapshot.scannedItems[firstTargetIdx]?.sourceImageUrl || null,
+                      vision: resolution.audit,
+                      visionRationale: resolution.selection.rationale,
+                      warnings: prepared.warnings
+                    };
+                  }
+                } else {
+                  removal = await removePopupForTicket(
+                    page,
+                    baseUrl,
+                    runDir,
+                    body,
+                    plan.ticket.popupAction,
+                    downloadedAttachment
+                  );
                 }
-              } else {
-                removal = await removePopupForTicket(
-                  page,
-                  baseUrl,
-                  runDir,
-                  body,
-                  plan.ticket.popupAction,
-                  downloadedAttachment
-                );
+              } catch (error) {
+                error.stage ||= 'popup-removal';
+                throw error;
               }
               plan.popupRemoval = {
                 scope: removal.scope,
@@ -3745,25 +3847,30 @@ async function main() {
                 ? 'CMS popup duration update and Build/publish were explicitly requested.'
                 : 'CMS popup duration update was explicitly requested. Build/publish was not requested.';
               progress('section-apply', 'Opening the Page editor and Popup settings');
-              plan.popupSection = await existingPopupSection(page, baseUrl, {
-                expectedPluginVersion: plan.plugin.version
-              });
-              await openPopupSection(page, plan.popupSection.sectionId);
-              await openPopupSettings(page, plan.popupSection.sectionId);
-              progress('popup-delay-slider', `Cài đặt Time delay slider: ${dur.delaySliderSeconds}s (thời gian yêu cầu ${dur.requestedSeconds}s + 3s mở popup)`);
-              const durationResult = await setTimeDelaySlider(page, dur.delaySliderSeconds);
-              if (durationResult.applied !== true) {
-                const error = new Error(`Time delay slider was not verified at ${dur.delaySliderSeconds}s (reported value: ${durationResult.value || 'empty'}). CMS Build was not started.`);
-                error.stage = 'popup-delay-slider-verification';
+              try {
+                plan.popupSection = await existingPopupSection(page, baseUrl, {
+                  expectedPluginVersion: plan.plugin.version
+                });
+                await openPopupSection(page, plan.popupSection.sectionId);
+                await openPopupSettings(page, plan.popupSection.sectionId);
+                progress('popup-delay-slider', `Cài đặt Time delay slider: ${dur.delaySliderSeconds}s (thời gian yêu cầu ${dur.requestedSeconds}s + 3s mở popup)`);
+                const durationResult = await setTimeDelaySlider(page, dur.delaySliderSeconds);
+                if (durationResult.applied !== true) {
+                  const error = new Error(`Time delay slider was not verified at ${dur.delaySliderSeconds}s (reported value: ${durationResult.value || 'empty'}). CMS Build was not started.`);
+                  error.stage = 'popup-delay-slider-verification';
+                  throw error;
+                }
+                plan.popup = {
+                  durationConfigured: durationResult.applied !== false,
+                  requestedSeconds: dur.requestedSeconds,
+                  delaySliderSeconds: dur.delaySliderSeconds,
+                  imageConfigured: true,
+                  ticketPosterVerified: true
+                };
+              } catch (error) {
+                error.stage ||= 'popup-settings';
                 throw error;
               }
-              plan.popup = {
-                durationConfigured: durationResult.applied !== false,
-                requestedSeconds: dur.requestedSeconds,
-                delaySliderSeconds: dur.delaySliderSeconds,
-                imageConfigured: true,
-                ticketPosterVerified: true
-              };
               await page.screenshot({ path: path.join(runDir, 'popup-settings.png'), fullPage: false });
               if (buildRequested) {
                 progress('build-start', 'Starting CMS Build after verified popup duration update');
@@ -3933,7 +4040,19 @@ async function main() {
                     expiredCount: legacyPopupSnapshot.expiredCount
                   };
                 }
-                const duplicates = await findDuplicatePopupImagesWithVision(page, downloadedAttachments, legacyPopupSnapshot.scannedItems);
+                const duplicates = await findDuplicatePopupImagesWithVision(
+                  page,
+                  downloadedAttachments,
+                  legacyPopupSnapshot.scannedItems,
+                  {
+                    confirmVisualMatch: async ({ ticket, cms, ticketBase64, ticketMime, cmsBase64, cmsMime }) => (
+                      resolveVisualDuplicateConfirmation(
+                        { filename: ticket?.filename || 'ticket-poster', mimeType: ticketMime, base64: ticketBase64 },
+                        { filename: cms?.filename || 'cms-popup', mimeType: cmsMime, base64: cmsBase64 }
+                      )
+                    )
+                  }
+                );
                 if (duplicates.length) {
                   progress(
                     'popup-replace-match',
@@ -4211,6 +4330,8 @@ module.exports = {
   popupListItemEditorIsOpen,
   ensurePopupSection,
   openPageEditor,
+  sectionCardLocatorById,
+  isCorruptedSectionText,
   popupSectionCards,
   popupSectionCardById,
   openPopupSection,

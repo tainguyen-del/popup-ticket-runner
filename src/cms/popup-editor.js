@@ -1329,11 +1329,28 @@ async function waitForPopupImageUpload(page, imagePanel, previousImageUrls, time
   // A CDN request only proves that some image moved through the page. It does
   // not prove that the current popup item's Vue model accepted that image.
   // Require the new preview to render inside this exact Image field.
+  let blobSeenAt = null;
+  let lastBlobUrl = null;
+  const blobWaitWindowMs = timeout >= 1000 ? Math.min(4000, Math.floor(timeout / 2)) : 0;
+
   while (Date.now() < deadline) {
     const imgs = await popupImageUrls(imagePanel);
-    const newImg = imgs.find((src) => !before.includes(src) && !src.includes('about.jpeg'));
-    if (newImg) return { currentImageUrls: imgs, uploadedImageUrl: newImg };
+    const permanentNewImg = imgs.find((src) => !before.includes(src) && !src.includes('about.jpeg') && !/^blob:/i.test(src));
+    if (permanentNewImg) return { currentImageUrls: imgs, uploadedImageUrl: permanentNewImg };
+    const blobNewImg = imgs.find((src) => !before.includes(src) && !src.includes('about.jpeg'));
+    if (blobNewImg) {
+      if (blobWaitWindowMs === 0) return { currentImageUrls: imgs, uploadedImageUrl: blobNewImg };
+      if (!blobSeenAt) blobSeenAt = Date.now();
+      lastBlobUrl = blobNewImg;
+      if (Date.now() - blobSeenAt >= blobWaitWindowMs) {
+        return { currentImageUrls: imgs, uploadedImageUrl: lastBlobUrl };
+      }
+    }
     await pageDelay(page, 300);
+  }
+  if (lastBlobUrl) {
+    const imgs = await popupImageUrls(imagePanel);
+    return { currentImageUrls: imgs, uploadedImageUrl: lastBlobUrl };
   }
 
   throw new Error('CMS did not render the ticket poster inside the current Popup Image field after upload.');
@@ -1478,6 +1495,7 @@ async function configurePopupListItem(page, imagePath, schedule, timezone, { for
     start: start?.date || null,
     end: end?.date || null,
     previewImageUrl: uploadedImageUrl,
+    previousImageUrl: isTargetReplacement ? (replaceTargetImageUrl || previousImageUrls[0] || null) : null,
     imageLink: configuredLink || imageLink || null
   };
 }
@@ -1551,7 +1569,8 @@ async function waitForPersistedPopupItem(page, target, schedule, timezone, timeo
         expectedCount: target.expectedCount,
         schedule,
         timezone,
-        previewImageUrl: target.previewImageUrl || null
+        previewImageUrl: target.previewImageUrl || null,
+        previousImageUrl: target.previousImageUrl || null
       });
       lastReason = verification.reason || 'not-persisted';
       if (verification.ok) {

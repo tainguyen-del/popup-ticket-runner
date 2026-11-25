@@ -60,12 +60,72 @@ function findDuplicatePopupImages(ticketImages, cmsImages) {
   return matches;
 }
 
-async function findDuplicatePopupImagesWithVision(page, ticketImages, cmsImages) {
+const VISUAL_PIXEL_CANVAS_SIZE = 64;
+const VISUAL_STRONG_SIMILARITY = 0.96;
+const VISUAL_STRONG_PEARSON = 0.96;
+const VISUAL_STRONG_CHANGED_RATIO = 0.04;
+const VISUAL_CANDIDATE_SIMILARITY = 0.86;
+const VISUAL_CANDIDATE_PEARSON = 0.84;
+const VISUAL_CANDIDATE_CHANGED_RATIO = 0.22;
+const VISUAL_STRICT_SIMILARITY = 0.90;
+const VISUAL_STRICT_PEARSON = 0.90;
+const VISUAL_STRICT_CHANGED_RATIO = 0.14;
+
+function normalizeVisualMetrics(raw) {
+  if (typeof raw === 'number') {
+    const score = Number.isFinite(raw) ? raw : 0;
+    return {
+      pixelSimilarity: score,
+      pearson: score,
+      changedRatio: Math.max(0, 1 - score)
+    };
+  }
+  if (!raw || typeof raw !== 'object') {
+    return { pixelSimilarity: 0, pearson: 0, changedRatio: 1 };
+  }
+  const pixelSimilarity = Number.isFinite(raw.pixelSimilarity) ? raw.pixelSimilarity : 0;
+  const pearson = Number.isFinite(raw.pearson) ? raw.pearson : pixelSimilarity;
+  const changedRatio = Number.isFinite(raw.changedRatio) ? raw.changedRatio : Math.max(0, 1 - pixelSimilarity);
+  return { pixelSimilarity, pearson, changedRatio };
+}
+
+function classifyVisualSimilarity(metrics, hasConfirmCallback = false) {
+  const { pixelSimilarity, pearson, changedRatio } = normalizeVisualMetrics(metrics);
+  if (
+    pixelSimilarity >= VISUAL_STRONG_SIMILARITY
+    && pearson >= VISUAL_STRONG_PEARSON
+    && changedRatio <= VISUAL_STRONG_CHANGED_RATIO
+  ) {
+    return { eligible: true, needsConfirmation: false, metrics: { pixelSimilarity, pearson, changedRatio } };
+  }
+  if (hasConfirmCallback) {
+    const eligible = pixelSimilarity >= VISUAL_CANDIDATE_SIMILARITY
+      && pearson >= VISUAL_CANDIDATE_PEARSON
+      && changedRatio <= VISUAL_CANDIDATE_CHANGED_RATIO;
+    return { eligible, needsConfirmation: eligible, metrics: { pixelSimilarity, pearson, changedRatio } };
+  }
+  const eligible = pixelSimilarity >= VISUAL_STRICT_SIMILARITY
+    && pearson >= VISUAL_STRICT_PEARSON
+    && changedRatio <= VISUAL_STRICT_CHANGED_RATIO;
+  return { eligible, needsConfirmation: false, metrics: { pixelSimilarity, pearson, changedRatio } };
+}
+
+function preferVisualCandidate(candidate, currentBest) {
+  if (!currentBest) return candidate;
+  const candidateHasSchedule = !!(candidate.cms?.end || candidate.cms?.start);
+  const bestHasSchedule = !!(currentBest.cms?.end || currentBest.cms?.start);
+  if (candidateHasSchedule && !bestHasSchedule) return candidate;
+  if (candidateHasSchedule === bestHasSchedule && candidate.similarity > currentBest.similarity) return candidate;
+  return currentBest;
+}
+
+async function findDuplicatePopupImagesWithVision(page, ticketImages, cmsImages, { confirmVisualMatch = null } = {}) {
   const directMatches = findDuplicatePopupImages(ticketImages, cmsImages);
   if (directMatches.length) return directMatches;
 
   if (!page || !Array.isArray(ticketImages) || !Array.isArray(cmsImages)) return [];
 
+  const hasConfirmCallback = typeof confirmVisualMatch === 'function';
   const matches = [];
   for (let ticketIndex = 0; ticketIndex < ticketImages.length; ticketIndex += 1) {
     const ticket = ticketImages[ticketIndex];
@@ -74,7 +134,7 @@ async function findDuplicatePopupImagesWithVision(page, ticketImages, cmsImages)
     const ticketBase64 = fs.readFileSync(ticketPath).toString('base64');
     const ticketMime = ticketPath.endsWith('.png') ? 'image/png' : (ticketPath.endsWith('.webp') ? 'image/webp' : 'image/jpeg');
 
-    let bestMatch = null;
+    const candidates = [];
     for (let cmsIndex = 0; cmsIndex < cmsImages.length; cmsIndex += 1) {
       const cms = cmsImages[cmsIndex];
       const cmsPath = cms?.imagePath || cms?.path || cms?.uploadPath;
@@ -83,7 +143,7 @@ async function findDuplicatePopupImagesWithVision(page, ticketImages, cmsImages)
       const cmsMime = cmsPath.endsWith('.png') ? 'image/png' : (cmsPath.endsWith('.webp') ? 'image/webp' : 'image/jpeg');
 
       try {
-        const similarity = await page.evaluate(async ({ tData, tMime, cData, cMime }) => {
+        const rawMetrics = await page.evaluate(async ({ tData, tMime, cData, cMime, size }) => {
           function load(data, mime) {
             return new Promise((resolve, reject) => {
               const img = new Image();
@@ -95,57 +155,116 @@ async function findDuplicatePopupImagesWithVision(page, ticketImages, cmsImages)
           const [img1, img2] = await Promise.all([load(tData, tMime), load(cData, cMime)]);
           const ratio1 = img1.width / img1.height;
           const ratio2 = img2.width / img2.height;
-          if (Math.abs(ratio1 - ratio2) > 0.15) return 0;
+          if (Math.abs(ratio1 - ratio2) > 0.15) return { pixelSimilarity: 0, pearson: 0, changedRatio: 1 };
 
           const canvas1 = document.createElement('canvas');
-          canvas1.width = 32; canvas1.height = 32;
+          canvas1.width = size; canvas1.height = size;
           const ctx1 = canvas1.getContext('2d');
-          ctx1.drawImage(img1, 0, 0, 32, 32);
-          const d1 = ctx1.getImageData(0, 0, 32, 32).data;
+          ctx1.drawImage(img1, 0, 0, size, size);
+          const d1 = ctx1.getImageData(0, 0, size, size).data;
 
           const canvas2 = document.createElement('canvas');
-          canvas2.width = 32; canvas2.height = 32;
+          canvas2.width = size; canvas2.height = size;
           const ctx2 = canvas2.getContext('2d');
-          ctx2.drawImage(img2, 0, 0, 32, 32);
-          const d2 = ctx2.getImageData(0, 0, 32, 32).data;
+          ctx2.drawImage(img2, 0, 0, size, size);
+          const d2 = ctx2.getImageData(0, 0, size, size).data;
 
+          const pixelCount = d1.length / 4;
+          const channelCount = pixelCount * 3;
           let diff = 0;
+          let changedPixels = 0;
+          let sum1 = 0;
+          let sum2 = 0;
           for (let i = 0; i < d1.length; i += 4) {
-            diff += Math.abs(d1[i] - d2[i]) + Math.abs(d1[i+1] - d2[i+1]) + Math.abs(d1[i+2] - d2[i+2]);
+            const dr = Math.abs(d1[i] - d2[i]);
+            const dg = Math.abs(d1[i + 1] - d2[i + 1]);
+            const db = Math.abs(d1[i + 2] - d2[i + 2]);
+            const pixelDiff = dr + dg + db;
+            diff += pixelDiff;
+            if (pixelDiff > 60) changedPixels += 1;
+            sum1 += d1[i] + d1[i + 1] + d1[i + 2];
+            sum2 += d2[i] + d2[i + 1] + d2[i + 2];
           }
-          const maxDiff = (d1.length / 4) * 255 * 3;
-          return 1 - (diff / maxDiff);
-        }, { tData: ticketBase64, tMime: ticketMime, cData: cmsBase64, cMime: cmsMime });
+          const mean1 = sum1 / channelCount;
+          const mean2 = sum2 / channelCount;
+          let cov = 0;
+          let var1 = 0;
+          let var2 = 0;
+          for (let i = 0; i < d1.length; i += 4) {
+            for (let c = 0; c < 3; c += 1) {
+              const a = d1[i + c] - mean1;
+              const b = d2[i + c] - mean2;
+              cov += a * b;
+              var1 += a * a;
+              var2 += b * b;
+            }
+          }
+          const pixelSimilarity = 1 - (diff / (pixelCount * 255 * 3));
+          const changedRatio = changedPixels / pixelCount;
+          const denom = Math.sqrt(var1 * var2);
+          const pearson = denom > 1e-6 ? (cov / denom) : (pixelSimilarity >= 0.99 ? 1 : 0);
+          return { pixelSimilarity, pearson, changedRatio };
+        }, { tData: ticketBase64, tMime: ticketMime, cData: cmsBase64, cMime: cmsMime, size: VISUAL_PIXEL_CANVAS_SIZE });
 
-        // Poster updates (e.g. changing holiday hours or dates on identical artwork)
-        // usually preserve 80-90% of pixel colors. Threshold of 0.80 reliably detects
-        // these updates without confusing different holiday posters (which score < 0.70).
-        if (similarity >= 0.80) {
-          const candidate = {
+        const classified = classifyVisualSimilarity(rawMetrics, hasConfirmCallback);
+        if (classified.eligible) {
+          candidates.push({
             ticketIndex,
             cmsIndex,
             method: 'visual-similarity',
-            similarity,
+            similarity: classified.metrics.pixelSimilarity,
+            pearson: classified.metrics.pearson,
+            changedRatio: classified.metrics.changedRatio,
+            needsConfirmation: classified.needsConfirmation,
             ticket,
-            cms
-          };
-          if (!bestMatch) {
-            bestMatch = candidate;
-          } else {
-            const candidateHasSchedule = !!(candidate.cms?.end || candidate.cms?.start);
-            const bestHasSchedule = !!(bestMatch.cms?.end || bestMatch.cms?.start);
-            if (candidateHasSchedule && !bestHasSchedule) {
-              bestMatch = candidate;
-            } else if (candidateHasSchedule === bestHasSchedule && candidate.similarity > bestMatch.similarity) {
-              bestMatch = candidate;
-            }
-          }
+            cms,
+            ticketBase64,
+            ticketMime,
+            cmsBase64,
+            cmsMime
+          });
         }
       } catch {
         // Fall back gracefully on canvas error
       }
     }
-    if (bestMatch) matches.push(bestMatch);
+
+    let bestMatch = null;
+    candidates.sort((a, b) => {
+      const aHas = !!(a.cms?.end || a.cms?.start);
+      const bHas = !!(b.cms?.end || b.cms?.start);
+      if (aHas !== bHas) return aHas ? -1 : 1;
+      return b.similarity - a.similarity;
+    });
+
+    for (const candidate of candidates) {
+      if (!candidate.needsConfirmation || !hasConfirmCallback) {
+        bestMatch = preferVisualCandidate(candidate, bestMatch);
+        break;
+      }
+      const verdict = await confirmVisualMatch(candidate).catch(() => null);
+      if (verdict?.confirmed === true) {
+        bestMatch = preferVisualCandidate(candidate, bestMatch);
+        break;
+      }
+      if (verdict?.confirmed === false) {
+        continue;
+      }
+      // If Gemini Vision was unavailable or uncertain, only accept with strict canvas thresholds.
+      if (
+        candidate.similarity >= VISUAL_STRICT_SIMILARITY
+        && candidate.pearson >= VISUAL_STRICT_PEARSON
+        && candidate.changedRatio <= VISUAL_STRICT_CHANGED_RATIO
+      ) {
+        bestMatch = preferVisualCandidate(candidate, bestMatch);
+        break;
+      }
+    }
+
+    if (bestMatch) {
+      const { ticketBase64: _tb, ticketMime: _tm, cmsBase64: _cb, cmsMime: _cm, ...publicMatch } = bestMatch;
+      matches.push(publicMatch);
+    }
   }
   return matches;
 }
@@ -154,6 +273,8 @@ module.exports = {
   decodedImageBasename,
   embeddedUploadHash,
   popupImageIdentity,
+  normalizeVisualMetrics,
+  classifyVisualSimilarity,
   findDuplicatePopupImages,
   findDuplicatePopupImagesWithVision
 };

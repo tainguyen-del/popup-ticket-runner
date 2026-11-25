@@ -18,6 +18,11 @@ const {
   buildPopupEntriesForTickets,
   setTimeDelaySlider
 } = require('../src/cms/popup-editor');
+const {
+  sectionCardLocatorById,
+  isCorruptedSectionText,
+  openPopupSection
+} = require('../src/run');
 
 test('readPopupListItems ignores a stale empty Vue snapshot when a populated snapshot exists', async () => {
   const snapshots = [
@@ -808,6 +813,91 @@ test('deletePopupItemAtIndex matches target image in card img sources directly',
 
   // When overlay count is 0, escape should not be pressed
   assert.equal(escapePressed, false);
+});
+
+test('sectionCardLocatorById escapes # in item_block_section IDs and isCorruptedSectionText matches N/A cards only', () => {
+  let capturedSelector = '';
+  const mockPage = { locator: (sel) => { capturedSelector = sel; return sel; } };
+  sectionCardLocatorById(mockPage, 'item_block_section#4');
+  assert.equal(capturedSelector, 'div[id="item_block_section#4"]');
+
+  assert.equal(isCorruptedSectionText('N/A\nN/A'), true);
+  assert.equal(isCorruptedSectionText('N/A N/A'), true);
+  assert.equal(isCorruptedSectionText('N/A'), true);
+  assert.equal(isCorruptedSectionText('ANNOUNCEMENT 1038 (*)\nAnnoucement Popup'), false);
+});
+
+test('openPopupSection clicks corrupted N/A card cleanly without throwing Announcement section was not found', async () => {
+  let drawerOpen = false;
+  let cardClicked = false;
+  const naSpan = {
+    isVisible: async () => true,
+    click: async () => { cardClicked = true; drawerOpen = true; }
+  };
+  const naCard = {
+    isVisible: async () => true,
+    innerText: async () => 'N/A\nN/A',
+    getAttribute: async () => 'item_block_section#4',
+    getByText: () => ({ count: async () => 0 }),
+    locator: () => ({
+      filter: () => ({
+        count: async () => 1,
+        nth: () => naSpan,
+        first: () => naSpan
+      })
+    }),
+    click: async () => { cardClicked = true; drawerOpen = true; }
+  };
+  const stableCard = { ...naCard };
+  const addBlockControl = {
+    count: async () => (drawerOpen ? 1 : 0),
+    nth: () => ({ isVisible: async () => drawerOpen }),
+    first: () => ({ isVisible: async () => drawerOpen })
+  };
+  const mockPage = {
+    evaluate: async () => drawerOpen,
+    waitForTimeout: async () => {},
+    getByText: (pattern) => {
+      if (drawerOpen && String(pattern).includes('Popup')) {
+        return { count: async () => 1, nth: () => ({ isVisible: async () => true }) };
+      }
+      return { count: async () => 0 };
+    },
+    locator: (sel) => {
+      if (sel === 'div[id^="item_block_section#"]') {
+        return { count: async () => 1, nth: () => naCard };
+      }
+      if (sel === 'div[id="item_block_section#4"]') {
+        return { first: () => stableCard, count: async () => 1, nth: () => stableCard };
+      }
+      if (String(sel).includes('Add block')) return addBlockControl;
+      return { count: async () => 0 };
+    }
+  };
+
+  await openPopupSection(mockPage, 'item_block_section#4', { openTimeoutMs: 500 });
+  assert.equal(cardClicked, true);
+  assert.equal(drawerOpen, true);
+});
+
+test('waitForPopupImageUpload prefers a permanent asset URL when a transient blob preview appears first', async () => {
+  let reads = 0;
+  const popupPanel = {
+    locator: () => ({
+      evaluateAll: async () => {
+        reads += 1;
+        return reads === 1
+          ? ['blob:https://cms.newzensite.com/temporary-preview']
+          : ['https://cdn.example/final-uploaded-poster.webp'];
+      }
+    })
+  };
+  const page = {
+    waitForTimeout: async () => {}
+  };
+
+  const result = await waitForPopupImageUpload(page, popupPanel, ['https://cdn.example/old-poster.webp'], 1500);
+  assert.equal(result.uploadedImageUrl, 'https://cdn.example/final-uploaded-poster.webp');
 });
 
 

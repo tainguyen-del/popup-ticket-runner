@@ -185,15 +185,22 @@ async function stageCmsUploadImage(attachment, runDir, { page = null, progress =
   fs.mkdirSync(uploadDirectory, { recursive: true });
 
   const originalBytes = attachment.bytes || original.bytes;
-  const needsCompression = originalBytes > CMS_MAX_UPLOAD_BYTES;
+  const rawBuffer = fs.readFileSync(attachment.path);
+  const rawMime = geminiVisionMimeType(attachment.path);
+  const needsRepair = Boolean(rawMime && !isImageContainerComplete(rawBuffer, rawMime));
+  const needsCompression = originalBytes > CMS_MAX_UPLOAD_BYTES || needsRepair;
   let stagedPath = null;
   let detectedExtension = attachment.extension || original.extension;
   let optimized = false;
 
   if (needsCompression && page) {
     if (typeof progress === 'function') {
-      const mb = (originalBytes / 1024 / 1024).toFixed(2);
-      progress('image-optimize', `Ảnh đính kèm ${mb}MB vượt quá giới hạn 3MB của CMS. Đang tự động nén tối ưu...`);
+      if (needsRepair && originalBytes <= CMS_MAX_UPLOAD_BYTES) {
+        progress('image-optimize', 'Ảnh tải về từ CRM bị thiếu chunk cuối; đang phục hồi định dạng sạch để upload CMS...');
+      } else {
+        const mb = (originalBytes / 1024 / 1024).toFixed(2);
+        progress('image-optimize', `Ảnh đính kèm ${mb}MB vượt quá giới hạn 3MB của CMS. Đang tự động nén tối ưu...`);
+      }
     }
     try {
       const compressed = await compressImageForUpload(page, attachment.path, { maxBytes: TARGET_OPTIMIZED_BYTES });
@@ -254,8 +261,36 @@ function geminiVisionMimeType(imagePath) {
   return null;
 }
 
-async function visionCandidatesFromDownloads(downloads, attachmentCandidates, { page = null } = {}) {
+function isImageContainerComplete(buffer, mimeType) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 12) return false;
+  if (mimeType === 'image/png') {
+    if (!buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) return false;
+    let pos = 8;
+    let lastChunk = null;
+    while (pos + 12 <= buffer.length) {
+      const len = buffer.readUInt32BE(pos);
+      if (pos + 12 + len > buffer.length) return false;
+      lastChunk = buffer.subarray(pos + 4, pos + 8).toString('ascii');
+      pos += 12 + len;
+    }
+    return lastChunk === 'IEND' && pos === buffer.length;
+  }
+  if (mimeType === 'image/jpeg') {
+    if (!(buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff)) return false;
+    const tailStart = Math.max(0, buffer.length - 64);
+    return buffer.subarray(tailStart).includes(Buffer.from([0xff, 0xd9]));
+  }
+  if (mimeType === 'image/webp') {
+    if (buffer.subarray(0, 4).toString('ascii') !== 'RIFF' || buffer.subarray(8, 12).toString('ascii') !== 'WEBP') return false;
+    const riffSize = buffer.readUInt32LE(4);
+    return riffSize > 4 && (riffSize + 8) <= buffer.length + 1;
+  }
+  return true;
+}
+
+async function visionCandidatesFromDownloads(downloads, attachmentCandidates, { page = null, forcePreview = false } = {}) {
   const MAX_IMAGE_BYTES = 4 * 1024 * 1024;
+  const MAX_MULTI_RAW_BYTES = 1.2 * 1024 * 1024;
   const MAX_TOTAL_BYTES = 15 * 1024 * 1024;
   let totalBytes = 0;
   const warnings = [];
@@ -266,9 +301,13 @@ async function visionCandidatesFromDownloads(downloads, attachmentCandidates, { 
       warnings.push(`Attachment #${download.candidateIndex} is not a PNG, JPEG, or WebP Vision input.`);
       continue;
     }
+    const rawBuffer = fs.readFileSync(download.path);
+    const structurallyComplete = isImageContainerComplete(rawBuffer, mimeType);
     let base64 = null;
     let candidateBytes = download.bytes;
-    if (download.bytes > MAX_IMAGE_BYTES || totalBytes + download.bytes > MAX_TOTAL_BYTES) {
+    const shouldOptimizeMulti = Boolean(page && downloads.length > 2 && download.bytes > MAX_MULTI_RAW_BYTES);
+    const exceedsLimits = download.bytes > MAX_IMAGE_BYTES || (totalBytes + download.bytes > MAX_TOTAL_BYTES);
+    if (forcePreview || !structurallyComplete || shouldOptimizeMulti || exceedsLimits) {
       if (page) {
         const preview = await createVisionPreview(page, download.path);
         if (preview && preview.base64) {
@@ -277,13 +316,18 @@ async function visionCandidatesFromDownloads(downloads, attachmentCandidates, { 
           candidateBytes = Math.round(base64.length * 3 / 4);
         }
       }
-      if (!base64 || (totalBytes + candidateBytes > MAX_TOTAL_BYTES)) {
-        warnings.push(`Attachment #${download.candidateIndex} was too large for the inline Vision request.`);
+      if ((!base64 && (!structurallyComplete || download.bytes > MAX_IMAGE_BYTES || totalBytes + download.bytes > MAX_TOTAL_BYTES))
+        || (totalBytes + candidateBytes > MAX_TOTAL_BYTES)) {
+        warnings.push(
+          !structurallyComplete
+            ? `Attachment #${download.candidateIndex} had truncated image bytes and could not be prepared locally.`
+            : `Attachment #${download.candidateIndex} was too large for the inline Vision request.`
+        );
         continue;
       }
     }
     if (!base64) {
-      base64 = fs.readFileSync(download.path).toString('base64');
+      base64 = rawBuffer.toString('base64');
     }
     totalBytes += candidateBytes;
     const context = attachmentCandidates.find((candidate) => candidate.index === download.candidateIndex) || {};
@@ -356,6 +400,7 @@ module.exports = {
   cmsSafeUploadFilename,
   stageCmsUploadImage,
   geminiVisionMimeType,
+  isImageContainerComplete,
   visionCandidatesFromDownloads,
   visionCandidateFromLocalImage,
   preparePopupRemovalVision

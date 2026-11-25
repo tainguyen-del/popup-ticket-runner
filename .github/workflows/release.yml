@@ -57,9 +57,13 @@ jobs:
               - Phân biệt chính xác **ngày nghỉ lễ của tiệm** vs **ngày bắt đầu hẹn giờ đăng popup (`startDate`)**: không gán nhầm `startDate` khi note chỉ ghi lịch nghỉ (VD: *"tiệm nghỉ từ 24/11 đến 26/11"*), đồng thời vẫn trích xuất chuẩn `expiryDate`.
               - Cho phép migrate các popup bảo lưu sang section mới ngay cả khi ticket không upload ảnh mới (`normalizeTicketPopupEntries`).
             - **Ổn định giao diện NewZen CMS Page Editor & Popup Drawer:**
-              - Loại bỏ thẻ lỗi `N/A N/A` khi tìm Announcement section hợp lệ, tránh vô hiệu hóa cơ chế fallback tìm section theo ID.
+              - Sửa lỗi selector CSS chứa ký tự `#` (`item_block_section#4`) bằng `div[id="..."]`, loại bỏ thẻ lỗi `N/A N/A` khi tìm Announcement section hợp lệ và dọn thẻ `N/A` trước khi chốt `sectionId` sau nâng cấp plugin.
+              - Sửa lỗi `openPopupSection` khi gặp thẻ `N/A N/A` bị hỏng sau nâng cấp (dùng fallback timeout ngắn và chuyển qua thay thế section thay vì văng lỗi sớm).
               - Sửa lỗi `returnToPageEditor` bị đánh lừa bởi breadcrumb `Content blocks` và giới hạn phạm vi nút `Back` trong drawer.
               - Loại bỏ thao tác spam click gây đóng/mở drawer liên tục trong `openPopupSection`, nhận diện trạng thái drawer mở trực tiếp từ DOM bất kể vị trí cuộn.
+            - **Sửa triệt để nhận diện trùng poster & đồng bộ vị trí khi thay thế popup (Ticket #1607558):**
+              - Nâng cấp thuật toán so sánh ảnh `findDuplicatePopupImagesWithVision` lên lưới `64×64` kết hợp **Pearson correlation**, tỷ lệ pixel thay đổi và đối chiếu Gemini Vision cho ngưỡng cận biên — loại bỏ hoàn toàn nhận diện nhầm 2 poster khác nội dung nhưng dùng chung nền/logo tiệm (ví dụ *Monday Special* vs *Thanksgiving*).
+              - Sửa lỗi `target-image-match-count-0` khi thay thế popup: chờ URL ảnh upload ổn định qua preview `blob:`, chặn xác nhận URL ảnh cũ trước khi Vue cập nhật xong ảnh mới (`verifyPersistedPopupItem`), và tự động chờ Vue đồng bộ danh sách trước khi sắp xếp thứ tự popup.
             - **Khắc phục triệt để lỗi chọn sai múi giờ (New York UTC-05:00):**
               - Tự động nhận diện chính xác múi giờ từ `setting.json`, `footer.json` trong CMS `/files` hoặc từ HTML website live / preview.
               - Hỗ trợ toàn diện các định dạng dấu câu trong địa chỉ: `CA 95605`, `CA, 95605`, `CA - 95605`, `California, 95605`.
@@ -73,9 +77,10 @@ jobs:
             - **Tự động đọc ảnh poster bằng Gemini Vision để tìm ngày hết hạn (Promotion Period / Expiration Date):**
               - Gemini Vision luôn tự động quét ảnh poster để đọc ngày khuyến mãi / ngày kết thúc (kể cả định dạng độc lập không kèm năm như `Dec 31`, `November 22 – December 31`).
               - Chuẩn hóa thứ tự ưu tiên (Precedence): Nếu note ticket có ghi ngày -> ưu tiên dùng ngày note ticket; Nếu note ticket không ghi ngày -> tự động kế thừa ngày từ ảnh poster popup.
+              - **Tự động phát hiện & phục hồi ảnh lỗi/thiếu byte (Truncated PNG/JPEG):** Phát hiện các ảnh chat/comment trên CRM bị cắt cụt chunk cuối (`Unable to process input image`) và tự động tái mã hóa qua trình duyệt trước khi gửi Gemini Vision hoặc upload CMS, đồng thời nén gọn payload khi ticket có nhiều ảnh.
             - **Tối ưu hóa và ổn định kết nối Gemini Vision & Giao diện UI:**
-              - Chuyển sang model mặc định `gemini-flash-lite-latest` siêu nhanh (1.8s text, 4.5s vision) với hạn mức lớn, không bị chạm ngưỡng 20 lượt/ngày.
-              - Chuẩn hóa danh sách model dự phòng hợp lệ (`gemini-flash-lite-latest`, `gemini-2.0-flash-lite`, `gemini-2.0-flash`, `gemini-1.5-flash`) khi Google gặp lỗi quá tải (503) hoặc chạm hạn mức (429), đồng thời hiển thị chi tiết lỗi API nếu gặp sự cố.
+              - Chuyển sang model mặc định `gemini-flash-lite-latest` siêu nhanh với hạn mức lớn.
+              - Chuẩn hóa danh sách model dự phòng hợp lệ (`gemini-flash-lite-latest`, `gemini-3.5-flash-lite`, `gemini-3.1-flash-lite`, `gemini-3.8-flash`, `gemini-3.5-flash`) và log rõ nguyên nhân thật sự khi API gặp sự cố thay vì báo nhầm lỗi mạng.
               - Hiển thị trực quan **Kế hoạch thực hiện (`actionSummary`)**, **Timezone đã cập nhật** và **Lý do gỡ popup** trên giao diện kết quả UI.
               - Tích hợp sẵn API key nội bộ hoạt động out-of-the-box cho mọi máy, không bắt buộc người dùng phải tự cấu hình key cá nhân.
             - **Tải file executable:** Tải file **`Popup Ticket Runner Final.exe`** ở mục Assets bên dưới để sử dụng trực tiếp không cần cài đặt.

@@ -15,7 +15,8 @@ const {
   geminiResponseSchema,
   multiVisionPrompt,
   visionPrompt,
-  isValidPosterScheduleEvidence
+  isValidPosterScheduleEvidence,
+  resolveVisualDuplicateConfirmation
 } = require('../src/semantic-ticket');
 const { applyArtworkSchedulePrecedence } = require('../src/run');
 
@@ -889,5 +890,71 @@ test('visionPrompt and semanticPrompt include explicit rules for comment replace
 
   const semPrompt = semanticPrompt('Ticket text', [{ index: 1, filename: 'p1.png' }, { index: 2, filename: 'p2.png' }]);
   assert.match(semPrompt, /Nhờ team thay bằng poster này giúp|thay bằng poster này/i);
+});
+
+test('resolveTicketPopupVisionSet stops model fallback on gemini-invalid-image and preserves errorDetail', async () => {
+  let calls = 0;
+  const candidates = [
+    { index: 1, filename: 'p1.png', mimeType: 'image/png', base64: 'aG9saWRheQ==' },
+    { index: 2, filename: 'p2.png', mimeType: 'image/png', base64: 'cG9zdGVy' }
+  ];
+  const result = await resolveTicketPopupVisionSet('Popup request', candidates, {
+    apiKey: 'test-key-not-a-real-secret',
+    fetchImpl: async () => {
+      calls += 1;
+      return {
+        ok: false,
+        status: 400,
+        json: async () => ({
+          error: { message: 'Unable to process input image. Please retry.' }
+        })
+      };
+    }
+  });
+
+  assert.equal(calls, 1);
+  assert.equal(result.selection, null);
+  assert.equal(result.audit.status, 'unavailable');
+  assert.equal(result.audit.errorCode, 'gemini-invalid-image');
+  assert.match(result.audit.errorDetail, /Unable to process input image/);
+});
+
+test('resolveVisualDuplicateConfirmation distinguishes different announcements sharing salon branding', async () => {
+  const ticketImg = { filename: 'thanksgiving.png', mimeType: 'image/png', base64: 'dGhhbmtz' };
+  const cmsImg = { filename: 'monday.webp', mimeType: 'image/webp', base64: 'bW9uZGF5' };
+
+  const different = await resolveVisualDuplicateConfirmation(ticketImg, cmsImg, {
+    apiKey: 'test-key-not-a-real-secret',
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        candidates: [{ content: { parts: [{ text: JSON.stringify({
+          samePosterArtwork: false,
+          confidence: 0.96,
+          rationale: 'Image 1 is Thanksgiving closure while Image 2 is Monday Special.'
+        }) }] } }]
+      })
+    })
+  });
+  assert.equal(different.confirmed, false);
+  assert.equal(different.audit.status, 'different');
+
+  const sameArtwork = await resolveVisualDuplicateConfirmation(ticketImg, cmsImg, {
+    apiKey: 'test-key-not-a-real-secret',
+    fetchImpl: async () => ({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        candidates: [{ content: { parts: [{ text: JSON.stringify({
+          samePosterArtwork: true,
+          confidence: 0.95,
+          rationale: 'Both are the same Thanksgiving closure poster with updated expiry date.'
+        }) }] } }]
+      })
+    })
+  });
+  assert.equal(sameArtwork.confirmed, true);
+  assert.equal(sameArtwork.audit.status, 'matched');
 });
 

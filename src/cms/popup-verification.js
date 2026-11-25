@@ -70,7 +70,7 @@ function resolvePopupItemByImageAndSchedule(items, imageUrl, schedule, timezone)
     : { item: null, index: -1, matches: matches.length };
 }
 
-function verifyPersistedPopupItem({ afterItems, targetIndex, expectedCount, schedule, timezone, previewImageUrl = null }) {
+function verifyPersistedPopupItem({ afterItems, targetIndex, expectedCount, schedule, timezone, previewImageUrl = null, previousImageUrl = null }) {
   const items = Array.isArray(afterItems) ? afterItems : [];
 
   // When a verified uploaded image URL is present, match the persisted item directly by image and schedule
@@ -106,6 +106,14 @@ function verifyPersistedPopupItem({ afterItems, targetIndex, expectedCount, sche
   const item = items[targetIndex];
   if (!item) return { ok: false, reason: 'target-item-missing', item: null };
   if (!String(item.image || '').trim()) return { ok: false, reason: 'target-image-empty', item };
+  // During an in-place replacement, refuse the pre-replacement image URL until
+  // the Vue list commits the newly uploaded poster URL (otherwise subsequent
+  // reordering steps look up the stale old URL and fail with match-count-0).
+  const prevStableUrl = previousImageUrl ? stableImageUrl(previousImageUrl) : '';
+  const previewStableUrl = previewImageUrl ? stableImageUrl(previewImageUrl) : '';
+  if (prevStableUrl && stableImageUrl(item.image) === prevStableUrl && previewStableUrl !== prevStableUrl) {
+    return { ok: false, reason: 'target-image-not-updated', item };
+  }
   if (!popupItemScheduleMatches(item, schedule, timezone)) {
     return { ok: false, reason: 'target-schedule-mismatch', item };
   }

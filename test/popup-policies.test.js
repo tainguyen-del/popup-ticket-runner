@@ -1,9 +1,16 @@
 'use strict';
 
+const fs = require('node:fs');
+const os = require('node:os');
+const path = require('node:path');
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { planPopupPosition, verifyPopupPosition } = require('../src/cms/popup-order-policy');
-const { findDuplicatePopupImages, findDuplicatePopupImagesWithVision } = require('../src/cms/popup-image-policy');
+const {
+  classifyVisualSimilarity,
+  findDuplicatePopupImages,
+  findDuplicatePopupImagesWithVision
+} = require('../src/cms/popup-image-policy');
 
 function item(image, end = '') {
   return { image, time_start: '', time_end: end, image_alt: '', link: '', html_code: '' };
@@ -77,4 +84,50 @@ test('findDuplicatePopupImagesWithVision returns direct matches when hash or fil
   );
   assert.equal(matches.length, 1);
   assert.equal(matches[0].method, 'sha256');
+});
+
+test('classifyVisualSimilarity rejects 80.3% same-branding false positive between different posters', () => {
+  const withoutConfirm = classifyVisualSimilarity({ pixelSimilarity: 0.803, pearson: 0.55, changedRatio: 0.28 }, false);
+  assert.equal(withoutConfirm.eligible, false);
+
+  const withConfirm = classifyVisualSimilarity({ pixelSimilarity: 0.803, pearson: 0.55, changedRatio: 0.28 }, true);
+  assert.equal(withConfirm.eligible, false);
+
+  // Even if background template makes raw similarity 0.91, different foreground structure (low Pearson or high changedRatio) is rejected.
+  const templateFalsePositive = classifyVisualSimilarity({ pixelSimilarity: 0.91, pearson: 0.68, changedRatio: 0.24 }, true);
+  assert.equal(templateFalsePositive.eligible, false);
+});
+
+test('findDuplicatePopupImagesWithVision uses confirmVisualMatch tie-breaker to reject different posters in borderline band', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'popup-vis-'));
+  try {
+    const ticketFile = path.join(dir, 'thanksgiving.png');
+    const cmsFile = path.join(dir, 'monday.webp');
+    fs.writeFileSync(ticketFile, Buffer.from('thanksgiving-bytes'));
+    fs.writeFileSync(cmsFile, Buffer.from('monday-bytes'));
+
+    const mockPage = {
+      evaluate: async () => ({ pixelSimilarity: 0.89, pearson: 0.87, changedRatio: 0.12 })
+    };
+
+    const rejected = await findDuplicatePopupImagesWithVision(
+      mockPage,
+      [{ path: ticketFile, filename: 'thanksgiving.png', sha256: '1'.repeat(64) }],
+      [{ imagePath: cmsFile, sourceImageUrl: 'https://cdn.example/monday.webp', sha256: '2'.repeat(64) }],
+      { confirmVisualMatch: async () => ({ confirmed: false, rationale: 'Different offer: Monday Special vs Thanksgiving Closure' }) }
+    );
+    assert.deepEqual(rejected, []);
+
+    const accepted = await findDuplicatePopupImagesWithVision(
+      mockPage,
+      [{ path: ticketFile, filename: 'thanksgiving.png', sha256: '1'.repeat(64) }],
+      [{ imagePath: cmsFile, sourceImageUrl: 'https://cdn.example/monday.webp', sha256: '2'.repeat(64) }],
+      { confirmVisualMatch: async () => ({ confirmed: true, rationale: 'Same Thanksgiving artwork with updated date' }) }
+    );
+    assert.equal(accepted.length, 1);
+    assert.equal(accepted[0].method, 'visual-similarity');
+    assert.equal('ticketBase64' in accepted[0], false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

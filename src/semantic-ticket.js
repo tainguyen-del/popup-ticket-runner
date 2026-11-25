@@ -31,7 +31,7 @@ const DEFAULT_GEMINI_API_KEY = Buffer.from(
 // the existing text-only model setting. It can be overridden for an account
 // that has a different model allow-list.
 const DEFAULT_GEMINI_VISION_MODEL = 'gemini-flash-lite-latest';
-const FALLBACK_GEMINI_MODELS = ['gemini-flash-lite-latest', 'gemini-2.0-flash-lite', 'gemini-2.0-flash', 'gemini-1.5-flash'];
+const FALLBACK_GEMINI_MODELS = ['gemini-flash-lite-latest', 'gemini-3.5-flash-lite', 'gemini-3.1-flash-lite', 'gemini-3.8-flash', 'gemini-3.5-flash'];
 
 function geminiCandidateModels(primaryModel) {
   const models = [primaryModel, ...FALLBACK_GEMINI_MODELS].filter(Boolean);
@@ -155,6 +155,20 @@ const REMOVAL_SELECTION_SCHEMA = {
     warnings: { type: 'array', items: { type: 'string' }, maxItems: 4 }
   },
   required: ['outcome', 'popupCandidateIndex', 'popupCandidateIndices', 'confidence', 'rationale', 'warnings'],
+  additionalProperties: false
+};
+
+const VISUAL_DUPLICATE_SCHEMA = {
+  type: 'object',
+  properties: {
+    samePosterArtwork: {
+      type: 'boolean',
+      description: 'True ONLY if Image 1 and Image 2 are the same announcement/poster artwork (e.g. minor date, hours, or text edit on the exact same poster design). False if they announce different promotions, holidays, or events even if they share the same salon template, logo, border, and background colors.'
+    },
+    confidence: { type: 'number', minimum: 0, maximum: 1 },
+    rationale: { type: 'string', description: 'Short explanation comparing the headline, offer, and event shown on both posters.' }
+  },
+  required: ['samePosterArtwork', 'confidence', 'rationale'],
   additionalProperties: false
 };
 
@@ -640,7 +654,14 @@ async function requestGeminiJson({
         const error = new Error(`${requestLabel} failed (HTTP ${response.status})${errorDetail}.`);
         if (payload?.error?.details?.some((d) => d.reason === 'API_KEY_INVALID') || payload?.error?.message?.includes('API key not valid')) {
           error.code = 'gemini-key-invalid';
+        } else if (response.status === 400 && /unable to process input image/i.test(payload?.error?.message || '')) {
+          error.code = 'gemini-invalid-image';
+        } else if (response.status === 404) {
+          error.code = 'gemini-model-not-found';
+        } else if (response.status === 429) {
+          error.code = 'gemini-quota-exceeded';
         }
+        error.httpStatus = response.status;
         error.retryable = response.status === 408 || response.status === 425 || response.status >= 500;
         throw error;
       }
@@ -847,6 +868,64 @@ async function requestGeminiRemovalVisionJson(ticketText, referenceImage, popupC
   return { value, model };
 }
 
+function visualDuplicatePrompt(ticketImage, cmsImage) {
+  return [
+    'Compare two popup poster images to decide whether the new ticket poster updates the exact same artwork already on the website CMS, or is a DIFFERENT announcement/poster that happens to share salon branding.',
+    'Return only the requested JSON schema.',
+    'Rules:',
+    '- Set samePosterArtwork to true ONLY when Image 1 and Image 2 depict the exact same poster design and announcement topic (for example, the same graphic re-uploaded or the exact same poster with only a date, hour, phone number, or minor typo updated).',
+    '- Set samePosterArtwork to false when Image 1 and Image 2 promote DIFFERENT topics, holidays, or offers (for example, "Monday Special" vs "Thanksgiving Closure", "Christmas Discount" vs "We Are Hiring"), EVEN IF both images share the same salon logo, decorative borders, background colors, and footer layout.',
+    '',
+    `Image 1 (New ticket poster): ${String(ticketImage?.filename || 'ticket-poster').slice(0, 200)}`,
+    `Image 2 (Existing CMS popup): ${String(cmsImage?.filename || 'cms-popup').slice(0, 200)}`
+  ].join('\n');
+}
+
+async function requestGeminiVisualDuplicateJson(ticketImage, cmsImage, {
+  apiKey = process.env.GEMINI_API_KEY || process.env.POPUP_TICKET_RUNNER_GEMINI_KEY || DEFAULT_GEMINI_API_KEY,
+  model = process.env.GEMINI_VISION_MODEL || DEFAULT_GEMINI_VISION_MODEL,
+  fetchImpl = globalThis.fetch,
+  retryDelayMs = GEMINI_RETRY_DELAY_MS
+} = {}) {
+  if (!apiKey) {
+    const error = new Error('Gemini API key is not configured.');
+    error.code = 'gemini-key-missing';
+    throw error;
+  }
+  if (!ticketImage?.mimeType || !ticketImage?.base64 || !cmsImage?.mimeType || !cmsImage?.base64) {
+    throw new Error('Both images are required for Gemini visual duplicate verification.');
+  }
+  if (typeof fetchImpl !== 'function') throw new Error('This Node runtime does not provide fetch for Gemini Vision.');
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent`;
+  const parts = [
+    { text: visualDuplicatePrompt(ticketImage, cmsImage) },
+    { text: 'Image 1 (New ticket poster):' },
+    { inline_data: { mime_type: ticketImage.mimeType, data: ticketImage.base64 } },
+    { text: 'Image 2 (Existing CMS popup):' },
+    { inline_data: { mime_type: cmsImage.mimeType, data: cmsImage.base64 } }
+  ];
+  const request = {
+    contents: [{ parts }],
+    generationConfig: {
+      temperature: 0,
+      maxOutputTokens: 250,
+      responseMimeType: 'application/json',
+      responseSchema: geminiResponseSchema(VISUAL_DUPLICATE_SCHEMA)
+    }
+  };
+  const value = await requestGeminiJson({
+    endpoint,
+    request,
+    apiKey,
+    fetchImpl,
+    requestLabel: 'Gemini visual-duplicate request',
+    emptyResponseMessage: 'Gemini visual-duplicate returned no JSON.',
+    timeoutMs: GEMINI_VISION_TIMEOUT_MS,
+    retryDelayMs
+  });
+  return { value, model };
+}
+
 function semanticAudit(model, status, extra = {}) {
   return { provider: 'gemini', model, status, appliedFields: [], warnings: [], ...extra };
 }
@@ -1040,31 +1119,58 @@ function mergeSemanticTicket(baseTicket, semantic, ticketText, model = DEFAULT_G
   return { ticket, audit };
 }
 
+function shouldStopGeminiFallback(error) {
+  return error?.code === 'gemini-key-missing'
+    || error?.code === 'gemini-key-invalid'
+    || error?.code === 'gemini-invalid-image';
+}
+
+async function runGeminiModelsWithFallback(models, primaryModel, invoke) {
+  let lastError = null;
+  let primaryError = null;
+  let lastModel = primaryModel;
+  for (const model of models) {
+    lastModel = model;
+    try {
+      return { value: await invoke(model), error: null, lastModel: model };
+    } catch (error) {
+      lastError = error;
+      if (!primaryError && error?.code !== 'gemini-model-not-found') {
+        primaryError = error;
+      }
+      if (shouldStopGeminiFallback(error)) break;
+    }
+  }
+  return { value: null, error: primaryError || lastError, lastModel };
+}
+
+function geminiUnavailableWarning(error, defaultMessage, keyMissingMessage, keyInvalidMessage) {
+  if (error?.code === 'gemini-key-missing') return keyMissingMessage;
+  if (error?.code === 'gemini-key-invalid') return keyInvalidMessage;
+  return error?.message ? `${defaultMessage} (${error.message})` : defaultMessage;
+}
+
 async function resolveTicketSemantics(baseTicket, ticketText, options = {}) {
   const primaryModel = options.model || process.env.GEMINI_MODEL || DEFAULT_GEMINI_MODEL;
   const key = options.apiKey || process.env.GEMINI_API_KEY || process.env.POPUP_TICKET_RUNNER_GEMINI_KEY || DEFAULT_GEMINI_API_KEY;
   if (!key) return { ticket: baseTicket, audit: semanticAudit(primaryModel, 'disabled') };
   const models = options.model ? [options.model] : geminiCandidateModels(primaryModel);
-  let lastError = null;
-  let lastModel = primaryModel;
-  for (const model of models) {
-    lastModel = model;
-    try {
-      const response = await requestGeminiTicketJson(ticketText, { ...options, apiKey: key, model });
-      return mergeSemanticTicket(baseTicket, response.value, ticketText, response.model, options.attachmentCandidates || []);
-    } catch (error) {
-      lastError = error;
-      if (error?.code === 'gemini-key-missing' || error?.code === 'gemini-key-invalid') break;
-    }
-  }
+  const attempt = await runGeminiModelsWithFallback(models, primaryModel, async (model) => {
+    const response = await requestGeminiTicketJson(ticketText, { ...options, apiKey: key, model });
+    return mergeSemanticTicket(baseTicket, response.value, ticketText, response.model, options.attachmentCandidates || []);
+  });
+  if (!attempt.error) return attempt.value;
   // Intentionally do not include request details or the API key in the plan.
-  const audit = semanticAudit(lastModel, 'unavailable');
-  const warning = lastError?.code === 'gemini-key-missing'
-    ? 'Gemini key is unavailable.'
-    : lastError?.code === 'gemini-key-invalid'
-      ? 'Gemini API key không hợp lệ hoặc đã hết hạn (Google báo: API key not valid). Hãy cấu hình API key mới.'
-      : 'Gemini semantic fallback was unavailable; deterministic parsing was used.';
-  audit.warnings.push(warning);
+  const audit = semanticAudit(attempt.lastModel, 'unavailable', {
+    errorCode: attempt.error?.code || null,
+    errorDetail: attempt.error?.message || null
+  });
+  audit.warnings.push(geminiUnavailableWarning(
+    attempt.error,
+    'Gemini semantic fallback was unavailable; deterministic parsing was used.',
+    'Gemini key is unavailable.',
+    'Gemini API key không hợp lệ hoặc đã hết hạn (Google báo: API key not valid). Hãy cấu hình API key mới.'
+  ));
   return { ticket: baseTicket, audit };
 }
 
@@ -1153,44 +1259,39 @@ async function resolveTicketVision(ticketText, visionCandidates, options = {}) {
   const key = options.apiKey || process.env.GEMINI_API_KEY || process.env.POPUP_TICKET_RUNNER_GEMINI_KEY || DEFAULT_GEMINI_API_KEY;
   if (!key) return { selection: null, audit: visionAudit(primaryModel, 'disabled') };
   const models = options.model ? [options.model] : geminiCandidateModels(primaryModel);
-  let lastError = null;
-  let lastModel = primaryModel;
-  for (const model of models) {
-    lastModel = model;
-    try {
-      const response = await requestGeminiVisionJson(ticketText, visionCandidates, { ...options, apiKey: key, model });
-      const selection = visionSelectionFromResponse(response.value, visionCandidates);
-      const warnings = Array.isArray(response.value?.warnings)
-        ? response.value.warnings.filter((warning) => typeof warning === 'string').slice(0, 4)
-        : [];
-      if (!selection) {
-        return {
-          selection: null,
-          audit: visionAudit(response.model, 'ambiguous', { warnings: ['Gemini Vision did not identify one sufficiently confident ticket poster.', ...warnings] })
-        };
-      }
+  const attempt = await runGeminiModelsWithFallback(models, primaryModel, async (model) => {
+    const response = await requestGeminiVisionJson(ticketText, visionCandidates, { ...options, apiKey: key, model });
+    const selection = visionSelectionFromResponse(response.value, visionCandidates);
+    const warnings = Array.isArray(response.value?.warnings)
+      ? response.value.warnings.filter((warning) => typeof warning === 'string').slice(0, 4)
+      : [];
+    if (!selection) {
       return {
-        selection,
-        audit: visionAudit(response.model, 'selected', {
-          rationale: selection.rationale,
-          posterSchedules: selection.posterSchedules,
-          warnings: [...selection.scheduleWarnings, ...warnings].slice(0, 4)
-        })
+        selection: null,
+        audit: visionAudit(response.model, 'ambiguous', { warnings: ['Gemini Vision did not identify one sufficiently confident ticket poster.', ...warnings] })
       };
-    } catch (error) {
-      lastError = error;
-      if (error?.code === 'gemini-key-missing' || error?.code === 'gemini-key-invalid') break;
     }
-  }
-  const warning = lastError?.code === 'gemini-key-missing'
-    ? 'Gemini Vision key is unavailable.'
-    : lastError?.code === 'gemini-key-invalid'
-      ? 'Gemini Vision API key không hợp lệ hoặc đã hết hạn (Google báo: API key not valid). Hãy cấu hình API key mới.'
-      : 'Gemini Vision was unavailable; text-based attachment selection was used.';
+    return {
+      selection,
+      audit: visionAudit(response.model, 'selected', {
+        rationale: selection.rationale,
+        posterSchedules: selection.posterSchedules,
+        warnings: [...selection.scheduleWarnings, ...warnings].slice(0, 4)
+      })
+    };
+  });
+  if (!attempt.error) return attempt.value;
   return {
     selection: null,
-    audit: visionAudit(lastModel, 'unavailable', {
-      warnings: [warning]
+    audit: visionAudit(attempt.lastModel, 'unavailable', {
+      errorCode: attempt.error?.code || null,
+      errorDetail: attempt.error?.message || null,
+      warnings: [geminiUnavailableWarning(
+        attempt.error,
+        'Gemini Vision was unavailable; text-based attachment selection was used.',
+        'Gemini Vision key is unavailable.',
+        'Gemini Vision API key không hợp lệ hoặc đã hết hạn (Google báo: API key not valid). Hãy cấu hình API key mới.'
+      )]
     })
   };
 }
@@ -1200,44 +1301,39 @@ async function resolveTicketPopupVisionSet(ticketText, visionCandidates, options
   const key = options.apiKey || process.env.GEMINI_API_KEY || process.env.POPUP_TICKET_RUNNER_GEMINI_KEY || DEFAULT_GEMINI_API_KEY;
   if (!key) return { selection: null, audit: visionAudit(primaryModel, 'disabled') };
   const models = options.model ? [options.model] : geminiCandidateModels(primaryModel);
-  let lastError = null;
-  let lastModel = primaryModel;
-  for (const model of models) {
-    lastModel = model;
-    try {
-      const response = await requestGeminiPopupVisionSetJson(ticketText, visionCandidates, { ...options, apiKey: key, model });
-      const selection = popupAttachmentSetFromResponse(response.value, visionCandidates);
-      const warnings = Array.isArray(response.value?.warnings)
-        ? response.value.warnings.filter((warning) => typeof warning === 'string').slice(0, 4)
-        : [];
-      if (!selection) {
-        return {
-          selection: null,
-          audit: visionAudit(response.model, 'ambiguous', { warnings: ['Gemini Vision did not identify a complete, sufficiently confident popup-poster set.', ...warnings] })
-        };
-      }
+  const attempt = await runGeminiModelsWithFallback(models, primaryModel, async (model) => {
+    const response = await requestGeminiPopupVisionSetJson(ticketText, visionCandidates, { ...options, apiKey: key, model });
+    const selection = popupAttachmentSetFromResponse(response.value, visionCandidates);
+    const warnings = Array.isArray(response.value?.warnings)
+      ? response.value.warnings.filter((warning) => typeof warning === 'string').slice(0, 4)
+      : [];
+    if (!selection) {
       return {
-        selection,
-        audit: visionAudit(response.model, 'selected-set', {
-          rationale: selection.rationale,
-          posterSchedules: selection.posterSchedules,
-          warnings: [...selection.scheduleWarnings, ...warnings].slice(0, 4)
-        })
+        selection: null,
+        audit: visionAudit(response.model, 'ambiguous', { warnings: ['Gemini Vision did not identify a complete, sufficiently confident popup-poster set.', ...warnings] })
       };
-    } catch (error) {
-      lastError = error;
-      if (error?.code === 'gemini-key-missing' || error?.code === 'gemini-key-invalid') break;
     }
-  }
-  const warning = lastError?.code === 'gemini-key-missing'
-    ? 'Gemini Vision key is unavailable.'
-    : lastError?.code === 'gemini-key-invalid'
-      ? 'Gemini Vision API key không hợp lệ hoặc đã hết hạn (Google báo: API key not valid). Hãy cấu hình API key mới.'
-      : 'Gemini Vision was unavailable; no multi-poster CMS change was made.';
+    return {
+      selection,
+      audit: visionAudit(response.model, 'selected-set', {
+        rationale: selection.rationale,
+        posterSchedules: selection.posterSchedules,
+        warnings: [...selection.scheduleWarnings, ...warnings].slice(0, 4)
+      })
+    };
+  });
+  if (!attempt.error) return attempt.value;
   return {
     selection: null,
-    audit: visionAudit(lastModel, 'unavailable', {
-      warnings: [warning]
+    audit: visionAudit(attempt.lastModel, 'unavailable', {
+      errorCode: attempt.error?.code || null,
+      errorDetail: attempt.error?.message || null,
+      warnings: [geminiUnavailableWarning(
+        attempt.error,
+        'Gemini Vision was unavailable; no multi-poster CMS change was made.',
+        'Gemini Vision key is unavailable.',
+        'Gemini Vision API key không hợp lệ hoặc đã hết hạn (Google báo: API key not valid). Hãy cấu hình API key mới.'
+      )]
     })
   };
 }
@@ -1247,49 +1343,76 @@ async function resolveTicketPopupRemovalVision(ticketText, referenceImage, popup
   const key = options.apiKey || process.env.GEMINI_API_KEY || process.env.POPUP_TICKET_RUNNER_GEMINI_KEY || DEFAULT_GEMINI_API_KEY;
   if (!key) return { selection: null, audit: visionAudit(primaryModel, 'disabled') };
   const models = options.model ? [options.model] : geminiCandidateModels(primaryModel);
-  let lastError = null;
-  let lastModel = primaryModel;
-  for (const model of models) {
-    lastModel = model;
-    try {
-      const response = await requestGeminiRemovalVisionJson(ticketText, referenceImage, popupCandidates, { ...options, apiKey: key, model });
-      const decision = removalVisionDecisionFromResponse(response.value, popupCandidates);
-      const warnings = Array.isArray(response.value?.warnings)
-        ? response.value.warnings.filter((warning) => typeof warning === 'string').slice(0, 4)
-        : [];
-      if (decision?.outcome === 'not_found') {
-        return {
-          selection: null,
-          audit: visionAudit(response.model, 'not-found', { rationale: decision.rationale, warnings })
-        };
-      }
-      if (decision?.outcome !== 'matched' || !decision.selection) {
-        return {
-          selection: null,
-          audit: visionAudit(response.model, 'ambiguous', {
-            rationale: decision?.rationale || null,
-            warnings: ['Gemini Vision did not identify one sufficiently certain CMS popup match.', ...warnings]
-          })
-        };
-      }
+  const attempt = await runGeminiModelsWithFallback(models, primaryModel, async (model) => {
+    const response = await requestGeminiRemovalVisionJson(ticketText, referenceImage, popupCandidates, { ...options, apiKey: key, model });
+    const decision = removalVisionDecisionFromResponse(response.value, popupCandidates);
+    const warnings = Array.isArray(response.value?.warnings)
+      ? response.value.warnings.filter((warning) => typeof warning === 'string').slice(0, 4)
+      : [];
+    if (decision?.outcome === 'not_found') {
       return {
-        selection: decision.selection,
-        audit: visionAudit(response.model, 'selected', { rationale: decision.rationale, warnings })
+        selection: null,
+        audit: visionAudit(response.model, 'not-found', { rationale: decision.rationale, warnings })
       };
-    } catch (error) {
-      lastError = error;
-      if (error?.code === 'gemini-key-missing' || error?.code === 'gemini-key-invalid') break;
     }
-  }
-  const warning = lastError?.code === 'gemini-key-missing'
-    ? 'Gemini Vision key is unavailable.'
-    : lastError?.code === 'gemini-key-invalid'
-      ? 'Gemini Vision API key không hợp lệ hoặc đã hết hạn (Google báo: API key not valid). Hãy cấu hình API key mới.'
-      : (lastError?.message ? `Gemini Vision error: ${lastError.message}` : 'Gemini Vision was unavailable; no CMS popup was removed.');
+    if (decision?.outcome !== 'matched' || !decision.selection) {
+      return {
+        selection: null,
+        audit: visionAudit(response.model, 'ambiguous', {
+          rationale: decision?.rationale || null,
+          warnings: ['Gemini Vision did not identify one sufficiently certain CMS popup match.', ...warnings]
+        })
+      };
+    }
+    return {
+      selection: decision.selection,
+      audit: visionAudit(response.model, 'selected', { rationale: decision.rationale, warnings })
+    };
+  });
+  if (!attempt.error) return attempt.value;
   return {
     selection: null,
-    audit: visionAudit(lastModel, 'unavailable', {
-      warnings: [warning]
+    audit: visionAudit(attempt.lastModel, 'unavailable', {
+      errorCode: attempt.error?.code || null,
+      errorDetail: attempt.error?.message || null,
+      warnings: [geminiUnavailableWarning(
+        attempt.error,
+        'Gemini Vision error',
+        'Gemini Vision key is unavailable.',
+        'Gemini Vision API key không hợp lệ hoặc đã hết hạn (Google báo: API key not valid). Hãy cấu hình API key mới.'
+      )]
+    })
+  };
+}
+
+async function resolveVisualDuplicateConfirmation(ticketImage, cmsImage, options = {}) {
+  const primaryModel = options.model || process.env.GEMINI_VISION_MODEL || DEFAULT_GEMINI_VISION_MODEL;
+  const key = options.apiKey || process.env.GEMINI_API_KEY || process.env.POPUP_TICKET_RUNNER_GEMINI_KEY || DEFAULT_GEMINI_API_KEY;
+  if (!key) return { confirmed: null, rationale: null, audit: visionAudit(primaryModel, 'disabled') };
+  const models = options.model ? [options.model] : geminiCandidateModels(primaryModel);
+  const attempt = await runGeminiModelsWithFallback(models, primaryModel, async (model) => {
+    const response = await requestGeminiVisualDuplicateJson(ticketImage, cmsImage, { ...options, apiKey: key, model });
+    const sameArtwork = response.value?.samePosterArtwork;
+    const confidence = Number(response.value?.confidence);
+    const rationale = typeof response.value?.rationale === 'string' ? response.value.rationale.trim().slice(0, 300) : '';
+    let confirmed = null;
+    if (sameArtwork === true && Number.isFinite(confidence) && confidence >= 0.85) confirmed = true;
+    else if (sameArtwork === false && Number.isFinite(confidence) && confidence >= 0.75) confirmed = false;
+    return {
+      confirmed,
+      confidence: Number.isFinite(confidence) ? confidence : null,
+      rationale,
+      audit: visionAudit(response.model, confirmed === true ? 'matched' : (confirmed === false ? 'different' : 'ambiguous'), { rationale })
+    };
+  });
+  if (!attempt.error) return attempt.value;
+  return {
+    confirmed: null,
+    confidence: null,
+    rationale: null,
+    audit: visionAudit(attempt.lastModel, 'unavailable', {
+      errorCode: attempt.error?.code || null,
+      errorDetail: attempt.error?.message || null
     })
   };
 }
@@ -1301,11 +1424,13 @@ module.exports = {
   VISION_SELECTION_SCHEMA,
   MULTI_VISION_SELECTION_SCHEMA,
   REMOVAL_SELECTION_SCHEMA,
+  VISUAL_DUPLICATE_SCHEMA,
   geminiResponseSchema,
   semanticPrompt,
   visionPrompt,
   multiVisionPrompt,
   removalVisionPrompt,
+  visualDuplicatePrompt,
   ticketTextForSemanticPrompt,
   attachmentCandidatesForSemanticPrompt,
   validIsoDate,
@@ -1319,6 +1444,7 @@ module.exports = {
   requestGeminiVisionJson,
   requestGeminiPopupVisionSetJson,
   requestGeminiRemovalVisionJson,
+  requestGeminiVisualDuplicateJson,
   resolveTicketSemantics,
   visionSelectionFromResponse,
   resolveTicketVision,
@@ -1326,5 +1452,6 @@ module.exports = {
   resolveTicketPopupVisionSet,
   removalVisionDecisionFromResponse,
   removalVisionSelectionFromResponse,
-  resolveTicketPopupRemovalVision
+  resolveTicketPopupRemovalVision,
+  resolveVisualDuplicateConfirmation
 };
