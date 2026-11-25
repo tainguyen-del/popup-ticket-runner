@@ -26,12 +26,15 @@ const POPUP_OPEN_DELAY_SECONDS = 3;
 
 function extractPopupDuration(text) {
   if (!text) return null;
-  const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ');
+  const raw = String(text || '');
+  const folded = foldTicketText(raw).replace(/[\t\r\f\v ]+/g, ' ');
 
-  // 1. Explicit slider expression (e.g. "delay slider 13s", "time delay 13", "slider 13s")
-  const sliderMatch = /(?:delay\s*slider|slider\s*delay|time\s*delay|slider)\b[^.;\n]{0,60}?\b(\d{1,3})\s*(?:s|giay|seconds?|sec)?\b/i.exec(folded);
+  // 1. Explicit delay-slider expression (e.g. "delay slider 13s", "time delay 13").
+  // Require a duration unit when bare "slider" is used so website hero references
+  // like "slider 1" or "banner slider 2" are never misread as popup delay seconds.
+  const sliderMatch = /(?:(?:delay\s*slider|slider\s*delay|time\s*delay)\b[^.;\n]{0,60}?\b(\d{1,3})\s*(?:s|giay|seconds?|sec)?|\bslider\b[^.;\n]{0,60}?\b(\d{1,3})\s*(?:giay|seconds?|sec)|slider\b[^.;\n]{0,60}?\b(\d{1,3})s)\b/i.exec(folded);
   if (sliderMatch) {
-    const rawVal = parseInt(sliderMatch[1], 10);
+    const rawVal = parseInt(sliderMatch[1] || sliderMatch[2] || sliderMatch[3], 10);
     if (rawVal > 0 && rawVal <= 120) {
       return {
         requestedSeconds: rawVal >= POPUP_OPEN_DELAY_SECONDS ? rawVal - POPUP_OPEN_DELAY_SECONDS : rawVal,
@@ -48,12 +51,24 @@ function extractPopupDuration(text) {
     /\b(?:pop[\s-]*ups?|announcements?|posters?|banners?)\b[^.;\n]{0,40}?\b(?:lau\s*hon|dai\s*hon|longer)\b[^.;\n]{0,30}?\b(\d{1,3})\s*(?:s|giay|seconds?|sec)\b/gi,
     /\b(?:thoi\s*gian|time)\s*(?:cho\s*)?(?:pop[\s-]*ups?|announcements?|posters?|banners?)\b[^.;\n]{0,30}?\b(\d{1,3})\s*(?:s|giay|seconds?|sec)\b/gi,
     /\b(?:chinh|cai|set|tang|de|cho)\s+(?:pop[\s-]*ups?|announcements?|posters?|banners?)\b[^.;\n]{0,80}?\b(\d{1,3})\s*(?:s|giay|seconds?|sec)\b/gi,
-    /\b(?:pop[\s-]*ups?|announcements?|posters?|banners?)\b[^.;\n]{0,80}?\b(\d{1,3})\s*(?:s|giay|seconds?|sec)\b/gi
+    /\b(?:pop[\s-]*ups?|announcements?|posters?|banners?)\b[^.;\n]{0,80}?\b(\d{1,3})(?:s|\s*(?:giay|seconds?|sec))\b/gi
   ];
 
-  for (const pattern of patterns) {
+  // Guard against US street direction numbers like "15 S Main St" or decade eras ("80s", "90s")
+  const rawAddressSouthPattern = /\b\d{1,3}\s+S\.?(?=\s+[A-Z0-9])/g;
+  const addressSouthNumbers = new Set([...raw.matchAll(rawAddressSouthPattern)].map((m) => m[0].trim().split(/\s+/)[0]));
+
+  for (let pIndex = 0; pIndex < patterns.length; pIndex += 1) {
+    const pattern = patterns[pIndex];
     for (const match of folded.matchAll(pattern)) {
       const rawSec = parseInt(match[1], 10);
+      const token = match[0];
+      if (pIndex === 5 && /^(?:70|80|90)s$/i.test(`${match[1]}s`) && /\b(?:70|80|90)s\b/i.test(token)) {
+        continue;
+      }
+      if (addressSouthNumbers.has(match[1]) && new RegExp(String.raw`\b${match[1]}\s+S\b`, 'i').test(token)) {
+        continue;
+      }
       if (rawSec > 0 && rawSec <= 120) {
         return {
           requestedSeconds: rawSec,
@@ -70,13 +85,18 @@ function extractPopupDuration(text) {
 function hasAffirmativePosterUpload(text) {
   const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim();
   const posterEntity = /\b(?:posters?|banners?|hinh|anh|file|dinh\s*kem|attachment|image)\b/i;
-  const uploadAction = /\b(?:add(?:ed)?|creat(?:e|ed)|upload(?:ed)?|publish(?:ed)?|them|tao|dang|up|len(?:\s+web)?)\b/gi;
+  const uploadAction = /\b(?:add(?:ed)?|creat(?:e|ed)|upload(?:ed)?|publish(?:ed)?|them|tao|dang|up|len(?:\s+web)?|treo|gan|chen)\b/gi;
   for (const match of folded.matchAll(uploadAction)) {
     if (actionIsNegated(folded, match.index)) continue;
     const { start, end } = clauseBounds(folded, match.index);
-    if (posterEntity.test(folded.slice(start, end))) return true;
+    const clause = folded.slice(start, end);
+    if (posterEntity.test(clause)) return true;
+    // Also detect explicit creation/upload of a new popup (e.g. "tao popup moi", "up popup nay len web")
+    if (/\b(?:new\s+pop[\s-]*ups?|pop[\s-]*ups?\s+(?:moi|nay)|(?:them|tao|dang|up|upload|add|create|publish)\s+(?:giup\s+)?(?:em\s+|tiem\s+)?(?:cai\s+)?pop[\s-]*up\b)\b/i.test(clause)) {
+      return true;
+    }
   }
-  const popupAsVerb = /\bpop[\s-]*up\s+(?:cho|giup)?\s*(?:poster|banner|image|anh|hinh|file|dinh\s*kem)\b/gi;
+  const popupAsVerb = /\bpop[\s-]*up\s+(?:cho\s+tiem|cho\s+web|cho|giup(?:\s+(?:em|tiem|anh|chi))?)?\s*(?:poster|banner|image|anh|hinh|tam\s+(?:hinh|anh)|file|dinh\s*kem)\b/gi;
   for (const match of folded.matchAll(popupAsVerb)) {
     if (!actionIsNegated(folded, match.index)) return true;
   }

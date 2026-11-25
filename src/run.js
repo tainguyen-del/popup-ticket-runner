@@ -18,6 +18,7 @@ const {
   findTicketDate,
   endOfMonthExpiryFromTicket,
   ticketData,
+  hasAffirmativePopupUpdate,
   isPopupRemovalAction,
   popupActionNeedsTicketImage,
   hasMultiPosterIntent,
@@ -708,6 +709,14 @@ async function openPageEditor(page, baseUrl) {
   await page.getByText('index.yml', { exact: true }).waitFor({ state: 'visible', timeout: 15000 });
   await page.getByText('index.yml', { exact: true }).first().click();
   await page.getByText('Content blocks', { exact: true }).waitFor({ state: 'visible', timeout: 15000 });
+  // Content blocks header often renders before Vue mounts the section cards for index.yml.
+  if (typeof page.locator === 'function') {
+    const cardsLocator = page.locator('div[id^="item_block_section#"]');
+    const firstCard = typeof cardsLocator?.first === 'function' ? cardsLocator.first() : null;
+    if (typeof firstCard?.waitFor === 'function') {
+      await firstCard.waitFor({ state: 'visible', timeout: 3000 }).catch(() => {});
+    }
+  }
 }
 
 async function visiblePopupSection(page, description = null) {
@@ -724,6 +733,13 @@ function isCorruptedSectionText(text) {
   return /^N\/?A[\s\n]+N\/?A$/i.test(trimmed) || trimmed === 'N/A';
 }
 
+function isAnnouncementSectionText(text) {
+  const raw = String(text || '');
+  if (isCorruptedSectionText(raw)) return false;
+  return /(?:^|\n)\s*(?:Annoucement|Announcement)\s+Popup(?:\s*\(\*\))?\s*(?:\n|$)/i.test(raw)
+    || /\bANNOUNCEMENT\s+\d{3,}\b/i.test(raw);
+}
+
 async function popupSectionCards(page, { includeCorrupted = false } = {}) {
   const cards = page.locator('div[id^="item_block_section#"]');
   const validCards = [];
@@ -734,7 +750,7 @@ async function popupSectionCards(page, { includeCorrupted = false } = {}) {
     const text = (await card.innerText().catch(() => '')).trim();
     const cardId = await card.getAttribute('id').catch(() => null);
     const stableCard = cardId ? sectionCardLocatorById(page, cardId).first() : card;
-    if (/(?:^|\n)(?:Annoucement|Announcement) Popup(?:\n|$)/.test(text)) validCards.push(stableCard);
+    if (isAnnouncementSectionText(text)) validCards.push(stableCard);
     else if (isCorruptedSectionText(text)) corruptedCards.push(stableCard);
   }
   if (includeCorrupted) {
@@ -940,9 +956,17 @@ async function ensurePopupSection(page, baseUrl, { replaceExisting = false, expe
 
 // A duration-only ticket changes settings on an existing popup. It must never
 // use the creation path, otherwise a missing section becomes a new empty block.
-async function existingPopupSection(page, baseUrl, { expectedPluginVersion = null } = {}) {
+async function existingPopupSection(page, baseUrl, { expectedPluginVersion = null, waitMs = 4000 } = {}) {
   await openPageEditor(page, baseUrl);
-  const existing = await popupSectionCards(page);
+  let existing = await popupSectionCards(page);
+  if (!existing.length && waitMs > 0) {
+    const deadline = Date.now() + waitMs;
+    while (Date.now() < deadline) {
+      await page.waitForTimeout(250);
+      existing = await popupSectionCards(page);
+      if (existing.length) break;
+    }
+  }
   if (!existing.length) {
     const error = new Error('No existing Announcement Popup section was found. A duration-only ticket cannot create a new popup section.');
     error.stage = 'popup-section-not-found';
@@ -3218,6 +3242,22 @@ async function main() {
       );
       plan.ticket.attachmentCount = ticketContext.attachmentCandidates.length;
       plan.ticket = resolveRemovalScopeFromAttachments(plan.ticket, ticketContext.attachmentCandidates);
+      // If a ticket carries a non-removal poster attachment (especially an uploaded file card)
+      // and mentions display duration, treat it as creating/updating that popup poster while keeping
+      // popupDuration, unless Gemini explicitly set requiresAttachment === false on a reference screenshot.
+      const hasUploadableAttachment = ticketContext.attachmentCandidates.some((c) => !c.isRemovalReference);
+      const hasUploadCardAttachment = ticketContext.attachmentCandidates.some((c) => !c.isRemovalReference && c.kind === 'upload-card');
+      if (
+        plan.ticket.popupAction === 'update-duration'
+        && hasUploadableAttachment
+        && (
+          plan.ticket.requiresAttachment === true
+          || Boolean(plan.ticket.popupAttachmentIndex)
+          || (plan.ticket.requiresAttachment !== false && (hasUploadCardAttachment || hasAffirmativePopupUpdate(body)))
+        )
+      ) {
+        plan.ticket.popupAction = 'create';
+      }
       if (plan.ticket.actionSummary) {
         progress('ticket-plan', `Kế hoạch thực hiện: ${plan.ticket.actionSummary}`, {
           action: plan.ticket.popupAction,
@@ -4329,9 +4369,11 @@ module.exports = {
   waitForPopupListItemsPanel,
   popupListItemEditorIsOpen,
   ensurePopupSection,
+  existingPopupSection,
   openPageEditor,
   sectionCardLocatorById,
   isCorruptedSectionText,
+  isAnnouncementSectionText,
   popupSectionCards,
   popupSectionCardById,
   openPopupSection,

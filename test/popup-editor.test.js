@@ -21,6 +21,8 @@ const {
 const {
   sectionCardLocatorById,
   isCorruptedSectionText,
+  isAnnouncementSectionText,
+  existingPopupSection,
   openPopupSection
 } = require('../src/run');
 
@@ -898,6 +900,50 @@ test('waitForPopupImageUpload prefers a permanent asset URL when a transient blo
 
   const result = await waitForPopupImageUpload(page, popupPanel, ['https://cdn.example/old-poster.webp'], 1500);
   assert.equal(result.uploadedImageUrl, 'https://cdn.example/final-uploaded-poster.webp');
+});
+
+test('existingPopupSection waits for async Vue section card mount and matches ANNOUNCEMENT 1038 labels', async () => {
+  assert.equal(isAnnouncementSectionText('ANNOUNCEMENT 1038 (*)\nAnnoucement Popup  '), true);
+  assert.equal(isAnnouncementSectionText('ANNOUNCEMENT 1034'), true);
+  assert.equal(isAnnouncementSectionText('N/A\nN/A'), false);
+
+  let polls = 0;
+  const announcementCard = {
+    isVisible: async () => true,
+    innerText: async () => 'ANNOUNCEMENT 1038 (*)\nAnnoucement Popup  ',
+    getAttribute: async () => 'item_block_section#9'
+  };
+  const mockPage = {
+    goto: async () => {},
+    waitForTimeout: async () => {},
+    getByText: () => ({
+      waitFor: async () => {},
+      first: () => ({ click: async () => {} })
+    }),
+    locator: (sel) => {
+      if (sel === 'div[id^="item_block_section#"]') {
+        polls += 1;
+        // Simulate Vue hydrating section cards on the 3rd poll after Content blocks becomes visible
+        const ready = polls >= 3;
+        return {
+          count: async () => (ready ? 1 : 0),
+          first: () => ({ waitFor: async () => {} }),
+          nth: () => announcementCard
+        };
+      }
+      if (sel === 'div[id="item_block_section#9"]') {
+        return { first: () => announcementCard };
+      }
+      return { count: async () => 0 };
+    }
+  };
+
+  const section = await existingPopupSection(mockPage, 'https://cms.example/projects/1', {
+    expectedPluginVersion: '1.0.38',
+    waitMs: 1000
+  });
+  assert.equal(section.exists, true);
+  assert.equal(section.sectionId, 'item_block_section#9');
 });
 
 

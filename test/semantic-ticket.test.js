@@ -958,3 +958,38 @@ test('resolveVisualDuplicateConfirmation distinguishes different announcements s
   assert.equal(sameArtwork.audit.status, 'matched');
 });
 
+test('mergeSemanticTicket allows Gemini create + requiresAttachment to override deterministic update-duration', () => {
+  const deterministic = {
+    ...baseTicket,
+    popupAction: 'update-duration',
+    popupDuration: { requestedSeconds: 10, delaySliderSeconds: 13, isExplicitSlider: false }
+  };
+  const { ticket, audit } = mergeSemanticTicket(deterministic, {
+    siteId: '16266',
+    popupRequested: true,
+    operation: 'create',
+    actionSummary: 'Tạo popup mới từ ảnh đính kèm với thời gian 10s',
+    removalTopic: null,
+    requiresAttachment: true,
+    popupPosition: null,
+    startDate: null,
+    endDate: null,
+    popupAttachmentIndex: 1,
+    popupLink: null,
+    confidence: 0.95,
+    evidence: {
+      siteId: 'ID#16266',
+      operation: 'pop up giup tiem 10s',
+      popupPosition: null,
+      startDate: null,
+      endDate: null,
+      popupAttachmentIndex: 'poster.png'
+    },
+    warnings: []
+  }, 'ID#16266\nNhờ team pop up giúp tiệm 10s', undefined, [{ index: 1, filename: 'poster.png', context: 'poster.png' }]);
+
+  assert.equal(ticket.popupAction, 'create');
+  assert.equal(ticket.popupDuration.requestedSeconds, 10);
+  assert.ok(audit.appliedFields.includes('popupAction'));
+});
+

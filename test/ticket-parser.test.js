@@ -1176,3 +1176,19 @@ test('ticketData extracts expiry dates with Vietnamese removal/hiding phrasing v
   const t4 = parsed('ID#100 - Support\nPlease pop up poster and hide after 11/27/2026', 103);
   assert.equal(t4.expiryDate, `${currentYear}-11-27`);
 });
+
+test('extractPopupDuration avoids street addresses, decades, and bare slider indexes while handling create + duration phrasing', () => {
+  const { extractPopupDuration } = require('../src/ticket-parser');
+  assert.equal(extractPopupDuration('ID#2001\nNhờ team pop up giúp tiệm ở 15 S Main St, cảm ơn.'), null);
+  assert.equal(extractPopupDuration('ID#2002\nNhờ team đăng banner trên slider 1 của trang chủ.'), null);
+  assert.equal(extractPopupDuration('ID#2003\nPop up poster 90s retro night'), null);
+
+  const addressCreate = parsed('ID#2001\nNhờ team pop up giúp tiệm ở 15 S Main St', 1608801);
+  assert.equal(addressCreate.popupDuration, null);
+  assert.equal(addressCreate.popupAction, 'create');
+
+  const newPopupWithDuration = parsed('ID#2004\nNhờ team up popup mới lên web hiển thị 10s giúp em.', 1608802);
+  assert.equal(newPopupWithDuration.popupAction, 'create');
+  assert.equal(newPopupWithDuration.popupDuration.requestedSeconds, 10);
+  assert.equal(newPopupWithDuration.popupDuration.delaySliderSeconds, 13);
+});

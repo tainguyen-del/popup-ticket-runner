@@ -385,8 +385,8 @@ function semanticPrompt(ticketText, attachmentCandidates = []) {
     '  * remove: The ticket asks to remove, delete, take down, or turn off an existing popup without adding any new poster (e.g. "gỡ giúp em poster thông báo nghĩ lễ đang có trên cms", "xóa popup", "tắt thông báo nghỉ lễ", "remove popup", "take down announcement"). requiresAttachment must be false.',
     '  * remove-all: The ticket explicitly asks to remove ALL current popups (e.g. "xóa toàn bộ popup", "gỡ hết popup"). requiresAttachment must be false.',
     '  * replace: The ticket asks to replace, swap, change, or "gỡ [A] và pop up [B]" / "đổi poster" / "update lại poster" an existing poster with a new one. requiresAttachment must be true.',
-    '  * create: The ticket asks to add/create/publish a brand-new popup poster. requiresAttachment must be true.',
-    '  * update-duration: The ticket only asks to adjust popup display time/delay/duration without changing poster. requiresAttachment must be false.',
+    '  * create: The ticket asks to add/create/publish a brand-new popup poster (even if display seconds are also mentioned). requiresAttachment must be true.',
+    '  * update-duration: ONLY when the ticket adjusts popup display time/delay/duration WITHOUT uploading or creating a new poster image. requiresAttachment must be false.',
     '- actionSummary: A concise, authoritative sentence in Vietnamese explaining what the automation tool must execute (e.g. "Gỡ poster thông báo nghỉ lễ đang có trên CMS và Build website", "Tạo popup mới từ poster đính kèm và cài đặt ngày kết thúc 2026-11-25", "Thay thế poster cũ bằng poster mới", "Cập nhật thời gian hiển thị popup thành 10 giây").',
     '- removalTopic: If operation is remove or replace, specify the topic, event, or description of the popup to remove (e.g. "thông báo nghỉ lễ", "holiday closure", "thanksgiving announcement", "poster cũ"), otherwise null.',
     '- requiresAttachment: boolean indicating whether this operation requires uploading a new image attachment from CRM.',
@@ -1045,8 +1045,10 @@ function mergeSemanticTicket(baseTicket, semantic, ticketText, model = DEFAULT_G
         if (!audit.appliedFields.includes('popupAction')) audit.appliedFields.push('popupAction');
       }
     } else if (semantic.operation === 'update-duration') {
-      ticket.popupAction = 'update-duration';
-      if (!audit.appliedFields.includes('popupAction')) audit.appliedFields.push('popupAction');
+      if (ticket.popupDuration && semantic.requiresAttachment === false && attachmentCandidates.length === 0) {
+        ticket.popupAction = 'update-duration';
+        if (!audit.appliedFields.includes('popupAction')) audit.appliedFields.push('popupAction');
+      }
     } else if (semantic.operation === 'create') {
       if (ticket.popupAction !== 'replace' && !hasAffirmativePopupReplace(ticketText)) {
         ticket.popupAction = 'create';
@@ -1066,7 +1068,7 @@ function mergeSemanticTicket(baseTicket, semantic, ticketText, model = DEFAULT_G
       audit.appliedFields.push('popupAction');
     }
   }
-  if ((ticket.popupAction === 'remove-one' || ticket.popupAction === 'replace') && semantic.operation === 'create' && canUseEvidence('operation', createEvidenceIsExplicit)) {
+  if ((ticket.popupAction === 'remove-one' || ticket.popupAction === 'replace' || ticket.popupAction === 'update-duration') && semantic.operation === 'create' && (canUseEvidence('operation', createEvidenceIsExplicit) || (semantic.requiresAttachment === true && attachmentCandidates.length > 0))) {
     if (!hasAffirmativePopupReplace(ticketText)) {
       ticket.popupAction = 'create';
       audit.appliedFields.push('popupAction');

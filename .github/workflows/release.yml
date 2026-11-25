@@ -46,6 +46,10 @@ jobs:
           body: |
             ## Popup Ticket Runner v${{ steps.pkg.outputs.version }}
             - Commit: `${{ github.sha }}`
+            - **Sửa triệt để lỗi `popup-section-not-found` & nhận diện đúng ticket chỉnh thời gian vs tạo popup mới (Ticket #1608801):**
+              - Loại trừ số địa chỉ hướng Nam (`15 S Main St`), thập niên (`80s`, `90s`) và chỉ số slider website (`slider 1`, `slider 2`) khỏi bộ lọc nhận diện thời lượng `extractPopupDuration` để tránh phân loại nhầm ticket tạo popup thành `update-duration`.
+              - Mở rộng `hasAffirmativePosterUpload` và `mergeSemanticTicket` cho các cách diễn đạt tạo/up popup mới; khi ticket có ảnh đính kèm mới và có yêu cầu thời gian hiển thị, tool tự động chạy luồng upload poster kèm cài đặt `Time delay slider` thay vì chặn bởi luồng duration-only.
+              - Sửa `openPageEditor`, `popupSectionCards` (`isAnnouncementSectionText`) và `existingPopupSection` chờ Vue render danh sách `div[id^="item_block_section#"]` sau khi mở `index.yml` (tối đa 4s) và khớp linh hoạt nhãn `Announcement Popup` / `ANNOUNCEMENT 1038`.
             - **Gỡ popup thông minh theo chủ đề & Tự động nâng cấp plugin lên 1.0.38 khi gỡ popup:**
               - Hỗ trợ ticket yêu cầu gỡ popup chỉ bằng ngữ cảnh văn bản (không cần ảnh đính kèm, VD: *"xóa giúp poster thông báo nghỉ lễ trên website"*): Gemini tự nhận diện hành động (`remove-one` / `remove-all`), chủ đề cần gỡ (`removalTopic`) và trả về kế hoạch thực hiện (`actionSummary`).
               - Hỗ trợ nhận diện và gỡ **cùng lúc nhiều popup** khớp yêu cầu từ Gemini Vision (VD: tiệm có 2 poster thông báo nghỉ lễ giống hoặc cùng chủ đề).
