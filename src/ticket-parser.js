@@ -190,8 +190,13 @@ function parseConversationComments(raw) {
   return comments;
 }
 
+function stripCrmComposerChrome(raw) {
+  return String(raw || '')
+    .replace(/\r?\n\s*Show task\s*\r?\n\s*Show Jira issues[\s\S]*?(?=\r?\n\s*Conversations\s*(?:\r?\n|$)|$)/i, '\n');
+}
+
 function activeTicketRequestText(body) {
-  const raw = String(body || '');
+  const raw = stripCrmComposerChrome(body);
   const comments = parseConversationComments(raw);
   if (!comments.length) return raw;
   const completionIdx = comments.findIndex((comment) => isCompletionReplyComment(comment.body));
@@ -346,7 +351,8 @@ function hasIndefiniteScheduleInstruction(text) {
     /\b(?:khong\s+(?:co\s+)?(?:han|ngay\s*(?:het\s*han|ket\s*thuc))|khong\s*(?:set|cai|de)\s*han)\b/i,
     /\bchay\s+(?:lien\s*tuc|vo\s+thoi\s+han)\b/i,
     /\buntil\s+(?:client|customer)\s+(?:asks?\s+to\s+)?(?:turn\s*off|remove|stop)\b/i,
-    /\b(?:no\s+exp(?:iry|iration)?|no\s+end\s*date|indefinite|run\s+continuously)\b/i
+    /\b(?:no\s+exp(?:iry|iration)?|no\s+end\s*date|indefinite|run\s+continuously)\b/i,
+    /\b(?:exp(?:iry|iration)?|end\s*date|han|ngay\s*(?:het\s*han|ket\s*thuc))\s*[:=-]?\s*(?:khong(?:\s*co)?|ko(?:\s*co)?|chua(?:\s*co)?|none|nil|null|n\/a|na|tbd|no(?:\s*(?:date|limit|expiry))?|unlimited|indefinite|forever)(?:\s|$|[.,;])/i
   ];
 
   return patterns.some((pattern) => pattern.test(folded));
@@ -727,7 +733,10 @@ function ticketData(body, ticketUrl) {
     /(?:id\s*(?:website|site|project))\s*[:#-]?\s*(\d{2,})/i
   ].map((rule) => raw.replace(/\s+/g, ' ').match(rule)?.[1]).find(Boolean) || null;
   const isIndefinite = hasIndefiniteScheduleInstruction(activeRaw);
-  const expiry = isIndefinite ? null : (/\b(?:exp(?:\.|\b)|expiry\b|expiration\b|expires?\b|end\s*date\b)\s*[:\-]?\s*([^|\n]{3,50})/i.exec(text)?.[1]?.trim() || null);
+  const rawExpiryMatch = isIndefinite ? null : (/\b(?:exp(?:\.|\b)|expiry\b|expiration\b|expires?\b|end\s*date\b)\s*[:=-]?\s*([^\r\n|]{1,60})/i.exec(activeRaw)?.[1]?.trim() || null);
+  const expiry = rawExpiryMatch && (normalizeExpiry(rawExpiryMatch) || /\d|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec|thanksgiving)\b/i.test(rawExpiryMatch))
+    ? rawExpiryMatch
+    : null;
   const fromPattern = String.raw`\bfrom\s*(?:date|time)?\s*[:=-]|\bfrom\s+(?:date|time)\b|\bfrom(?=\s+(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s*)?(?:${DATE_TOKEN_SOURCE}))`;
   const start = isIndefinite ? null : findTicketDate(activeRaw, [
     String.raw`\b(?:time\s*start|start\s*(?:date|time)?|popup\s*start|ngay\s*(?:bat\s*dau|dang|hien)|thoi\s*gian\s*(?:bat\s*dau|hien)|tu\s+ngay|hen(?:\s+(?:ngay|gio|lich))?)\b`,
@@ -849,6 +858,7 @@ module.exports = {
   foldTicketText,
   isCompletionReplyComment,
   parseConversationComments,
+  stripCrmComposerChrome,
   activeTicketRequestText,
   hasAffirmativePopupRemoval,
   hasAffirmativeExpiredRemoval,

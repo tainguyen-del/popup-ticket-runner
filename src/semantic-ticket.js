@@ -4,6 +4,7 @@ const {
   foldTicketText,
   normalizeExpiry,
   actionIsNegated,
+  stripCrmComposerChrome,
   POPUP_OPEN_DELAY_SECONDS
 } = require('./ticket-parser');
 const { formatCasesForPrompt } = require('./case-knowledge');
@@ -48,7 +49,7 @@ const SEMANTIC_SCHEMA = {
     actionSummary: { type: ['string', 'null'], description: 'Clear short action sentence in Vietnamese explaining what the automation tool must execute (e.g. "Gỡ poster thông báo nghỉ lễ Thanksgiving trên CMS và Build web", "Tạo popup mới từ poster đính kèm").' },
     removalTopic: { type: ['string', 'null'], description: 'Topic or description of the popup to remove if applicable (e.g. "thông báo nghỉ lễ", "holiday closure", "poster cũ"), otherwise null.' },
     requiresAttachment: { type: 'boolean', description: 'True if operation needs a new poster uploaded from the ticket; false if pure removal or duration update.' },
-    isIndefinite: { type: 'boolean', description: 'True ONLY when the ticket explicitly says to keep the popup active indefinitely until client asks to turn it off (e.g. "đến khi khách tắt", "không cài hạn", "chạy liên tục"). False when an end/turn-off date is given or unspecified.' },
+    isIndefinite: { type: 'boolean', description: 'True ONLY when the ticket explicitly says no expiry date exists or asks to keep the popup active indefinitely until client turns it off (e.g. "exp: không có", "exp: none", "đến khi khách tắt", "không cài hạn", "chạy liên tục"). False when a specific expiry date is given or unspecified.' },
     isMultiPoster: { type: 'boolean', description: 'True ONLY when the ticket explicitly asks to publish more than one separate new popup poster together (e.g. "2 poster", "cả 2 banner", "both posters"). False for single-poster tickets, even when later comments send a replacement image or note keeping existing CMS popups.' },
     hasInlineRemoval: { type: 'boolean', description: 'True when the ticket asks to publish new poster(s) AND remove another specific existing popup, or when operation is replace. False otherwise.' },
     keepExistingPopups: { type: 'boolean', description: 'True when the ticket explicitly notes to keep/preserve current active popups on CMS.' },
@@ -359,24 +360,34 @@ function posterSchedulesFromResponse(rawSchedules, visionCandidates, selectedInd
   };
 }
 
+const NO_EXPIRY_EVIDENCE_PATTERN = /^(?:khong(?:\s*co)?|ko(?:\s*co)?|chua(?:\s*co)?|none|nil|null|n\/a|na|tbd|no(?:\s*(?:date|limit|expiry))?|unlimited|indefinite|forever)(?:\b|$)/i;
+
 function exactEvidenceInTicket(ticketText, evidence) {
   const needle = compact(evidence);
   if (!needle) return false;
   if (compact(ticketText).includes(needle)) return true;
+  const foldedTicket = compact(foldTicketText(ticketText));
   const foldedNeedle = compact(foldTicketText(evidence));
-  return Boolean(foldedNeedle) && compact(foldTicketText(ticketText)).includes(foldedNeedle);
+  if (!foldedNeedle) return false;
+  if (foldedTicket.includes(foldedNeedle)) return true;
+  const tokens = foldedNeedle.split(/[^a-z0-9]+/).filter((token) => token.length >= 2);
+  if (tokens.length >= 2) {
+    return tokens.every((token) => new RegExp(`\\b${token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i').test(foldedTicket));
+  }
+  return false;
 }
 
 function siteIdIsExplicit(ticketText, siteId) {
   if (!/^\d{2,}$/.test(siteId || '')) return false;
   const escaped = siteId.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const header = new RegExp(`(?:\\bID\\s*(?:#\\s*|[-:]\\s*)?${escaped}\\s*[-:]|(?:^|\\n)\\s*${escaped}\\s*-\\s*)`, 'im');
+  const header = new RegExp(`(?:\\bID\\s*(?:#\\s*|[-:]\\s*)?${escaped}\\s*[-:]|(?:^|\\n)\\s*#?${escaped}\\s*[-:|])`, 'im');
   const labelled = new RegExp(`\\b(?:website|site|project)\\s*(?:id|#)?\\s*[:#-]?\\s*${escaped}\\b`, 'i');
   return header.test(ticketText) || labelled.test(ticketText);
 }
 
 function dateEvidenceLooksRelevant(evidence) {
-  return /(?:\d{1,2}[./-]\d{1,2}(?:[./-](?:20)?\d{2})?|20\d{2}[./-]\d{1,2}[./-]\d{1,2}|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\b)/i.test(evidence || '');
+  const folded = foldTicketText(evidence || '');
+  return /(?:\d{1,2}[./-]\d{1,2}(?:[./-](?:20)?\d{2})?|20\d{2}[./-]\d{1,2}[./-]\d{1,2}|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\b|\b(?:thang|ngay|het|cuoi|end\s+of|month|week|year|thanksgiving|christmas|xmas|halloween|new\s*year)\b)/i.test(folded);
 }
 
 function startEvidenceIsClosureOnly(evidence) {
@@ -444,7 +455,7 @@ function operationEvidenceIsSafe(operation, evidenceOp) {
 }
 
 function ticketTextForSemanticPrompt(ticketText, limit = 40000) {
-  const text = String(ticketText || '');
+  const text = stripCrmComposerChrome(ticketText);
   if (text.length <= limit) return text;
   const headLength = Math.min(10000, Math.floor(limit / 3));
   const tailLength = Math.max(0, limit - headLength);
@@ -496,7 +507,7 @@ function semanticPrompt(ticketText, attachmentCandidates = []) {
     '  * create: The ticket asks to add/create/publish a brand-new popup poster (even if display seconds are also mentioned). requiresAttachment must be true.',
     '  * update-duration: ONLY when the ticket adjusts popup display time/delay/duration WITHOUT uploading or creating a new poster image. requiresAttachment must be false.',
     '- IMPORTANT ON SCHEDULED AUTO-TURN-OFF / EXPIRY PHRASES: Phrases such as "Auto turn off poster: 1/01/2027", "Schedule gỡ pop up 11/26", "tắt sau ngày 27/11", "ẩn vào cuối ngày..." define endDate for the new/replaced popup ("operation": "create" or "replace"), NEVER "remove".',
-    '- isIndefinite: true ONLY when the ticket explicitly instructs keeping the popup running with NO expiry until the client asks to turn it off (e.g. "đến khi khách tắt", "không cài hạn", "chạy liên tục"). Must be false whenever endDate is set or not mentioned.',
+    '- isIndefinite: true when the ticket explicitly states NO expiry date exists or instructs keeping the popup running indefinitely (e.g. "exp: không có", "exp: ko có", "exp: none", "exp: N/A", "không cài hạn", "đến khi khách tắt", "chạy liên tục"). Must be false whenever a concrete endDate is set or expiry is simply unmentioned.',
     '- isMultiPoster: true ONLY when the active request explicitly asks to publish MORE THAN ONE new popup poster simultaneously (e.g. "2 coupon pop up đính kèm", "cả 2 poster", "up 2 hình"). Keep false for single-popup tickets even if an old attachment is replaced by a later comment attachment, or if the note says to keep existing CMS popups ("vẫn giữ 2 coupon hiện có").',
     '- hasInlineRemoval: true when creating new poster(s) AND ALSO asking to remove a specific existing CMS popup (or when operation is "replace").',
     '- keepExistingPopups: true when the ticket asks to preserve/keep current active popups on CMS.',
@@ -1086,19 +1097,31 @@ function mergeSemanticTicket(baseTicket, semantic, ticketText, model = DEFAULT_G
 
   const semanticStart = validIsoDate(semantic.startDate) ? semantic.startDate : normalizeExpiry(semantic.startDate);
   const semanticEnd = validIsoDate(semantic.endDate) ? semantic.endDate : normalizeExpiry(semantic.endDate);
-  if (typeof semantic.isIndefinite === 'boolean') {
-    if (semantic.isIndefinite && !semanticEnd && exactEvidenceInTicket(ticketText, evidence.endDate || evidence.operation)) {
+  const explicitNoExpiryEvidence = NO_EXPIRY_EVIDENCE_PATTERN.test(
+    foldTicketText(evidence.endDate || '').replace(/\s+/g, ' ').trim()
+  );
+  ticket.scheduleError = null;
+  if (!ticket.expiryDate) ticket.expiry = null;
+  if (!ticket.startDate) ticket.start = null;
+
+  if (typeof semantic.isIndefinite === 'boolean' || explicitNoExpiryEvidence) {
+    if ((semantic.isIndefinite === true || explicitNoExpiryEvidence) && !semanticEnd && exactEvidenceInTicket(ticketText, evidence.endDate || evidence.operation)) {
       const changed = ticket.isIndefinite !== true;
       ticket.isIndefinite = true;
       ticket.start = null;
       ticket.startDate = null;
       ticket.expiry = null;
       ticket.expiryDate = null;
+      ticket.scheduleError = null;
       ticket.scheduleSource = 'gemini-semantic';
       ticket.scheduleEvidence = evidence.endDate || evidence.operation || ticket.scheduleEvidence || null;
       if (changed && !audit.appliedFields.includes('isIndefinite')) audit.appliedFields.push('isIndefinite');
-    } else if (!semantic.isIndefinite && ticket.isIndefinite && semanticEnd && canUseEvidence('endDate', dateEvidenceLooksRelevant)) {
+    } else if (semantic.isIndefinite === false && !explicitNoExpiryEvidence && ticket.isIndefinite) {
       ticket.isIndefinite = false;
+      if (!semanticEnd && ticket.scheduleSource === 'ticket-indefinite') {
+        ticket.scheduleSource = null;
+        ticket.scheduleEvidence = null;
+      }
       if (!audit.appliedFields.includes('isIndefinite')) audit.appliedFields.push('isIndefinite');
     }
   }
@@ -1120,11 +1143,18 @@ function mergeSemanticTicket(baseTicket, semantic, ticketText, model = DEFAULT_G
     } else if (!ticket.expiry && ticket.expiryDate) {
       ticket.expiry = ticket.expiryDate;
     }
+    if (!ticket.startDate && !ticket.expiryDate && ticket.scheduleSource === 'labels') {
+      ticket.scheduleSource = null;
+      ticket.scheduleEvidence = null;
+    }
     if (ticket.startDate && ticket.expiryDate && ticket.expiryDate < ticket.startDate) {
       if (audit.appliedFields.includes('expiryDate')) {
-        ticket.expiryDate = baseTicket.expiryDate || null;
-        ticket.expiry = baseTicket.expiry || null;
+        ticket.expiryDate = validIsoDate(baseTicket.expiryDate) ? baseTicket.expiryDate : null;
+        ticket.expiry = ticket.expiryDate;
         audit.appliedFields = audit.appliedFields.filter((field) => field !== 'expiryDate');
+      }
+      if (ticket.startDate && ticket.expiryDate && ticket.expiryDate < ticket.startDate) {
+        ticket.scheduleError = 'Popup end date is before its start date and the ticket does not provide a safe cross-year range.';
       }
       audit.warnings.push('Gemini dates form an invalid reversed range.');
     }
@@ -1250,7 +1280,7 @@ function mergeSemanticTicket(baseTicket, semantic, ticketText, model = DEFAULT_G
   if (semanticAttachmentIndex !== null) {
     const candidate = attachmentCandidateByIndex(attachmentCandidates, semanticAttachmentIndex);
     const evidenceText = evidence.popupAttachmentIndex;
-    if (candidate && attachmentEvidenceInContext(candidate, evidenceText)) {
+    if (candidate && (attachmentCandidates.length === 1 || attachmentEvidenceInContext(candidate, evidenceText))) {
       ticket.popupAttachmentIndex = semanticAttachmentIndex;
       audit.appliedFields.push('popupAttachmentIndex');
     } else {

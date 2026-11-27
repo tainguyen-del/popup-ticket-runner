@@ -1272,3 +1272,94 @@ test('Gemini-first decision overrides false regex replace (#1610769) and handles
   assert.equal(mergedClosure.ticket.expiryDate, '2026-11-26');
 });
 
+test('Gemini cleans dirty deterministic expiry/scheduleError leftovers (#1611044) and accepts single-attachment index cleanly', () => {
+  const dirtyDeterministic = {
+    ...baseTicket,
+    siteId: '17639',
+    expiry: 'không có Thanks team Show task Show Jira issues',
+    expiryDate: null,
+    scheduleSource: 'labels',
+    scheduleError: 'Popup end date is before its start date...',
+    isIndefinite: false
+  };
+  const ticket1611044 = [
+    'ID#17639 - Support Website',
+    'Hi team nhờ team pop-up giúp khách',
+    'exp: không có',
+    'Thanks team'
+  ].join('\n');
+  const merged = mergeSemanticTicket(dirtyDeterministic, {
+    siteId: '17639',
+    popupRequested: true,
+    operation: 'create',
+    actionSummary: 'Tạo popup mới từ poster đính kèm',
+    requiresAttachment: true,
+    isIndefinite: false,
+    endDate: null,
+    startDate: null,
+    popupAttachmentIndex: 1,
+    confidence: 0.95,
+    evidence: {
+      siteId: 'ID#17639',
+      operation: 'pop-up giúp khách',
+      popupPosition: null,
+      startDate: null,
+      endDate: 'không có',
+      popupAttachmentIndex: '1'
+    },
+    warnings: []
+  }, ticket1611044, undefined, [{ index: 1, filename: 'flyer.jpg', context: '' }]);
+
+  assert.equal(merged.ticket.isIndefinite, true);
+  assert.equal(merged.ticket.expiry, null);
+  assert.equal(merged.ticket.expiryDate, null);
+  assert.equal(merged.ticket.scheduleError, null);
+  assert.equal(merged.ticket.popupAttachmentIndex, 1);
+  assert.equal(merged.audit.warnings.some((w) => /popupAttachmentIndex/i.test(w)), false);
+
+  // Also test arbitrary non-expiry phrasing ("exp: để sau tính") without indefinite flag: raw regex garbage is still cleared cleanly
+  const unscheduled = mergeSemanticTicket(dirtyDeterministic, {
+    siteId: '17639',
+    popupRequested: true,
+    operation: 'create',
+    isIndefinite: false,
+    endDate: null,
+    startDate: null,
+    confidence: 0.92,
+    evidence: {
+      siteId: 'ID#17639',
+      operation: 'pop-up giúp khách',
+      popupPosition: null,
+      startDate: null,
+      endDate: null,
+      popupAttachmentIndex: null
+    },
+    warnings: []
+  }, 'ID#17639 - Support\nNhờ team pop-up giúp khách\nexp: để sau tính');
+  assert.equal(unscheduled.ticket.expiry, null);
+  assert.equal(unscheduled.ticket.expiryDate, null);
+  assert.equal(unscheduled.ticket.scheduleError, null);
+  assert.equal(unscheduled.ticket.scheduleSource, null);
+
+  // Vietnamese month wording in Gemini endDate evidence ("hết tháng 12") must not be rejected
+  const monthText = 'ID#17639 - Support\nNhờ team đăng poster này tới hết tháng 12 nhé';
+  const mergedMonth = mergeSemanticTicket({ ...baseTicket, siteId: '17639' }, {
+    siteId: '17639',
+    popupRequested: true,
+    operation: 'create',
+    isIndefinite: false,
+    endDate: '2026-12-31',
+    confidence: 0.95,
+    evidence: {
+      siteId: 'ID#17639',
+      operation: 'đăng poster này',
+      popupPosition: null,
+      startDate: null,
+      endDate: 'hết tháng 12',
+      popupAttachmentIndex: null
+    },
+    warnings: []
+  }, monthText);
+  assert.equal(mergedMonth.ticket.expiryDate, '2026-12-31');
+});
+

@@ -46,6 +46,10 @@ jobs:
           body: |
             ## Popup Ticket Runner v${{ steps.pkg.outputs.version }}
             - Commit: `${{ github.sha }}`
+            - **Loại bỏ rò rỉ dữ liệu rác regex & sửa lỗi `exp: không có` (Ticket #1611044):**
+              - Tước bỏ khung soạn thảo UI CRM thừa (`Show task` / `Show Jira issues` / `Upload` / `Send note`) khỏi nội dung gửi tới parser và Gemini (`stripCrmComposerChrome` trong [`ticket-parser.js`](src/ticket-parser.js) & [`semantic-ticket.js`](src/semantic-ticket.js)).
+              - Chặn rò rỉ chuỗi rác `expiry` / `start` / `scheduleError` của regex sau khi Gemini đã phân tích thành công: khi Gemini trả `endDate: null` hoặc nhận diện các cụm không có hạn (`exp: không có`, `ko có`, `chưa có`, `none`, `N/A`, `TBD`), [`mergeSemanticTicket`](src/semantic-ticket.js) tự động dọn sạch field regex chưa parse và chuyển sang `isIndefinite: true` (`NO_EXPIRY_EVIDENCE_PATTERN`).
+              - Mở rộng `dateEvidenceLooksRelevant` (nhận diện cụm tháng/ngày tiếng Việt như `"hết tháng 12"`), `exactEvidenceInTicket` (khớp bỏ dấu & khớp từ), `siteIdIsExplicit`, và bỏ warning giả với ticket 1 ảnh đính kèm.
             - **Nâng cấp kiến trúc AI-first (Gemini đọc ticket và quyết định hành động chính) & Sửa lỗi `Auto turn off poster` (Ticket #1610769):**
               - Đảo ngược quyền quyết định trong [`mergeSemanticTicket`](src/semantic-ticket.js) và [`run.js`](src/run.js): Gemini trực tiếp quyết định `operation`, `startDate`, `expiryDate`, `isIndefinite`, `isMultiPoster`, `hasInlineRemoval`, `keepExistingPopups`, `isReuploadOrResize`, `durationSeconds`, `popupOrderLabels` và `popupPosition` dựa trên bằng chứng trong ticket mà không còn bị chặn hay ghi đè bởi các regex từ khóa cứng (`hasAffirmativePopupReplace`, `hasAffirmativePopupRemoval`, ...).
               - Giữ nguyên các chốt an toàn cấu trúc (không bịa `siteId`, kiểm tra bằng chứng xuất hiện trong ticket, chặn nhầm câu `"hoàn tất design"`, câu phủ định `"do not add..."`, ngày đóng cửa `"tiệm nghỉ..."` và bài Facebook/social) cùng toàn bộ regex fallback khi offline/lỗi mạng.

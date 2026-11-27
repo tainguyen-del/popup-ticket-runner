@@ -108,5 +108,18 @@
       "expiry": "2027-01-01",
       "popupPosition": null
     }
+  },
+  {
+    "id": "case-no-expiry",
+    "title": "Ghi rõ exp: không có / không có hạn (Chạy liên tục không cài ngày kết thúc)",
+    "ticketSample": "ID#17639 - Support Website\nHi team nhờ team pop-up giúp khách\nexp: không có\nThanks team",
+    "explanation": "Cụm 'exp: không có' (hoặc 'exp: ko có', 'exp: none', 'exp: N/A') nghĩa là KHÔNG CÀI NGÀY HẾT HẠN (isIndefinite=true, expiry=null).",
+    "expected": {
+      "siteId": "17639",
+      "operation": "create",
+      "expiry": null,
+      "isIndefinite": true,
+      "popupPosition": null
+    }
   }
 ]

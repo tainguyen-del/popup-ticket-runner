@@ -1305,4 +1305,33 @@ test('scopes multi-round CRM conversations to uncompleted active request and ign
   assert.equal(parsed1610769.popupAction, 'create');
   assert.equal(parsed1610769.hasInlineRemovalRequest, false);
   assert.equal(parsed1610769.expiryDate, '2027-01-01');
+
+  // Ticket 1611044: "exp: không có" + CRM composer UI chrome must never leak into expiry or block run.
+  const t1611044 = [
+    'ID#17639 - Support Website',
+    'Nov 28, 2026 4:16 AM Nails & Beauty Spa',
+    'Hi team nhờ team pop-up giúp khách',
+    'exp: không có',
+    'Thanks team',
+    'Show task',
+    'Show Jira issues',
+    'Add conversations',
+    'Internal note',
+    'Upload',
+    'Send note',
+    'Conversations',
+    'Reload',
+    'No data'
+  ].join('\n');
+  const parsed1611044 = parsed(t1611044, 1611044);
+  assert.equal(parsed1611044.siteId, '17639');
+  assert.equal(parsed1611044.popupAction, 'create');
+  assert.equal(parsed1611044.isIndefinite, true);
+  assert.equal(parsed1611044.expiry, null);
+  assert.equal(parsed1611044.expiryDate, null);
+
+  // Unparseable non-date text after exp: stays line-scoped and does not set false blocking expiry strings
+  const nonDateExp = parsed('ID#17639 - Support\nNhờ team popup poster.\nexp: hỏi lại khách sau\nThanks team', 1611045);
+  assert.equal(nonDateExp.expiry, null);
+  assert.equal(nonDateExp.expiryDate, null);
 });

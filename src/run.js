@@ -4384,11 +4384,12 @@ async function main() {
             if (!repairExistingPopup && (!downloadedAttachments.length || downloadedAttachments.some((attachment) => !(attachment?.uploadPath || attachment?.path)))) {
               throw new Error('One or more requested posters were not downloaded and verified locally; CMS write mode stopped before any change.');
             }
+            const semanticVerified = ['verified', 'enriched'].includes(plan.semantic?.status);
             const effectiveExpiry = expiryOverride || plan.ticket.expiryDate || null;
-            if (plan.ticket.expiry && !effectiveExpiry) {
+            if (plan.ticket.expiry && !effectiveExpiry && !semanticVerified) {
               throw new Error('Ticket expiry was found but could not be converted automatically to a safe date. Use an ISO date (YYYY-MM-DD) in the ticket.');
             }
-            if (plan.ticket.start && !plan.ticket.startDate) {
+            if (plan.ticket.start && !plan.ticket.startDate && !semanticVerified) {
               throw new Error('Ticket popup start date was found but could not be converted automatically to a safe date. Use an ISO date (YYYY-MM-DD) in the ticket.');
             }
             const popupSchedule = popupScheduleFromTicket(plan.ticket, effectiveExpiry);
