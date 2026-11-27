@@ -3539,7 +3539,7 @@ async function main() {
     } else {
       const evaluateTicketAnalysis = async (currentText, currentCandidates, currentRoot) => {
         const deterministicTicket = ticketData(currentText, ticketUrl);
-        progress('ticket-semantics', 'Reading ticket meaning with Gemini safety fallback');
+        progress('ticket-semantics', 'Đang dùng Gemini đọc và phân tích yêu cầu ticket');
         const semanticResolution = await resolveTicketSemantics(deterministicTicket, currentText, {
           attachmentCandidates: currentCandidates
         });
@@ -3727,7 +3727,9 @@ async function main() {
                 throw error;
               }
             }
-            const multiIntent = hasMultiPosterIntent(activeTicketRequestText(body));
+            const multiIntent = typeof plan.ticket.isMultiPoster === 'boolean'
+              ? plan.ticket.isMultiPoster
+              : hasMultiPosterIntent(activeTicketRequestText(body));
             if (!multiIntent && validTextSelection && visionResolution.selection.indices.includes(validTextSelection)) {
               progress('attachment-selection-refined', `Ticket chỉ yêu cầu 1 popup; ưu tiên poster #${validTextSelection} từ ngữ cảnh/comment`);
               plan.ticket.popupAttachmentIndexes = [validTextSelection];
@@ -3840,6 +3842,8 @@ async function main() {
                     const textSelectionWasRejected = new RegExp(String.raw`attachment\s*#?${textSelection}\b.*(?:remove|gỡ|xóa|old|screenshot|chụp|không\s*phải)`, 'i').test(rationale)
                       || isPopupRemovalAction(plan.ticket.popupAction)
                       || plan.ticket.popupAction === 'replace'
+                      || plan.ticket.isReuploadOrResize === true
+                      || plan.ticket.hasInlineRemovalRequest === true
                       || hasAffirmativePopupRemoval(activeTicketText)
                       || hasSizeOrReuploadInstruction(activeTicketText)
                       || /\b(?:size|1x1|1:1|square|vuông|re-?upload|up\s*lại|thay\s*bằng|later\s*comment|newer|updated)\b/i.test(rationale);
@@ -4480,11 +4484,10 @@ async function main() {
                     }
                   }
                 } else if (
-                  plan.ticket.popupAction === 'replace'
+                  (plan.ticket.popupAction === 'replace' || (plan.ticket.popupAction === 'create' && plan.ticket.hasInlineRemovalRequest))
                   && removalMatches.length === 0
                   && legacyPopupSnapshot.scannedItems.length > 1
                   && plan.ticket.removalTopic
-                  && hasAffirmativePopupRemoval(activeTicketRequestText(body))
                 ) {
                   const popupCandidates = legacyPopupSnapshot.scannedItems.map((item, idx) => ({
                     ...item,
@@ -4510,7 +4513,9 @@ async function main() {
                   } catch {}
                 }
                 if (preserveLegacyPopups) {
-                  if (legacyPopupSnapshot.sectionIds.length > 0 && legacyPopupSnapshot.scannedItems.length === 0 && keepsExistingPopups(body)) {
+                  const shouldKeepExisting = plan.ticket.keepExistingPopups === true
+                    || (plan.ticket.keepExistingPopups !== false && keepsExistingPopups(body));
+                  if (legacyPopupSnapshot.sectionIds.length > 0 && legacyPopupSnapshot.scannedItems.length === 0 && shouldKeepExisting) {
                     const error = new Error(
                       'CMS still has an active Announcement section and the ticket asks to keep existing popups, '
                       + 'but 0 readable popup items could be captured before section replacement. Legacy section was NOT deleted.'
@@ -4533,6 +4538,7 @@ async function main() {
                   };
                 }
                 const allowCrossAspectRatioConfirmation = plan.ticket.popupAction === 'replace'
+                  || plan.ticket.isReuploadOrResize === true
                   || hasSizeOrReuploadInstruction(activeTicketRequestText(body));
                 const duplicates = await findDuplicatePopupImagesWithVision(
                   page,
@@ -4659,7 +4665,9 @@ async function main() {
                 : `Adding ${stagedTicketEntries.length} ticket poster${stagedTicketEntries.length === 1 ? '' : 's'} to Popup settings`
             );
             try {
-              const customOrderLabels = extractPopupOrderSequence(body);
+              const customOrderLabels = Array.isArray(plan.ticket.popupOrderLabels)
+                ? plan.ticket.popupOrderLabels
+                : extractPopupOrderSequence(body);
               const configuredPopup = await configurePopup(page, downloadedAttachment?.uploadPath || downloadedAttachment?.path || null, popupSchedule, plan.timezone, {
                 replaceExisting: plan.ticket.popupAction === 'replace',
                 sectionId: plan.popupSection.sectionId,

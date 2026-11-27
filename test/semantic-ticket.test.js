@@ -57,7 +57,7 @@ test('Gemini enrichment safely fills a missing dotted-date expiry with exact evi
   assert.deepEqual(audit.appliedFields, ['expiryDate']);
 });
 
-test('Gemini cannot overwrite a deterministic expiry with conflicting output', () => {
+test('Gemini with valid ticket evidence overrides conflicting deterministic expiry, while unverified Gemini dates cannot', () => {
   const { ticket, audit } = mergeSemanticTicket({ ...baseTicket, expiry: '2026-12-31', expiryDate: '2026-12-31' }, {
     siteId: '16266',
     popupRequested: true,
@@ -69,8 +69,24 @@ test('Gemini cannot overwrite a deterministic expiry with conflicting output', (
     warnings: []
   }, 'ID#16266 - Website Support\nuntil 11.30.26');
 
-  assert.equal(ticket.expiryDate, '2026-12-31');
-  assert.match(audit.warnings.join(' '), /conflicts/i);
+  assert.equal(ticket.expiryDate, '2026-11-30');
+  assert.equal(ticket.scheduleSource, 'gemini-semantic');
+  assert.ok(audit.appliedFields.includes('expiryDate'));
+  assert.match(audit.warnings.join(' '), /overrode deterministic/i);
+
+  const unverified = mergeSemanticTicket({ ...baseTicket, expiry: '2026-12-31', expiryDate: '2026-12-31' }, {
+    siteId: '16266',
+    popupRequested: true,
+    operation: 'create',
+    startDate: null,
+    endDate: '2026-11-30',
+    confidence: 0.98,
+    evidence: { siteId: null, operation: null, startDate: null, endDate: 'invented phrase not in ticket' },
+    warnings: []
+  }, 'ID#16266 - Website Support\nEXP: 12/31/2026');
+
+  assert.equal(unverified.ticket.expiryDate, '2026-12-31');
+  assert.match(unverified.audit.warnings.join(' '), /lacks valid ticket evidence/i);
 });
 
 test('Gemini can safely promote an explicit Vietnamese popup removal', () => {
@@ -1102,5 +1118,157 @@ test('mergeSemanticTicket respects uncompleted active comments for create vs rep
   }, expiredText);
   assert.equal(mergedExpired.ticket.popupAction, 'remove-expired');
   assert.equal(mergedExpired.ticket.requiresAttachment, false);
+});
+
+test('Gemini-first decision overrides false regex replace (#1610769) and handles unseen Vietnamese/English phrasing directly', () => {
+  // 1. Ticket #1610769: even if fallback had flagged 'replace', Gemini create + endDate overrides cleanly.
+  const ticket1610769 = [
+    'ID#12333 - Website Support',
+    'Nhờ team popup Poster giúp khách nhé.',
+    'Auto turn off poster: 1/01/2027'
+  ].join('\n');
+  const merged1610769 = mergeSemanticTicket({ ...baseTicket, siteId: '12333', popupAction: 'replace', hasInlineRemovalRequest: false }, {
+    siteId: '12333',
+    popupRequested: true,
+    operation: 'create',
+    actionSummary: 'Tạo popup mới từ poster đính kèm và cài đặt ngày kết thúc 2027-01-01',
+    removalTopic: null,
+    requiresAttachment: true,
+    isIndefinite: false,
+    isMultiPoster: false,
+    hasInlineRemoval: false,
+    keepExistingPopups: false,
+    isReuploadOrResize: false,
+    popupPosition: null,
+    startDate: null,
+    endDate: '2027-01-01',
+    durationSeconds: null,
+    durationIsSliderValue: false,
+    popupOrderLabels: [],
+    popupAttachmentIndex: 1,
+    popupLink: null,
+    confidence: 0.95,
+    evidence: {
+      siteId: 'ID#12333',
+      operation: 'popup Poster',
+      popupPosition: null,
+      startDate: null,
+      endDate: '1/01/2027',
+      popupAttachmentIndex: 'holiday.png'
+    },
+    warnings: []
+  }, ticket1610769, undefined, [{ index: 1, filename: 'holiday.png', context: 'holiday.png' }]);
+  assert.equal(merged1610769.ticket.popupAction, 'create');
+  assert.equal(merged1610769.ticket.expiryDate, '2027-01-01');
+  assert.equal(merged1610769.ticket.isMultiPoster, false);
+  assert.ok(merged1610769.audit.appliedFields.includes('popupAction'));
+
+  // 2. Unseen Vietnamese phrasing ("dẹp bỏ banner khuyến mãi", "cho lên trên cùng") without regex updates
+  const unseenRemoveText = 'ID#7701 - Website Support\nNhờ team dẹp cái banner khuyến mãi đang chạy đi giúp tiệm nha';
+  const mergedUnseenRemove = mergeSemanticTicket({ ...baseTicket, siteId: '7701', popupAction: 'create' }, {
+    siteId: '7701',
+    popupRequested: true,
+    operation: 'remove',
+    removalTopic: 'banner khuyến mãi',
+    requiresAttachment: false,
+    confidence: 0.94,
+    evidence: {
+      siteId: 'ID#7701',
+      operation: 'dẹp cái banner khuyến mãi đang chạy đi',
+      popupPosition: null,
+      startDate: null,
+      endDate: null,
+      popupAttachmentIndex: null
+    },
+    warnings: []
+  }, unseenRemoveText);
+  assert.equal(mergedUnseenRemove.ticket.popupAction, 'remove-one');
+  assert.equal(mergedUnseenRemove.ticket.removalScope, 'ticket-topic-remove-one');
+  assert.equal(mergedUnseenRemove.ticket.removalTopic, 'banner khuyến mãi');
+
+  // 3. Unseen indefinite, position, multi-poster, duration, custom order, and non-closure startDate
+  const complexText = [
+    'ID#8802 - Support',
+    'Nhờ team đăng hết 2 tấm hình mới này cùng lúc, chờ qua trưa 01/12/2026 mới bật lên, để chạy hoài tới khi nào tiệm báo dẹp thì thôi.',
+    'Sắp xếp tấm Giftcard nằm trên rồi tới tấm Holiday. Cho hiển thị tầm 8 giây, tấm Giftcard đứng top đầu luôn.'
+  ].join('\n');
+  const mergedComplex = mergeSemanticTicket({ ...baseTicket, siteId: '8802', expiryDate: '2026-12-31' }, {
+    siteId: '8802',
+    popupRequested: true,
+    operation: 'create',
+    requiresAttachment: true,
+    isIndefinite: true,
+    isMultiPoster: true,
+    hasInlineRemoval: false,
+    keepExistingPopups: true,
+    isReuploadOrResize: false,
+    popupPosition: 'first',
+    startDate: null,
+    endDate: null,
+    durationSeconds: 8,
+    durationIsSliderValue: false,
+    popupOrderLabels: ['Giftcard', 'Holiday'],
+    confidence: 0.96,
+    evidence: {
+      siteId: 'ID#8802',
+      operation: 'đăng hết 2 tấm hình mới này cùng lúc',
+      popupPosition: 'đứng top đầu',
+      startDate: null,
+      endDate: 'tới khi nào tiệm báo dẹp',
+      popupAttachmentIndex: null
+    },
+    warnings: []
+  }, complexText);
+  assert.equal(mergedComplex.ticket.isIndefinite, true);
+  assert.equal(mergedComplex.ticket.expiryDate, null);
+  assert.equal(mergedComplex.ticket.isMultiPoster, true);
+  assert.equal(mergedComplex.ticket.keepExistingPopups, true);
+  assert.equal(mergedComplex.ticket.popupPosition, 'first');
+  assert.deepEqual(mergedComplex.ticket.popupDuration, { requestedSeconds: 8, delaySliderSeconds: 11, isExplicitSlider: false });
+  assert.deepEqual(mergedComplex.ticket.popupOrderLabels, ['Giftcard', 'Holiday']);
+
+  // 4. Explicit start date with unseen Vietnamese phrasing allowed, while pure holiday closure start date is still rejected
+  const unseenStartText = 'ID#8803 - Support\nChờ qua trưa 01/12/2026 mới bật popup này lên nhé';
+  const mergedStart = mergeSemanticTicket({ ...baseTicket, siteId: '8803' }, {
+    siteId: '8803',
+    popupRequested: true,
+    operation: 'create',
+    isIndefinite: false,
+    startDate: '2026-12-01',
+    endDate: null,
+    confidence: 0.95,
+    evidence: {
+      siteId: 'ID#8803',
+      operation: 'bật popup này lên',
+      popupPosition: null,
+      startDate: '01/12/2026 mới bật popup',
+      endDate: null,
+      popupAttachmentIndex: null
+    },
+    warnings: []
+  }, unseenStartText);
+  assert.equal(mergedStart.ticket.startDate, '2026-12-01');
+
+  const closureText = 'ID#8804 - Support\nTiệm nghỉ từ 24/11 đến 26/11';
+  const mergedClosure = mergeSemanticTicket({ ...baseTicket, siteId: '8804' }, {
+    siteId: '8804',
+    popupRequested: true,
+    operation: 'create',
+    isIndefinite: false,
+    startDate: '2026-11-24',
+    endDate: '2026-11-26',
+    confidence: 0.95,
+    evidence: {
+      siteId: 'ID#8804',
+      operation: 'Tiệm nghỉ',
+      popupPosition: null,
+      startDate: 'Tiệm nghỉ từ 24/11',
+      endDate: 'đến 26/11',
+      popupAttachmentIndex: null
+    },
+    warnings: []
+  }, closureText);
+  assert.equal(mergedClosure.ticket.startDate, null);
+  assert.equal(mergedClosure.ticket.expiryDate, '2026-11-26');
 });
 

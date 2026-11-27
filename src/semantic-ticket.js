@@ -2,23 +2,18 @@
 
 const {
   foldTicketText,
-  requestedPopupPosition,
-  hasAffirmativePopupRemoval,
-  hasAffirmativeExpiredRemoval,
-  hasAffirmativePopupUpdate,
-  hasAffirmativePopupReplace,
-  activeTicketRequestText,
   normalizeExpiry,
-  hasExplicitPopupStartDate,
-  actionIsNegated
+  actionIsNegated,
+  POPUP_OPEN_DELAY_SECONDS
 } = require('./ticket-parser');
 const { formatCasesForPrompt } = require('./case-knowledge');
 
-// Gemini is an optional semantic reader. It never receives browser cookies,
-// credentials, image bytes, or CMS data; it receives active ticket/comment
-// text plus local metadata for the ticket's visible image attachments.
-// Its JSON is treated as a suggestion and is locally validated before it can
-// fill a missing ticket field.
+// Gemini is the primary semantic reader and decision maker for CRM ticket notes.
+// It never receives browser cookies, credentials, or CMS data; it receives active
+// ticket/comment text plus local metadata for the ticket's visible image attachments.
+// Its structured JSON drives popup action, schedule, multi-poster count, and ordering,
+// while local structural guardrails (explicit siteId, verbatim evidence check, negated
+// safeguards) protect CMS from hallucinations and deterministic rules act as offline fallback.
 
 // Use a Gemini model for structured text output. The previous Gemma default
 // accepts the key but does not reliably accept Gemini's JSON response
@@ -53,9 +48,17 @@ const SEMANTIC_SCHEMA = {
     actionSummary: { type: ['string', 'null'], description: 'Clear short action sentence in Vietnamese explaining what the automation tool must execute (e.g. "Gỡ poster thông báo nghỉ lễ Thanksgiving trên CMS và Build web", "Tạo popup mới từ poster đính kèm").' },
     removalTopic: { type: ['string', 'null'], description: 'Topic or description of the popup to remove if applicable (e.g. "thông báo nghỉ lễ", "holiday closure", "poster cũ"), otherwise null.' },
     requiresAttachment: { type: 'boolean', description: 'True if operation needs a new poster uploaded from the ticket; false if pure removal or duration update.' },
+    isIndefinite: { type: 'boolean', description: 'True ONLY when the ticket explicitly says to keep the popup active indefinitely until client asks to turn it off (e.g. "đến khi khách tắt", "không cài hạn", "chạy liên tục"). False when an end/turn-off date is given or unspecified.' },
+    isMultiPoster: { type: 'boolean', description: 'True ONLY when the ticket explicitly asks to publish more than one separate new popup poster together (e.g. "2 poster", "cả 2 banner", "both posters"). False for single-poster tickets, even when later comments send a replacement image or note keeping existing CMS popups.' },
+    hasInlineRemoval: { type: 'boolean', description: 'True when the ticket asks to publish new poster(s) AND remove another specific existing popup, or when operation is replace. False otherwise.' },
+    keepExistingPopups: { type: 'boolean', description: 'True when the ticket explicitly notes to keep/preserve current active popups on CMS.' },
+    isReuploadOrResize: { type: 'boolean', description: 'True when the ticket or comment asks to re-upload, fix image size/aspect ratio, or resize an existing popup poster (e.g. "1x1", "vuông", "khác size", "up lại ảnh").' },
     popupPosition: { type: ['string', 'null'], description: 'Explicit requested popup order position: first or last; otherwise null.' },
     startDate: { type: ['string', 'null'], description: 'Explicit popup start date as YYYY-MM-DD, otherwise null.' },
-    endDate: { type: ['string', 'null'], description: 'Explicit popup expiry/end date as YYYY-MM-DD, otherwise null.' },
+    endDate: { type: ['string', 'null'], description: 'Explicit popup expiry/end/auto-turn-off date as YYYY-MM-DD, otherwise null.' },
+    durationSeconds: { type: ['integer', 'null'], minimum: 1, maximum: 120, description: 'Explicitly requested popup display duration or delay slider seconds (1-120), otherwise null.' },
+    durationIsSliderValue: { type: 'boolean', description: 'True ONLY if durationSeconds explicitly refers to the raw CMS slider value ("delay slider 13s", "time delay 13"); false when it refers to visible display duration ("hiện 10 giây", "10s").' },
+    popupOrderLabels: { type: 'array', items: { type: 'string' }, description: 'Ordered list of popup names/labels from first to last ONLY when the ticket explicitly specifies display sequence across multiple popups (e.g. ["Giftcard", "Weekly Appreciation"]), otherwise [].' },
     popupAttachmentIndex: { type: ['integer', 'null'], minimum: 1, description: 'Number of the attachment explicitly identified as the popup poster, otherwise null.' },
     popupLink: { type: ['string', 'null'], description: 'Explicit URL the ticket asks to attach as the popup image link (e.g. "direct tới link booking http://..."), otherwise null.' },
     confidence: { type: 'number', minimum: 0, maximum: 1 },
@@ -74,7 +77,30 @@ const SEMANTIC_SCHEMA = {
     },
     warnings: { type: 'array', items: { type: 'string' }, maxItems: 4 }
   },
-  required: ['siteId', 'popupRequested', 'operation', 'actionSummary', 'removalTopic', 'requiresAttachment', 'popupPosition', 'startDate', 'endDate', 'popupAttachmentIndex', 'popupLink', 'confidence', 'evidence', 'warnings'],
+  required: [
+    'siteId',
+    'popupRequested',
+    'operation',
+    'actionSummary',
+    'removalTopic',
+    'requiresAttachment',
+    'isIndefinite',
+    'isMultiPoster',
+    'hasInlineRemoval',
+    'keepExistingPopups',
+    'isReuploadOrResize',
+    'popupPosition',
+    'startDate',
+    'endDate',
+    'durationSeconds',
+    'durationIsSliderValue',
+    'popupOrderLabels',
+    'popupAttachmentIndex',
+    'popupLink',
+    'confidence',
+    'evidence',
+    'warnings'
+  ],
   additionalProperties: false
 };
 
@@ -335,7 +361,10 @@ function posterSchedulesFromResponse(rawSchedules, visionCandidates, selectedInd
 
 function exactEvidenceInTicket(ticketText, evidence) {
   const needle = compact(evidence);
-  return Boolean(needle) && compact(ticketText).includes(needle);
+  if (!needle) return false;
+  if (compact(ticketText).includes(needle)) return true;
+  const foldedNeedle = compact(foldTicketText(evidence));
+  return Boolean(foldedNeedle) && compact(foldTicketText(ticketText)).includes(foldedNeedle);
 }
 
 function siteIdIsExplicit(ticketText, siteId) {
@@ -350,20 +379,68 @@ function dateEvidenceLooksRelevant(evidence) {
   return /(?:\d{1,2}[./-]\d{1,2}(?:[./-](?:20)?\d{2})?|20\d{2}[./-]\d{1,2}[./-]\d{1,2}|\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)\w*\b)/i.test(evidence || '');
 }
 
-function actionEvidenceIsExplicit(evidence) {
-  return hasAffirmativePopupRemoval(evidence);
+function startEvidenceIsClosureOnly(evidence) {
+  const folded = foldTicketText(evidence || '').replace(/\s+/g, ' ').trim();
+  if (!folded) return false;
+  const mentionsClosure = /\b(?:tiem\s+nghi|nghi\s+le|dong\s+cua|closed|closure|holiday\s+hours)\b/i.test(folded);
+  const mentionsPopupStart = /\b(?:pop[\s-]*up|poster|banner|hien|show|display|dang|len|start|tu\s+ngay|moi\s*(?:len|dang|hien))\b/i.test(folded);
+  return mentionsClosure && !mentionsPopupStart;
 }
 
-function createEvidenceIsExplicit(evidence) {
-  return hasAffirmativePopupUpdate(evidence);
+function evidenceMentionsOnlyNonWebsiteChannel(foldedOp) {
+  const mentionsSocial = /\b(?:dang\s+tren|tren|on)\s+(?:facebook|fb|fanpage|instagram|ig|tiktok|social(?:\s*media)?|google(?:\s*business)?|gbp)\b/i.test(foldedOp);
+  const mentionsWebsite = /\b(?:website|web|site|cms|pop[\s-]*up)\b/i.test(foldedOp);
+  return mentionsSocial && !mentionsWebsite;
 }
 
-function replaceEvidenceIsExplicit(evidence) {
-  return hasAffirmativePopupReplace(evidence);
-}
+function operationEvidenceIsSafe(operation, evidenceOp) {
+  const foldedOp = foldTicketText(evidenceOp || '').replace(/\s+/g, ' ').trim();
+  if (!foldedOp) return false;
 
-function popupPositionEvidenceIsExplicit(evidence) {
-  return requestedPopupPosition(evidence) !== null;
+  if (operation === 'remove' || operation === 'remove-all') {
+    if (evidenceMentionsOnlyNonWebsiteChannel(foldedOp)) return false;
+    if (actionIsNegated(foldedOp, 0)) return false;
+    if (/\b(?:do\s+not|don\W?t|never|khong(?:\s+can)?|dung)\s+(?:go|xoa|tat|huy|dep|remove|delete|turn\s*off)\b/i.test(foldedOp)) {
+      return false;
+    }
+    // Never mistake design-completion notes ("hoàn tất design Poster") for turning off a poster.
+    if (/\b(?:hoan\s*tat|finish(?:ed)?|complet(?:ed?|ion)|sau\s*khi)\b/i.test(foldedOp)) {
+      const withoutCompletion = foldedOp.replace(/\b(?:hoan\s*tat|finish(?:ed)?|complet(?:ed?|ion)|sau\s*khi)\b/gi, ' ');
+      if (!/\b(?:go|xoa|tat|huy|dep|bo|ngung|dong|remove|delete|turn\s*off|take\s*down|disable|clear|clean|purge|stop)\b/i.test(withoutCompletion)) {
+        return false;
+      }
+    }
+    return true;
+  }
+
+  if (operation === 'remove-expired') {
+    if (/\b(?:do\s+not|don\W?t|never|khong(?:\s+can)?|dung)\s+(?:go|xoa|don|tat|remove|delete|clear|clean)\b/i.test(foldedOp)) {
+      return false;
+    }
+    return true;
+  }
+
+  if (operation === 'replace') {
+    if (evidenceMentionsOnlyNonWebsiteChannel(foldedOp)) return false;
+    if (/\b(?:do\s+not|don\W?t|never|khong(?:\s+can)?|dung)\s+(?:add|creat(?:e|ed)|upload|them|tao|dang|len|pop\s*up)\b/i.test(foldedOp)) {
+      return false;
+    }
+    return true;
+  }
+
+  if (operation === 'create') {
+    if (evidenceMentionsOnlyNonWebsiteChannel(foldedOp)) return false;
+    if (/\b(?:do\s+not|don\W?t|never|khong(?:\s+can)?|dung)\s+(?:add|creat(?:e|ed)|upload|them|tao|dang|len|pop\s*up)\b/i.test(foldedOp)) {
+      return false;
+    }
+    return true;
+  }
+
+  if (operation === 'update-duration') {
+    return !/\b(?:do\s+not|don\W?t|never|khong(?:\s+can)?|dung)\s+(?:change|update|set|chinh|sua|cai|doi)\b/i.test(foldedOp);
+  }
+
+  return false;
 }
 
 function ticketTextForSemanticPrompt(ticketText, limit = 40000) {
@@ -418,6 +495,14 @@ function semanticPrompt(ticketText, attachmentCandidates = []) {
     '  * replace: The ticket asks to replace, swap, change, or "gỡ [A] và pop up [B]" / "đổi poster" / "update lại poster" an existing poster with a new one. requiresAttachment must be true.',
     '  * create: The ticket asks to add/create/publish a brand-new popup poster (even if display seconds are also mentioned). requiresAttachment must be true.',
     '  * update-duration: ONLY when the ticket adjusts popup display time/delay/duration WITHOUT uploading or creating a new poster image. requiresAttachment must be false.',
+    '- IMPORTANT ON SCHEDULED AUTO-TURN-OFF / EXPIRY PHRASES: Phrases such as "Auto turn off poster: 1/01/2027", "Schedule gỡ pop up 11/26", "tắt sau ngày 27/11", "ẩn vào cuối ngày..." define endDate for the new/replaced popup ("operation": "create" or "replace"), NEVER "remove".',
+    '- isIndefinite: true ONLY when the ticket explicitly instructs keeping the popup running with NO expiry until the client asks to turn it off (e.g. "đến khi khách tắt", "không cài hạn", "chạy liên tục"). Must be false whenever endDate is set or not mentioned.',
+    '- isMultiPoster: true ONLY when the active request explicitly asks to publish MORE THAN ONE new popup poster simultaneously (e.g. "2 coupon pop up đính kèm", "cả 2 poster", "up 2 hình"). Keep false for single-popup tickets even if an old attachment is replaced by a later comment attachment, or if the note says to keep existing CMS popups ("vẫn giữ 2 coupon hiện có").',
+    '- hasInlineRemoval: true when creating new poster(s) AND ALSO asking to remove a specific existing CMS popup (or when operation is "replace").',
+    '- keepExistingPopups: true when the ticket asks to preserve/keep current active popups on CMS.',
+    '- isReuploadOrResize: true when the ticket/comment asks to re-upload or change poster dimensions/size (e.g. "1x1", "vuông", "đúng size", "up lại ảnh").',
+    '- durationSeconds & durationIsSliderValue: If the ticket mentions display timing (e.g. "hiện 10s", "10 giây" -> durationSeconds: 10, durationIsSliderValue: false; "delay slider 13s" -> durationSeconds: 13, durationIsSliderValue: true), otherwise durationSeconds: null, durationIsSliderValue: false.',
+    '- popupOrderLabels: Ordered array of popup names from first to last ONLY when the ticket specifies custom ordering (e.g. ["Giftcard", "Weekly Appreciation"]), otherwise [].',
     '- MULTI-ROUND CONVERSATIONS & COMPLETED COMMENTS: CRM "Conversations" lists comments newest-first. If a newer follow-up comment appears ABOVE a team completion reply (e.g. "Đã update theo yêu cầu", "Done", "Đã xử lý", "-Done"), requests BELOW that completion reply are ALREADY COMPLETED. Determine operation, dates, and new poster selection ONLY from the active comment(s) above the completion reply (never combine an older completed "remove poster..." with a newer "popup poster lên website" into "replace"!).',
     '- Social media / Facebook post removal requests (e.g. "gỡ poster đăng trên facebook", "xoá bài trên FB") are NOT CMS website popup removals.',
     '- actionSummary: A concise, authoritative sentence in Vietnamese explaining what the automation tool must execute (e.g. "Gỡ poster thông báo nghỉ lễ đang có trên CMS và Build website", "Tạo popup mới từ poster đính kèm và cài đặt ngày kết thúc 2026-11-25", "Thay thế poster cũ bằng poster mới", "Cập nhật thời gian hiển thị popup thành 10 giây").',
@@ -715,7 +800,7 @@ async function requestGeminiTicketJson(ticketText, {
     contents: [{ parts: [{ text: semanticPrompt(ticketText, attachmentCandidates) }] }],
     generationConfig: {
       temperature: 0,
-      maxOutputTokens: 700,
+      maxOutputTokens: 900,
       // This is the documented Gemini generateContent shape. Keeping the
       // response JSON-only lets the local evidence validator reject any
       // unsupported or invented ticket field safely.
@@ -971,18 +1056,19 @@ function mergeSemanticTicket(baseTicket, semantic, ticketText, model = DEFAULT_G
     return { ticket, audit };
   }
   const canUseEvidence = (field, predicate = () => true) => exactEvidenceInTicket(ticketText, evidence[field]) && predicate(evidence[field]);
-  const applyMissing = (field, candidate, evidenceField, predicate = () => true) => {
-    if (candidate === null || candidate === undefined || candidate === '') return;
-    if (ticket[field]) {
-      if (ticket[field] !== candidate) audit.warnings.push(`Gemini ${field} conflicts with deterministic extraction.`);
-      return;
-    }
+  const applyField = (field, candidate, evidenceField, predicate = () => true) => {
+    if (candidate === null || candidate === undefined || candidate === '') return false;
     if (!canUseEvidence(evidenceField, predicate)) {
       audit.warnings.push(`Gemini ${field} lacks valid ticket evidence.`);
-      return;
+      return false;
     }
+    if (ticket[field] && ticket[field] !== candidate) {
+      audit.warnings.push(`Gemini ${field} (${candidate}) overrode deterministic extraction (${ticket[field]}).`);
+    }
+    const changed = ticket[field] !== candidate;
     ticket[field] = candidate;
-    audit.appliedFields.push(field);
+    if (changed && !audit.appliedFields.includes(field)) audit.appliedFields.push(field);
+    return true;
   };
 
   const semanticSiteId = typeof semantic.siteId === 'string' ? semantic.siteId.trim() : null;
@@ -998,18 +1084,42 @@ function mergeSemanticTicket(baseTicket, semantic, ticketText, model = DEFAULT_G
     audit.warnings.push('Gemini siteId conflicts with the ticket header.');
   }
 
-  if (!ticket.isIndefinite) {
-    const hasExplicitStart = hasExplicitPopupStartDate(ticketText);
-    const semanticStart = hasExplicitStart
-      ? (validIsoDate(semantic.startDate) ? semantic.startDate : normalizeExpiry(semantic.startDate))
-      : null;
-    const semanticEnd = validIsoDate(semantic.endDate) ? semantic.endDate : normalizeExpiry(semantic.endDate);
-    if (hasExplicitStart && semanticStart) {
-      applyMissing('startDate', semanticStart, 'startDate', dateEvidenceLooksRelevant);
+  const semanticStart = validIsoDate(semantic.startDate) ? semantic.startDate : normalizeExpiry(semantic.startDate);
+  const semanticEnd = validIsoDate(semantic.endDate) ? semantic.endDate : normalizeExpiry(semantic.endDate);
+  if (typeof semantic.isIndefinite === 'boolean') {
+    if (semantic.isIndefinite && !semanticEnd && exactEvidenceInTicket(ticketText, evidence.endDate || evidence.operation)) {
+      const changed = ticket.isIndefinite !== true;
+      ticket.isIndefinite = true;
+      ticket.start = null;
+      ticket.startDate = null;
+      ticket.expiry = null;
+      ticket.expiryDate = null;
+      ticket.scheduleSource = 'gemini-semantic';
+      ticket.scheduleEvidence = evidence.endDate || evidence.operation || ticket.scheduleEvidence || null;
+      if (changed && !audit.appliedFields.includes('isIndefinite')) audit.appliedFields.push('isIndefinite');
+    } else if (!semantic.isIndefinite && ticket.isIndefinite && semanticEnd && canUseEvidence('endDate', dateEvidenceLooksRelevant)) {
+      ticket.isIndefinite = false;
+      if (!audit.appliedFields.includes('isIndefinite')) audit.appliedFields.push('isIndefinite');
     }
-    applyMissing('expiryDate', semanticEnd, 'endDate', dateEvidenceLooksRelevant);
-    if (!ticket.start && ticket.startDate) ticket.start = ticket.startDate;
-    if (!ticket.expiry && ticket.expiryDate) ticket.expiry = ticket.expiryDate;
+  }
+
+  if (!ticket.isIndefinite) {
+    if (semanticStart) {
+      applyField('startDate', semanticStart, 'startDate', (ev) => dateEvidenceLooksRelevant(ev) && !startEvidenceIsClosureOnly(ev));
+    }
+    if (semanticEnd) {
+      applyField('expiryDate', semanticEnd, 'endDate', dateEvidenceLooksRelevant);
+    }
+    if (ticket.startDate && audit.appliedFields.includes('startDate')) {
+      ticket.start = ticket.startDate;
+    } else if (!ticket.start && ticket.startDate) {
+      ticket.start = ticket.startDate;
+    }
+    if (ticket.expiryDate && audit.appliedFields.includes('expiryDate')) {
+      ticket.expiry = ticket.expiryDate;
+    } else if (!ticket.expiry && ticket.expiryDate) {
+      ticket.expiry = ticket.expiryDate;
+    }
     if (ticket.startDate && ticket.expiryDate && ticket.expiryDate < ticket.startDate) {
       if (audit.appliedFields.includes('expiryDate')) {
         ticket.expiryDate = baseTicket.expiryDate || null;
@@ -1030,85 +1140,110 @@ function mergeSemanticTicket(baseTicket, semantic, ticketText, model = DEFAULT_G
   if (typeof semantic.requiresAttachment === 'boolean') {
     ticket.requiresAttachment = semantic.requiresAttachment;
   }
+  if (typeof semantic.isMultiPoster === 'boolean') {
+    ticket.isMultiPoster = semantic.isMultiPoster;
+  }
+  if (typeof semantic.keepExistingPopups === 'boolean') {
+    ticket.keepExistingPopups = semantic.keepExistingPopups;
+  }
+  if (typeof semantic.isReuploadOrResize === 'boolean') {
+    ticket.isReuploadOrResize = semantic.isReuploadOrResize;
+  }
+  if (Array.isArray(semantic.popupOrderLabels)) {
+    const cleanLabels = semantic.popupOrderLabels
+      .map((label) => String(label || '').trim())
+      .filter(Boolean);
+    ticket.popupOrderLabels = cleanLabels;
+  }
 
-  const activeTicketText = activeTicketRequestText(ticketText);
+  const semanticDuration = Number.isInteger(semantic.durationSeconds)
+    && semantic.durationSeconds >= 1
+    && semantic.durationSeconds <= 120
+    ? semantic.durationSeconds
+    : null;
+  if (semanticDuration && (exactEvidenceInTicket(ticketText, String(semanticDuration)) || exactEvidenceInTicket(ticketText, evidence.operation))) {
+    const isExplicitSlider = Boolean(semantic.durationIsSliderValue);
+    const requestedSeconds = isExplicitSlider
+      ? (semanticDuration >= POPUP_OPEN_DELAY_SECONDS ? semanticDuration - POPUP_OPEN_DELAY_SECONDS : semanticDuration)
+      : semanticDuration;
+    const delaySliderSeconds = isExplicitSlider
+      ? semanticDuration
+      : semanticDuration + POPUP_OPEN_DELAY_SECONDS;
+    if (!ticket.popupDuration || ticket.popupDuration.delaySliderSeconds !== delaySliderSeconds) {
+      ticket.popupDuration = { requestedSeconds, delaySliderSeconds, isExplicitSlider };
+      if (!audit.appliedFields.includes('popupDuration')) audit.appliedFields.push('popupDuration');
+    }
+  }
+
+  const requestedOp = typeof semantic.operation === 'string' ? semantic.operation : null;
   const hasExactOpEvidence = exactEvidenceInTicket(ticketText, evidence.operation);
-  if (hasExactOpEvidence) {
-    if (semantic.operation === 'remove-expired') {
-      if (hasAffirmativeExpiredRemoval(evidence.operation) && !hasAffirmativePopupReplace(activeTicketText) && !hasAffirmativePopupUpdate(activeTicketText)) {
-        ticket.popupAction = 'remove-expired';
-        ticket.requiresAttachment = false;
-        if (!audit.appliedFields.includes('popupAction')) audit.appliedFields.push('popupAction');
+  if (requestedOp && requestedOp !== 'unknown' && hasExactOpEvidence && operationEvidenceIsSafe(requestedOp, evidence.operation)) {
+    const foldedOp = foldTicketText(evidence.operation);
+    if (requestedOp === 'remove-expired') {
+      ticket.popupAction = 'remove-expired';
+      ticket.hasInlineRemovalRequest = false;
+      ticket.requiresAttachment = false;
+      if (baseTicket.popupAction !== 'remove-expired' && !audit.appliedFields.includes('popupAction')) {
+        audit.appliedFields.push('popupAction');
       }
-    } else if (semantic.operation === 'remove' || semantic.operation === 'remove-all') {
-      const foldedOp = foldTicketText(evidence.operation);
-      const isExpiredOnlyEvidence = /\b(?:da\s+)?(?:het\s*han|qua\s*han|expired)\b/i.test(foldedOp);
-      const isNegated = actionIsNegated(foldedOp, 0)
-        || /\b(?:khong|do\s+not|don\W?t|never)\s+(?:xoa|go|tat|remove|delete)\b/i.test(foldedOp);
-      const isAffirmativeRemoval = !isExpiredOnlyEvidence && (hasAffirmativePopupRemoval(evidence.operation)
-        || (/\b(?:go|xoa|remove|delete|take\s*down)\b/i.test(foldedOp) && !/\b(?:hoan\s*tat|sau\s*khi)\b/i.test(foldedOp)));
-      if (isAffirmativeRemoval && !isNegated && !isExpiredOnlyEvidence) {
-        const isAll = semantic.operation === 'remove-all'
-          || /\b(?:toan\s+bo|tat\s+ca|all|every)\b/i.test(foldedOp);
+    } else if (requestedOp === 'remove' || requestedOp === 'remove-all') {
+      const isExpiredOnlyEvidence = /\b(?:da\s+)?(?:het\s*han|qua\s*han|expired)\b/i.test(foldedOp)
+        && !/\b(?:all|every|toan\s+bo|tat\s+ca)\b/i.test(foldedOp);
+      if (isExpiredOnlyEvidence && requestedOp === 'remove') {
+        ticket.popupAction = 'remove-expired';
+        ticket.hasInlineRemovalRequest = false;
+        ticket.requiresAttachment = false;
+      } else {
+        const isAll = requestedOp === 'remove-all' || /\b(?:toan\s+bo|tat\s+ca|all|every)\b/i.test(foldedOp);
         ticket.popupAction = isAll ? 'remove-all' : 'remove-one';
         ticket.hasInlineRemovalRequest = true;
         if (ticket.popupAction === 'remove-one' && attachmentCandidates.length === 0) {
           ticket.removalScope = 'ticket-topic-remove-one';
           ticket.requiresAttachment = false;
         }
-        if (!audit.appliedFields.includes('popupAction')) audit.appliedFields.push('popupAction');
       }
-    } else if (semantic.operation === 'replace') {
-      const foldedOp = foldTicketText(evidence.operation);
-      const isNegated = actionIsNegated(foldedOp, 0)
-        || /\b(?:do\s+not|don\W?t|never|khong)\s+(?:add|tao|len|pop\s*up)\b/i.test(foldedOp);
-      if (!isNegated && replaceEvidenceIsExplicit(evidence.operation)) {
-        ticket.popupAction = 'replace';
-        if (!audit.appliedFields.includes('popupAction')) audit.appliedFields.push('popupAction');
+      if (baseTicket.popupAction !== ticket.popupAction && !audit.appliedFields.includes('popupAction')) {
+        audit.appliedFields.push('popupAction');
       }
-    } else if (semantic.operation === 'update-duration') {
+    } else if (requestedOp === 'replace') {
+      ticket.popupAction = 'replace';
+      ticket.hasInlineRemovalRequest = false;
+      if (baseTicket.popupAction !== 'replace' && !audit.appliedFields.includes('popupAction')) {
+        audit.appliedFields.push('popupAction');
+      }
+    } else if (requestedOp === 'update-duration') {
       if (ticket.popupDuration && semantic.requiresAttachment === false && attachmentCandidates.length === 0) {
         ticket.popupAction = 'update-duration';
-        if (!audit.appliedFields.includes('popupAction')) audit.appliedFields.push('popupAction');
+        ticket.hasInlineRemovalRequest = false;
+        if (baseTicket.popupAction !== 'update-duration' && !audit.appliedFields.includes('popupAction')) {
+          audit.appliedFields.push('popupAction');
+        }
       }
-    } else if (semantic.operation === 'create') {
-      if (ticket.popupAction !== 'replace' && !hasAffirmativePopupReplace(activeTicketText)) {
-        ticket.popupAction = 'create';
-      }
-    }
-  } else {
-    if (ticket.popupAction === 'create' && semantic.operation === 'replace' && canUseEvidence('operation', replaceEvidenceIsExplicit)) {
-      ticket.popupAction = 'replace';
-      audit.appliedFields.push('popupAction');
-    }
-    if (ticket.popupAction === 'create' && semantic.operation === 'remove-expired' && canUseEvidence('operation', hasAffirmativeExpiredRemoval)) {
-      ticket.popupAction = 'remove-expired';
-      ticket.requiresAttachment = false;
-      audit.appliedFields.push('popupAction');
-    }
-    if (ticket.popupAction === 'create' && semantic.operation === 'remove' && canUseEvidence('operation', actionEvidenceIsExplicit)) {
-      ticket.popupAction = 'remove-one';
-      if (attachmentCandidates.length === 0) {
-        ticket.removalScope = 'ticket-topic-remove-one';
-        ticket.requiresAttachment = false;
-      }
-      audit.appliedFields.push('popupAction');
-    }
-  }
-  if ((ticket.popupAction === 'remove-one' || ticket.popupAction === 'replace' || ticket.popupAction === 'update-duration') && semantic.operation === 'create' && (canUseEvidence('operation', createEvidenceIsExplicit) || (semantic.requiresAttachment === true && attachmentCandidates.length > 0))) {
-    if (!hasAffirmativePopupReplace(activeTicketText)) {
+    } else if (requestedOp === 'create') {
       ticket.popupAction = 'create';
+      ticket.hasInlineRemovalRequest = semantic.hasInlineRemoval === true;
+      if (baseTicket.popupAction !== 'create' && !audit.appliedFields.includes('popupAction')) {
+        audit.appliedFields.push('popupAction');
+      }
+    }
+  } else if (requestedOp === 'create' && semantic.requiresAttachment === true && attachmentCandidates.length > 0 && operationEvidenceIsSafe('create', evidence.operation || ticketText)) {
+    ticket.popupAction = 'create';
+    ticket.hasInlineRemovalRequest = semantic.hasInlineRemoval === true;
+    if (baseTicket.popupAction !== 'create' && !audit.appliedFields.includes('popupAction')) {
       audit.appliedFields.push('popupAction');
     }
   }
-  if (!ticket.popupRequested && semantic.popupRequested && canUseEvidence('operation')) {
+
+  if (!ticket.popupRequested && semantic.popupRequested && hasExactOpEvidence) {
     ticket.popupRequested = true;
     audit.appliedFields.push('popupRequested');
   }
   const semanticPopupPosition = semantic.popupPosition === 'first' || semantic.popupPosition === 'last'
     ? semantic.popupPosition
     : null;
-  applyMissing('popupPosition', semanticPopupPosition, 'popupPosition', popupPositionEvidenceIsExplicit);
+  if (semanticPopupPosition) {
+    applyField('popupPosition', semanticPopupPosition, 'popupPosition');
+  }
   const semanticAttachmentIndex = Number.isInteger(semantic.popupAttachmentIndex)
     ? semantic.popupAttachmentIndex
     : null;
@@ -1122,24 +1257,26 @@ function mergeSemanticTicket(baseTicket, semantic, ticketText, model = DEFAULT_G
       audit.warnings.push('Gemini popupAttachmentIndex lacks a valid ticket/comment evidence match.');
     }
   }
-  // Merge popupLink: Gemini may confirm or surface a URL that the
-  // deterministic extractor already found; never replace an existing one.
-  if (!ticket.popupLink) {
-    const semanticLink = typeof semantic.popupLink === 'string' && /^https?:\/\//i.test(semantic.popupLink.trim())
-      ? semantic.popupLink.trim().replace(/[.,;)]+$/, '')
-      : null;
-    if (semanticLink && !/^(?:https?:\/\/)?(?:crm|jira|api)\.fastboy\./i.test(semanticLink)) {
-      const websiteUrlMatch = /(?:link\s+website|website|domain|web)\s*[:=-]?\s*(https?:\/\/[^\s<>"']+)/i.exec(ticketText || '');
-      const websiteUrl = websiteUrlMatch ? websiteUrlMatch[1].replace(/[.,;)]+$/, '') : null;
-      if (!websiteUrl || semanticLink.toLowerCase() !== websiteUrl.toLowerCase()) {
+  // Merge popupLink: accept explicit external URL surfaced by Gemini unless it points to CRM/website home.
+  const semanticLink = typeof semantic.popupLink === 'string' && /^https?:\/\//i.test(semantic.popupLink.trim())
+    ? semantic.popupLink.trim().replace(/[.,;)]+$/, '')
+    : null;
+  if (semanticLink && !/^(?:https?:\/\/)?(?:crm|jira|api)\.fastboy\./i.test(semanticLink)) {
+    const websiteUrlMatch = /(?:link\s+website|website|domain|web)\s*[:=-]?\s*(https?:\/\/[^\s<>"']+)/i.exec(ticketText || '');
+    const websiteUrl = websiteUrlMatch ? websiteUrlMatch[1].replace(/[.,;)]+$/, '') : null;
+    if (!websiteUrl || semanticLink.toLowerCase() !== websiteUrl.toLowerCase()) {
+      if (ticket.popupLink !== semanticLink && exactEvidenceInTicket(ticketText, semanticLink)) {
         ticket.popupLink = semanticLink;
-        audit.appliedFields.push('popupLink');
+        if (!audit.appliedFields.includes('popupLink')) audit.appliedFields.push('popupLink');
+      } else if (!ticket.popupLink) {
+        ticket.popupLink = semanticLink;
+        if (!audit.appliedFields.includes('popupLink')) audit.appliedFields.push('popupLink');
       }
     }
   }
   if (audit.appliedFields.some((field) => ['startDate', 'expiryDate'].includes(field))) {
-    ticket.scheduleSource = ticket.scheduleSource || 'gemini-semantic';
-    ticket.scheduleEvidence = ticket.scheduleEvidence || (evidence.endDate || evidence.startDate || null);
+    ticket.scheduleSource = 'gemini-semantic';
+    ticket.scheduleEvidence = evidence.endDate || evidence.startDate || ticket.scheduleEvidence || null;
   }
   if (Array.isArray(semantic.warnings)) {
     audit.warnings.push(...semantic.warnings.filter((warning) => typeof warning === 'string').slice(0, 4));

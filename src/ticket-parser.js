@@ -233,7 +233,7 @@ function hasAffirmativePopupRemoval(text) {
         if (removalTargetIsNonWebsiteChannel(folded, match.index)) continue;
         if (removalTargetIsExpiredOnly(folded, match.index)) continue;
         const prefix = folded.slice(Math.max(0, match.index - 30), match.index);
-        if (/\b(?:schedule|lich|hen(?:\s+gio)?|timer)\s*$/i.test(prefix.trim())) continue;
+        if (/\b(?:auto(?:\s*matically)?|schedule|lich|hen(?:\s+gio)?|timer)\s*$/i.test(prefix.trim())) continue;
         return true;
       }
     }
@@ -735,7 +735,7 @@ function ticketData(body, ticketUrl) {
   ], [String.raw`\b(?:time\s*end|end\s*(?:date|time)?|exp(?:iry|iration)?|expires?|ngay\s*(?:het\s*han|ket\s*thuc)|den\s*(?:het|ngay)|toi\s*het|until)\b`]);
   const holidayClosureLabel = String.raw`\b(?:thong\s*bao\s*nghi\s*(?:le\s*)?(?:ngay)?|tiem\s*nghi\s*(?:le\s*)?(?:ngay)?|nghi\s*(?:le\s*)?(?:ngay)?|dong\s*cua\s*(?:ngay)?|closed\s*(?:on|for)?|closure\s*(?:on|for)?)\b`;
   const parsedExpiry = isIndefinite ? null : (findTicketDate(activeRaw, [
-    String.raw`\b(?:time\s*end|end\s*(?:date|time)?|exp(?:iry|iration)?|expires?|popup\s*(?:end|expiry)|ngay\s*(?:het\s*han|ket\s*thuc)|thoi\s*gian\s*(?:het\s*han|ket\s*thuc)|den\s*(?:het|ngay)|toi\s*het|han\s*(?:toi|den)|until|through|schedule\s*(?:go|remove|end)|lich\s*go|hen\s*(?:gio\s*)?go|go\s*(?:pop\s*up\s*)?vao(?:\s+cuoi)?\s*ngay|remove(?:\s+popup)?\s+on|(?:an|tat|go)\s*sau(?:\s*ngay)?|sau\s*ngay|(?:an|tat|go)\s*(?:vao\s*ngay|ngay|vao)|(?:hide|turn\s*off|take\s*down)\s*(?:after|on))\b`,
+    String.raw`\b(?:time\s*end|end\s*(?:date|time)?|exp(?:iry|iration)?|expires?|popup\s*(?:end|expiry)|ngay\s*(?:het\s*han|ket\s*thuc)|thoi\s*gian\s*(?:het\s*han|ket\s*thuc)|den\s*(?:het|ngay)|toi\s*het|han\s*(?:toi|den)|until|through|schedule\s*(?:go|remove|end)|lich\s*go|hen\s*(?:gio\s*)?go|go\s*(?:pop\s*up\s*)?vao(?:\s+cuoi)?\s*ngay|remove(?:\s+popup)?\s+on|(?:an|tat|go)\s*sau(?:\s*ngay)?|sau\s*ngay|(?:an|tat|go)\s*(?:vao\s*ngay|ngay|vao)|auto(?:\s*matically)?\s*(?:turn\s*off|hide|remove|tat|go|an)(?:\s*(?:pop\s*up|poster|banner|announcement))?|(?:hide|turn\s*off|take\s*down)\s*(?:pop\s*up|poster|banner|announcement)\s*(?:after|on|:|=|-)|(?:hide|turn\s*off|take\s*down)\s*(?:after|on))\b`,
     holidayClosureLabel
   ]) || expiry);
   const hasExplicitStart = !isIndefinite && hasExplicitPopupStartDate(activeRaw);

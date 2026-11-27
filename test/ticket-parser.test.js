@@ -1289,4 +1289,20 @@ test('scopes multi-round CRM conversations to uncompleted active request and ign
   const expiredTicket = parsed('ID#4832 - Update website\nNhờ team xóa các popup đã hết hạn giúp website', 1609900);
   assert.equal(expiredTicket.popupAction, 'remove-expired');
   assert.equal(popupActionNeedsTicketImage(expiredTicket.popupAction, 0), false);
+
+  // Ticket 1610769: "Auto turn off poster: 1/01/2027" is an expiry date for a new popup, NOT a removal/replace command.
+  const t1610769 = [
+    'ID#12333 - Website Support',
+    'Hi team',
+    'Nhờ team popup Poster giúp khách nhé.',
+    'Auto turn off poster: 1/01/2027',
+    'Thanks team'
+  ].join('\n');
+  assert.equal(hasAffirmativePopupRemoval(t1610769), false);
+  assert.equal(hasAffirmativePopupReplace(t1610769), false);
+  const parsed1610769 = parsed(t1610769, 1610769);
+  assert.equal(parsed1610769.siteId, '12333');
+  assert.equal(parsed1610769.popupAction, 'create');
+  assert.equal(parsed1610769.hasInlineRemovalRequest, false);
+  assert.equal(parsed1610769.expiryDate, '2027-01-01');
 });

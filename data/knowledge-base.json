@@ -96,5 +96,17 @@
       "popupPosition": null,
       "popupAttachmentIndex": 2
     }
+  },
+  {
+    "id": "case-auto-turn-off-expiry",
+    "title": "Hẹn ngày tự tắt poster mới (Auto turn off poster - Tạo mới, không phải Gỡ/Thay thế)",
+    "ticketSample": "ID#12333 - Website Support\nNhờ team popup Poster giúp khách nhé.\nAuto turn off poster: 1/01/2027\nThanks team",
+    "explanation": "Yêu cầu chỉ tạo mới 1 popup từ poster đính kèm. Dòng 'Auto turn off poster: 1/01/2027' là hẹn ngày hết hạn tự tắt (endDate = 2027-01-01), TUYỆT ĐỐI KHÔNG phải lệnh xóa hoặc thay thế popup đang chạy trên CMS.",
+    "expected": {
+      "siteId": "12333",
+      "operation": "create",
+      "expiry": "2027-01-01",
+      "popupPosition": null
+    }
   }
 ]
