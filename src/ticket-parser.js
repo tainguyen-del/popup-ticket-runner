@@ -129,6 +129,94 @@ function actionIsNegated(text, actionIndex) {
   return /\b(?:do\s+not|don\W?t|dont|never|(?:must|should|shall)\s+not|can\W?t|cannot|not\s+to|no(?:\s+need\s+to)?|without|khong(?:\s+can)?|dung)\b[^.;\n]{0,60}$/i.test(scopedPrefix);
 }
 
+function isCompletionReplyComment(text) {
+  const folded = foldTicketText(text).replace(/\s+/g, ' ').trim();
+  if (!folded || folded.length > 220) return false;
+  if (/\b(?:nho\s+team|please\b|can\s+ho\s+tro|giup\s+khach|sau\s+do\s+se|thay\s+bang|up\s+lai|xoa\s+popup|go\s+popup|popup\s+poster|remove\s+poster)\b/i.test(folded)) {
+    return false;
+  }
+  return /^(?:hi\s+team\s*,?\s*)?(?:(?:da|done)\s+(?:update(?:\s+theo\s+yeu\s+cau)?|cap\s*nhat(?:\s+theo\s+yeu\s+cau)?|up|xu\s*ly|ho\s*tro|xong|hoan\s*tat|go|xoa)|done\b|completed?\b|updated?\b|finished\b|.{0,60}-\s*done\b)(?:[\s.,!?:;-]*(?:thanks?|thank\s+team|cam\s+on|a|nha))*$/i.test(folded);
+}
+
+function parseConversationComments(raw) {
+  const text = String(raw || '');
+  const convMatch = /(?:^|\n)Conversations\s*(?:\n|$)/i.exec(text);
+  if (!convMatch) return [];
+  let section = text.slice(convMatch.index + convMatch[0].length);
+  section = section.replace(/^\s*Reload\s*(?:\n|$)/i, '');
+  const footerMatch = /\nFastboy CRM\s*@/i.exec(section);
+  if (footerMatch) section = section.slice(0, footerMatch.index);
+  const lines = section.split(/\r?\n/);
+  const timestampPattern = /^(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)\s+\d{1,2},\s+20\d{2}\s+\d{1,2}:\d{2}\s*(?:AM|PM)$/i;
+  const tsIndices = [];
+  for (let i = 0; i < lines.length; i += 1) {
+    if (timestampPattern.test(lines[i].trim())) tsIndices.push(i);
+  }
+  if (!tsIndices.length) return [];
+  const comments = [];
+  for (let k = 0; k < tsIndices.length; k += 1) {
+    const tsIdx = tsIndices[k];
+    const nextTsIdx = k + 1 < tsIndices.length ? tsIndices[k + 1] : lines.length;
+    let bodyEnd = nextTsIdx;
+    if (k + 1 < tsIndices.length) {
+      // Strip the next comment's author/assign/email header lines (1 to 3 lines before next timestamp)
+      let headerStart = nextTsIdx - 1;
+      let steps = 0;
+      while (headerStart > tsIdx && steps < 3) {
+        const candidate = lines[headerStart].trim();
+        if (!candidate || candidate === '(assign)' || /@/.test(candidate) || steps === 2 || headerStart === nextTsIdx - 1) {
+          headerStart -= 1;
+          steps += 1;
+        } else {
+          break;
+        }
+      }
+      // Trim up to email + optional (assign) + author line right above next timestamp
+      let metaLines = 1; // at least author or email line immediately before timestamp
+      if (nextTsIdx - 2 > tsIdx && (lines[nextTsIdx - 2].trim() === '(assign)' || /@/.test(lines[nextTsIdx - 1]))) {
+        metaLines = 2;
+      }
+      if (nextTsIdx - 3 > tsIdx && lines[nextTsIdx - 2].trim() === '(assign)') {
+        metaLines = 3;
+      }
+      bodyEnd = Math.max(tsIdx + 1, nextTsIdx - metaLines);
+    }
+    const body = lines.slice(tsIdx + 1, bodyEnd).join('\n').trim();
+    comments.push({
+      timestamp: lines[tsIdx].trim(),
+      body
+    });
+  }
+  return comments;
+}
+
+function activeTicketRequestText(body) {
+  const raw = String(body || '');
+  const comments = parseConversationComments(raw);
+  if (!comments.length) return raw;
+  const completionIdx = comments.findIndex((comment) => isCompletionReplyComment(comment.body));
+  if (completionIdx <= 0) return raw;
+  const recentText = comments
+    .slice(0, completionIdx)
+    .map((comment) => comment.body)
+    .filter(Boolean)
+    .join('\n\n')
+    .trim();
+  if (!recentText) return raw;
+  const hasActionSignal = /\b(?:pop[\s-]*up|announcement|poster|banner|coupon|voucher|hinh|anh|exp|expiry|until|het\s*han|seconds?|giay|delay|size|1x1)\b/i
+    .test(foldTicketText(recentText));
+  return hasActionSignal ? recentText : raw;
+}
+
+function removalTargetIsNonWebsiteChannel(folded, matchIndex) {
+  const { start, end } = clauseBounds(folded, matchIndex);
+  const clause = folded.slice(start, end);
+  if (/(?:-\s*done\b|\bda\s+(?:xoa|go|xong)\b)/i.test(clause)) return true;
+  const mentionsSocial = /\b(?:dang\s+tren|tren|on)\s+(?:facebook|fb|fanpage|instagram|ig|tiktok|social(?:\s*media)?|google(?:\s*business)?|gbp)\b/i.test(clause);
+  const mentionsWebsite = /\b(?:website|web|site|cms|pop[\s-]*up)\b/i.test(clause);
+  return mentionsSocial && !mentionsWebsite;
+}
+
 function hasAffirmativePopupRemoval(text) {
   const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim();
   const entity = String.raw`(?:pop[\s-]*ups?|announcements?|posters?|banners?|halloween|holiday|thong\s*bao(?:\s*nghi(?:\s*le)?)?)`;
@@ -142,6 +230,8 @@ function hasAffirmativePopupRemoval(text) {
   return patterns.some((pattern) => {
     for (const match of folded.matchAll(pattern)) {
       if (!actionIsNegated(folded, match.index)) {
+        if (removalTargetIsNonWebsiteChannel(folded, match.index)) continue;
+        if (removalTargetIsExpiredOnly(folded, match.index)) continue;
         const prefix = folded.slice(Math.max(0, match.index - 30), match.index);
         if (/\b(?:schedule|lich|hen(?:\s+gio)?|timer)\s*$/i.test(prefix.trim())) continue;
         return true;
@@ -174,14 +264,14 @@ function hasAffirmativePopupUpdate(text) {
 
 function hasAffirmativePopupReplace(text) {
   const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim();
-  const entity = String.raw`(?:pop[\s-]*ups?|announcements?|posters?|banners?|hinh|anh)`;
+  const entity = String.raw`(?:pop[\s-]*ups?|announcements?|posters?|banners?|hinh|anh|coupons?|vouchers?)`;
   if (!new RegExp(String.raw`\b${entity}\b`, 'i').test(folded)) return false;
 
   const patterns = [
-    new RegExp(String.raw`\b(?:update\s*lai|cap\s*nhat\s*lai|thay\s*lai|doi|thay\s*doi|thay\s*the|replace|change|swap)\b[^.;\n]{0,40}\b${entity}\b`, 'gi'),
-    new RegExp(String.raw`\b${entity}\b[^.;\n]{0,40}\b(?:update\s*lai|cap\s*nhat\s*lai|thay\s*lai|doi|thay\s*doi|thay\s*the|replace|change|swap)\b`, 'gi'),
+    new RegExp(String.raw`\b(?:update\s*lai|up\s*lai|dang\s*lai|cap\s*nhat\s*lai|thay\s*lai|doi|thay\s*doi|thay\s*the|replace|change|swap)\b[^.;\n]{0,40}\b${entity}\b`, 'gi'),
+    new RegExp(String.raw`\b${entity}\b[^.;\n]{0,40}\b(?:update\s*lai|up\s*lai|dang\s*lai|cap\s*nhat\s*lai|thay\s*lai|doi|thay\s*doi|thay\s*the|replace|change|swap)\b`, 'gi'),
     new RegExp(String.raw`\bthay\b[^.;\n]{0,30}\b${entity}\b`, 'gi'),
-    /\b(?:update|cap\s*nhat|thay|doi)\s+lai\b/gi
+    /\b(?:update|up|dang|cap\s*nhat|thay|doi)\s+lai\b(?!\s+(?:content|noi\s*dung|bai(?:\s+(?:viet|dang))?|caption|sms|tin\s*nhan|google|facebook|fb|menu|gia|gio|text)\b)/gi
   ];
 
   for (const pattern of patterns) {
@@ -200,6 +290,30 @@ function hasAffirmativePopupReplace(text) {
   return removesExisting && addsOrUpdates && !isScheduledRemoval && !isTemporaryRemoval && !isSeparatedAction;
 }
 
+function removalTargetIsExpiredOnly(folded, matchIndex) {
+  const { start, end } = clauseBounds(folded, matchIndex);
+  const clause = folded.slice(start, end);
+  return /\b(?:da\s+)?(?:het\s*han|qua\s*han|expired)\b/i.test(clause);
+}
+
+function hasAffirmativeExpiredRemoval(text) {
+  const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim();
+  const entity = String.raw`(?:pop[\s-]*ups?|announcements?|posters?|banners?)`;
+  const patterns = [
+    new RegExp(String.raw`\b(?:go|xoa|don(?:\s+dep)?|tat|remove|delete|clear|clean(?:\s+up)?|purge)\b[^.;\n]{0,45}\b(?:cac\s+|nhung\s+|toan\s+bo\s+|tat\s+ca\s+|all\s+)?${entity}\b[^.;\n]{0,30}\b(?:da\s+)?(?:het\s*han|qua\s*han)\b`, 'gi'),
+    new RegExp(String.raw`\b(?:remove|delete|clear|clean(?:\s+up)?|purge)\b[^.;\n]{0,45}\bexpired\s+(?:${entity})\b`, 'gi'),
+    new RegExp(String.raw`\b${entity}\b[^.;\n]{0,25}\b(?:da\s+)?(?:het\s*han|qua\s*han|expired)\b[^.;\n]{0,35}\b(?:go|xoa|don|tat|remove|delete|clear|clean)\b`, 'gi')
+  ];
+  for (const pattern of patterns) {
+    for (const match of folded.matchAll(pattern)) {
+      if (actionIsNegated(folded, match.index)) continue;
+      if (removalTargetIsNonWebsiteChannel(folded, match.index)) continue;
+      return true;
+    }
+  }
+  return false;
+}
+
 function explicitRemoveAllRequested(text) {
   const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim();
   const patterns = [
@@ -211,6 +325,7 @@ function explicitRemoveAllRequested(text) {
   for (const pattern of patterns) {
     for (const match of folded.matchAll(pattern)) {
       if (actionIsNegated(folded, match.index)) continue;
+      if (removalTargetIsExpiredOnly(folded, match.index)) continue;
       const { end } = clauseBounds(folded, match.index);
       const tail = folded.slice(match.index + match[0].length, end);
       if (/\b(?:except|but\s+keep|leave|tru|ngoai\s+tru)\b/i.test(tail)) continue;
@@ -237,21 +352,94 @@ function hasIndefiniteScheduleInstruction(text) {
   return patterns.some((pattern) => pattern.test(folded));
 }
 
+function stripKeepExistingClauses(foldedText) {
+  return String(foldedText || '')
+    // Do not mistake "vẫn giữ 2 coupon hiện có" / "keep 2 existing popups" for uploading 2 new posters.
+    .replace(/\b(?:van\s+)?giu{1,2}(?:\s+(?:lai|nguyen))?\s+(?:ca\s*)?(?:\d+|hai|ba|bon|two|three|both)?\s*(?:(?:coupon|voucher|flyer|poster|pop[\s-]*up|anh|hinh|slide|card|item)s?\s*)*[^.\n,;]{0,40}\b(?:hien\s+co|dang\s+co|dang\s+chay|dang\s+pop(?:\s*up)?|hien\s+tai|cu|existing|current)\b/gi, ' ')
+    .replace(/\bkeep(?:ing)?\s+(?:all\s+)?(?:the\s+)?(?:existing|current|\d+|two|three|both)\s+(?:existing|current\s+)?(?:coupon|voucher|flyer|poster|pop[\s-]*up|image|card)s?\b/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function hasMultiPosterIntent(text) {
-  const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim();
+  const folded = stripKeepExistingClauses(
+    foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim()
+  );
   if (!folded) return false;
 
+  const pluralNoun = String.raw`(?:(?:coupon|voucher|flyer|promo(?:tion)?|poster|banner|anh|hinh|image)\s+)*(?:posters?|pop[\s-]*ups?|banners?|coupons?|vouchers?|flyers?|(?:hinh\s+)?anh|(?:tam\s+)?hinh)`;
   const patterns = [
-    /\b(?:2|3|4|hai|ba|bon|two|three)\s*(?:posters?|pop[\s-]*ups?|banners?)\b/i,
-    /\b(?:ca\s*2|ca\s*hai|both)\s*(?:posters?|pop[\s-]*ups?|banners?|anh|hinh|file)?\b/i,
-    /\b(?:pop(?:\s*up)?|dang|up|them|tao|treo|cai(?:\s+dat)?)\s+(?:ca\s*2|ca\s*hai|2|hai|3|ba)\s*(?:posters?|pop[\s-]*ups?|banners?|anh|hinh|file)?\b/i,
-    /\b(?:pop(?:\s*up)?|dang|up|them|tao|treo)\s+(?:posters|pop[\s-]*ups)\b/i,
-    /\b(?:poster|popup|anh|hinh)\s*(?:1|mot|one)\s*(?:va|and|,|&)\s*(?:poster|popup|anh|hinh)?\s*(?:2|hai|two)\b/i,
-    /\b(?:multiple|several|both)\s+(?:posters?|pop[\s-]*ups?|banners?)\b/i,
-    /\b(?:2|3|two|three)\s+separate\s+pop[\s-]*ups?\b/i
+    new RegExp(String.raw`\b(?:2|3|4|hai|ba|bon|two|three)\s*${pluralNoun}\b`, 'i'),
+    /\b(?:2|3|4|hai|ba|bon|two|three)\s+(?:anh|hinh|image|file)s?\s+(?:dinh\s*kem|moi|ben\s+duoi|pop[\s-]*up)\b/i,
+    new RegExp(String.raw`\b(?:ca\s*2|ca\s*hai|both)\s*(?:${pluralNoun}|anh|hinh|file)?\b`, 'i'),
+    new RegExp(String.raw`\b(?:pop(?:\s*up)?|dang|up|update|cap\s*nhat|them|tao|treo|cai(?:\s+dat)?)\s+(?:ca\s*2|ca\s*hai|2|hai|3|ba)\s*(?:${pluralNoun}|anh|hinh|file)?\b`, 'i'),
+    /\b(?:pop(?:\s*up)?|dang|up|them|tao|treo)\s+(?:posters|pop[\s-]*ups|coupons)\b/i,
+    /\b(?:poster|popup|coupon|voucher|anh|hinh)\s*(?:1|mot|one)\s*(?:va|and|,|&)\s*(?:poster|popup|coupon|voucher|anh|hinh)?\s*(?:2|hai|two)\b/i,
+    /\b(?:multiple|several|both)\s+(?:(?:coupon|voucher|flyer|poster|banner)\s+)*(?:posters?|pop[\s-]*ups?|banners?|coupons?|vouchers?)\b/i,
+    /\b(?:2|3|two|three)\s+separate\s+(?:pop[\s-]*ups?|coupons?|posters?)\b/i
   ];
 
   return patterns.some((pattern) => pattern.test(folded));
+}
+
+function keepsExistingPopups(text) {
+  const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim();
+  if (!folded) return false;
+  const patterns = [
+    /\b(?:van\s+)?giu{1,2}(?:\s+(?:lai|nguyen))?\s+(?:het|toan\s+bo|tat\s+ca|cac|\d+|hai|ba)?\s*(?:coupon|voucher|flyer|poster|pop[\s-]*up|anh|hinh|card|cai|slide)[^.\n;]{0,45}\b(?:hien\s+co|dang\s+co|dang\s+chay|dang\s+pop(?:\s*up)?|hien\s+tai|cu)\b/gi,
+    /\bvan\s+giu{1,2}(?:\s+(?:lai|nguyen))?\b/gi,
+    /\bkeep(?:ing)?(?:\s+all)?\s+(?:the\s+)?(?:existing|current)\s+(?:pop[\s-]*ups?|coupons?|posters?|banners?)\b/gi
+  ];
+  for (const pattern of patterns) {
+    for (const match of folded.matchAll(pattern)) {
+      if (!actionIsNegated(folded, match.index)) return true;
+    }
+  }
+  return false;
+}
+
+function extractPopupOrderSequence(text) {
+  const raw = String(text || '');
+  if (!raw.trim()) return [];
+  const linePattern = /(?:theo\s+)?(?:th[uưứ]\s*t[uự]|order(?:\s+of\s+(?:pop[\s-]*ups?|coupons?|posters?))?)(?:\s+(?:coupon|pop[\s-]*ups?|posters?|hi[eể]n\s*th[iị]))?\s*[:=-]\s*([^\n\r]+)/gi;
+  for (const match of raw.matchAll(linePattern)) {
+    const rhs = String(match[1] || '').trim();
+    if (!rhs) continue;
+    const parts = rhs
+      .split(/(?:\s+[-–—]\s+|\s*(?:->|=>|>|,|\/|;|\|)\s*)/)
+      .map((part) => part.replace(/^\d+[.)]\s*/, '').replace(/\s+/g, ' ').trim())
+      .filter((part) => part.length >= 2);
+    if (parts.length < 2) continue;
+    if (parts.every((part) => /^(?:first|last|top|bottom|dau|cuoi)$/i.test(foldTicketText(part)))) continue;
+    return parts;
+  }
+  return [];
+}
+
+function requestedAspectRatio(text) {
+  const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim();
+  if (!folded) return null;
+  if (/\b(?:size\s*)?(?:1\s*[x:]\s*1|vuong|square)\b/i.test(folded)) {
+    return { label: '1:1', ratio: 1 };
+  }
+  const ratioMatch = /\b(?:size|ti\s*le|ratio|khung)\s*[:=-]?\s*(\d{1,4})\s*[x:]\s*(\d{1,4})\b/i.exec(folded);
+  if (ratioMatch) {
+    const w = Number(ratioMatch[1]);
+    const h = Number(ratioMatch[2]);
+    if (w > 0 && h > 0) {
+      return { label: `${w}:${h}`, ratio: w / h };
+    }
+  }
+  return null;
+}
+
+function hasSizeOrReuploadInstruction(text) {
+  const folded = foldTicketText(text).replace(/[\t\r\f\v ]+/g, ' ').trim();
+  if (!folded) return false;
+  return Boolean(requestedAspectRatio(folded))
+    || /\b(?:up|upload|dang|gui|update|cap\s*nhat|sua|chinh)\s+lai\s+(?:anh|hinh|poster|popup|coupon)\b/i.test(folded)
+    || /\b(?:dung|chuan|khac|sai|doi|fix|wrong|different|correct)\s+size\b/i.test(folded)
+    || /\bsize\s+(?:moi|khac|vuong|1\s*[x:]\s*1)\b/i.test(folded);
 }
 
 function requestedPopupPosition(text) {
@@ -521,7 +709,8 @@ function hasExplicitPopupStartDate(text) {
 
 function ticketData(body, ticketUrl) {
   const raw = String(body || '');
-  const text = raw.replace(/\s+/g, ' ').trim();
+  const activeRaw = activeTicketRequestText(raw);
+  const text = activeRaw.replace(/\s+/g, ' ').trim();
   const ticketNumber = new URL(ticketUrl).pathname.match(/\/tickets\/detail\/(\d+)/i)?.[1] || null;
   const beforeCurrentTicket = ticketNumber && raw.includes(`#${ticketNumber}`)
     ? raw.slice(0, raw.indexOf(`#${ticketNumber}`))
@@ -536,22 +725,22 @@ function ticketData(body, ticketUrl) {
   const labelledSiteId = [
     /(?:website|site|project)\s*(?:id|#)\s*[:#-]?\s*(\d{2,})/i,
     /(?:id\s*(?:website|site|project))\s*[:#-]?\s*(\d{2,})/i
-  ].map((rule) => text.match(rule)?.[1]).find(Boolean) || null;
-  const isIndefinite = hasIndefiniteScheduleInstruction(raw);
+  ].map((rule) => raw.replace(/\s+/g, ' ').match(rule)?.[1]).find(Boolean) || null;
+  const isIndefinite = hasIndefiniteScheduleInstruction(activeRaw);
   const expiry = isIndefinite ? null : (/\b(?:exp(?:\.|\b)|expiry\b|expiration\b|expires?\b|end\s*date\b)\s*[:\-]?\s*([^|\n]{3,50})/i.exec(text)?.[1]?.trim() || null);
   const fromPattern = String.raw`\bfrom\s*(?:date|time)?\s*[:=-]|\bfrom\s+(?:date|time)\b|\bfrom(?=\s+(?:(?:mon|tue|wed|thu|fri|sat|sun)[a-z]*,?\s*)?(?:${DATE_TOKEN_SOURCE}))`;
-  const start = isIndefinite ? null : findTicketDate(raw, [
+  const start = isIndefinite ? null : findTicketDate(activeRaw, [
     String.raw`\b(?:time\s*start|start\s*(?:date|time)?|popup\s*start|ngay\s*(?:bat\s*dau|dang|hien)|thoi\s*gian\s*(?:bat\s*dau|hien)|tu\s+ngay|hen(?:\s+(?:ngay|gio|lich))?)\b`,
     fromPattern
   ], [String.raw`\b(?:time\s*end|end\s*(?:date|time)?|exp(?:iry|iration)?|expires?|ngay\s*(?:het\s*han|ket\s*thuc)|den\s*(?:het|ngay)|toi\s*het|until)\b`]);
   const holidayClosureLabel = String.raw`\b(?:thong\s*bao\s*nghi\s*(?:le\s*)?(?:ngay)?|tiem\s*nghi\s*(?:le\s*)?(?:ngay)?|nghi\s*(?:le\s*)?(?:ngay)?|dong\s*cua\s*(?:ngay)?|closed\s*(?:on|for)?|closure\s*(?:on|for)?)\b`;
-  const parsedExpiry = isIndefinite ? null : (findTicketDate(raw, [
+  const parsedExpiry = isIndefinite ? null : (findTicketDate(activeRaw, [
     String.raw`\b(?:time\s*end|end\s*(?:date|time)?|exp(?:iry|iration)?|expires?|popup\s*(?:end|expiry)|ngay\s*(?:het\s*han|ket\s*thuc)|thoi\s*gian\s*(?:het\s*han|ket\s*thuc)|den\s*(?:het|ngay)|toi\s*het|han\s*(?:toi|den)|until|through|schedule\s*(?:go|remove|end)|lich\s*go|hen\s*(?:gio\s*)?go|go\s*(?:pop\s*up\s*)?vao(?:\s+cuoi)?\s*ngay|remove(?:\s+popup)?\s+on|(?:an|tat|go)\s*sau(?:\s*ngay)?|sau\s*ngay|(?:an|tat|go)\s*(?:vao\s*ngay|ngay|vao)|(?:hide|turn\s*off|take\s*down)\s*(?:after|on))\b`,
     holidayClosureLabel
   ]) || expiry);
-  const hasExplicitStart = !isIndefinite && hasExplicitPopupStartDate(raw);
+  const hasExplicitStart = !isIndefinite && hasExplicitPopupStartDate(activeRaw);
   const range = isIndefinite ? null : popupRangeFromText(text);
-  const holidayExpiry = isIndefinite ? null : findHolidayClosureExpiry(raw);
+  const holidayExpiry = isIndefinite ? null : findHolidayClosureExpiry(activeRaw);
   const popupStart = hasExplicitStart ? (range?.start || start) : null;
   const inferredMonthEnd = isIndefinite ? null : endOfMonthExpiryFromTicket(text);
   const popupEnd = range?.end || parsedExpiry || holidayExpiry || inferredMonthEnd?.date || null;
@@ -562,12 +751,13 @@ function ticketData(body, ticketUrl) {
     : reconcilePopupRange(popupStartDate, popupEndDate, Boolean(range || (start && parsedExpiry)));
   // Keep ticket line/clause boundaries for action parsing. CRM headers such
   // as "Update website" must not be joined to a later popup-removal sentence.
-  const folded = foldTicketText(raw);
-  const popupPosition = requestedPopupPosition(raw);
-  const popupDuration = extractPopupDuration(raw);
+  const folded = foldTicketText(activeRaw);
+  const popupPosition = requestedPopupPosition(activeRaw);
+  const popupDuration = extractPopupDuration(activeRaw);
   const popupRequested = /\b(?:pop[ -]?up|announcement|poster|banner)\b/i.test(text);
   // Vietnamese removal verbs must be adjacent to the entity. This prevents
   // "hoan tat design poster" from being read as "tat poster".
+  const removesExpiredPopups = hasAffirmativeExpiredRemoval(folded);
   const removesExistingPopupPoster = hasAffirmativePopupRemoval(folded);
   const addsOrUpdatesPopup = hasAffirmativePopupUpdate(folded);
   const hasPosterUpload = hasAffirmativePosterUpload(folded);
@@ -582,6 +772,8 @@ function ticketData(body, ticketUrl) {
   let popupAction;
   if (replaceExistingPopup) {
     popupAction = 'replace';
+  } else if (removesExpiredPopups && !addsOrUpdatesPopup && !removesAllExistingPopups && !hasPosterUpload) {
+    popupAction = 'remove-expired';
   } else if (removesExistingPopupPoster && !isScheduledRemoval && !addsOrUpdatesPopup) {
     popupAction = removesAllExistingPopups ? 'remove-all' : 'remove-one';
   } else if (popupDuration && !hasPosterUpload && !replaceExistingPopup && !removesExistingPopupPoster) {
@@ -589,7 +781,7 @@ function ticketData(body, ticketUrl) {
   } else {
     popupAction = 'create';
   }
-  const popupLink = extractPopupLink(raw);
+  const popupLink = extractPopupLink(activeRaw);
   return {
     siteId: titleSiteId || labelledSiteId,
     start: popupStart,
@@ -655,11 +847,19 @@ module.exports = {
   MONTH_NUMBERS,
   calendarDate,
   foldTicketText,
+  isCompletionReplyComment,
+  parseConversationComments,
+  activeTicketRequestText,
   hasAffirmativePopupRemoval,
+  hasAffirmativeExpiredRemoval,
   hasAffirmativePopupUpdate,
   hasAffirmativePopupReplace,
   explicitRemoveAllRequested,
   hasMultiPosterIntent,
+  keepsExistingPopups,
+  extractPopupOrderSequence,
+  requestedAspectRatio,
+  hasSizeOrReuploadInstruction,
   hasIndefiniteScheduleInstruction,
   requestedPopupPosition,
   normalizeExpiry,

@@ -16,7 +16,8 @@ const {
   multiVisionPrompt,
   visionPrompt,
   isValidPosterScheduleEvidence,
-  resolveVisualDuplicateConfirmation
+  resolveVisualDuplicateConfirmation,
+  resolvePopupOrderVision
 } = require('../src/semantic-ticket');
 const { applyArtworkSchedulePrecedence } = require('../src/run');
 
@@ -991,5 +992,115 @@ test('mergeSemanticTicket allows Gemini create + requiresAttachment to override 
   assert.equal(ticket.popupAction, 'create');
   assert.equal(ticket.popupDuration.requestedSeconds, 10);
   assert.ok(audit.appliedFields.includes('popupAction'));
+});
+
+test('visionPrompt exposes pixel sizes and resolvePopupOrderVision maps custom order labels to entries', async () => {
+  const prompt = visionPrompt('Nhờ team up lại ảnh này, vì đúng size 1x1', [
+    { index: 1, filename: 'old.png', width: 682, height: 1024, aspectLabel: '0.67 (portrait)', context: 'old poster' },
+    { index: 2, filename: 'new.webp', width: 1024, height: 1024, aspectLabel: '1:1 (square)', context: 'size 1x1' }
+  ]);
+  assert.match(prompt, /\[Size: 682x1024, Aspect: 0\.67 \(portrait\)\]/);
+  assert.match(prompt, /\[Size: 1024x1024, Aspect: 1:1 \(square\)\]/);
+  assert.match(prompt, /DIFFERENT SIZE \/ ASPECT RATIO RE-UPLOAD/);
+
+  const entries = [
+    { index: 1, filename: 'weekly-appreciation.png', isTicket: true, mimeType: 'image/png', base64: 'MQ==' },
+    { index: 2, filename: 'giftcard.png', isTicket: true, mimeType: 'image/png', base64: 'Mg==' },
+    { index: 3, filename: 'weekly-special.webp', isTicket: false, mimeType: 'image/webp', base64: 'Mw==' }
+  ];
+  const orderResult = await resolvePopupOrderVision(
+    ['Giftcard', 'Weekly Appreciation', 'Weekly Special'],
+    entries,
+    {
+      apiKey: 'test-key-not-a-real-secret',
+      fetchImpl: async () => ({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          candidates: [{ content: { parts: [{ text: JSON.stringify({
+            orderedIndices: [2, 1, 3],
+            confidence: 0.97,
+            rationale: 'Entry #2 is Giftcard, Entry #1 is Weekly Appreciation, Entry #3 is Weekly Special.'
+          }) }] } }]
+        })
+      })
+    }
+  );
+  assert.deepEqual(orderResult.orderedIndices, [2, 1, 3]);
+  assert.equal(orderResult.audit.status, 'ordered');
+});
+
+test('mergeSemanticTicket respects uncompleted active comments for create vs replace and validates remove-expired', () => {
+  const multiRoundText = [
+    'ID#4832 - Support',
+    'Conversations',
+    'Reload',
+    'Hau Do',
+    'hau_do@fastboy.net',
+    'Nov 27, 2026 11:17 PM',
+    'Nhờ team hỗ trợ popup poster lên website giúp khách nha',
+    'EXP: 11/27/2026',
+    'Tai Nguyen (TE)',
+    'tai_nguyen@fastboy.net',
+    'Nov 27, 2026 11:15 PM',
+    'Đã update theo yêu cầu',
+    'Hau Do',
+    'hau_do@fastboy.net',
+    'Nov 27, 2026 10:55 PM',
+    'Nhờ team hỗ trợ remove poster 20% gift card nha',
+    'Fastboy CRM @ 2026 Created by Fastboy'
+  ].join('\n');
+
+  const mergedCreate = mergeSemanticTicket({ ...baseTicket, siteId: '4832', popupAction: 'replace' }, {
+    siteId: '4832',
+    popupRequested: true,
+    operation: 'create',
+    actionSummary: 'Tạo popup mới từ poster đính kèm',
+    removalTopic: null,
+    requiresAttachment: true,
+    popupPosition: null,
+    startDate: null,
+    endDate: '2026-11-27',
+    popupAttachmentIndex: 1,
+    popupLink: null,
+    confidence: 0.95,
+    evidence: {
+      siteId: 'ID#4832',
+      operation: 'popup poster lên website',
+      popupPosition: null,
+      startDate: null,
+      endDate: 'EXP: 11/27/2026',
+      popupAttachmentIndex: 'black-friday.png'
+    },
+    warnings: []
+  }, multiRoundText, undefined, [{ index: 1, filename: 'black-friday.png', context: 'black-friday.png' }]);
+  assert.equal(mergedCreate.ticket.popupAction, 'create');
+
+  const expiredText = 'ID#4832 - Update website\nNhờ team xóa các popup đã hết hạn trên CMS';
+  const mergedExpired = mergeSemanticTicket({ ...baseTicket, siteId: '4832', popupAction: 'create' }, {
+    siteId: '4832',
+    popupRequested: true,
+    operation: 'remove-expired',
+    actionSummary: 'Xóa các popup đã hết hạn trên CMS',
+    removalTopic: null,
+    requiresAttachment: false,
+    popupPosition: null,
+    startDate: null,
+    endDate: null,
+    popupAttachmentIndex: null,
+    popupLink: null,
+    confidence: 0.94,
+    evidence: {
+      siteId: 'ID#4832',
+      operation: 'xóa các popup đã hết hạn',
+      popupPosition: null,
+      startDate: null,
+      endDate: null,
+      popupAttachmentIndex: null
+    },
+    warnings: []
+  }, expiredText);
+  assert.equal(mergedExpired.ticket.popupAction, 'remove-expired');
+  assert.equal(mergedExpired.ticket.requiresAttachment, false);
 });
 

@@ -46,6 +46,17 @@ jobs:
           body: |
             ## Popup Ticket Runner v${{ steps.pkg.outputs.version }}
             - Commit: `${{ github.sha }}`
+            - **Tính năng mới — Tự động & theo yêu cầu xóa popup đã hết hạn:**
+              - Tự động phát hiện và xóa các popup đã quá hạn (`time_end < ngày hiện tại` theo múi giờ project) sau khi cập nhật popup trên CMS, luôn bảo toàn popup vô thời hạn, popup còn hạn và ảnh vừa upload; bổ sung checkbox **"Tự động xóa các popup đã hết hạn trên CMS"** trên UI (`--no-cleanup-expired` để tắt).
+              - Hỗ trợ ticket chuyên biệt yêu cầu dọn popup hết hạn (`remove-expired`), tách biệt hoàn toàn với `remove-all` để không xóa nhầm popup đang chạy.
+              - Sửa [`deletePopupItemAtIndex`](src/cms/popup-editor.js) không bấm `Escape` lên `[role="dialog"]` của chính slideover drawer NewZen CMS, khắc phục triệt để lỗi đóng drawer gây `target-image-match-count-0` ở bước sắp xếp vị trí sau khi xóa card.
+            - **Sửa lỗi ticket nhiều vòng hội thoại & nhận diện thay thế sai (Tickets #1609899, ID#9343):**
+              - Tách phạm vi phân tích sang comment mới nhất chưa hoàn tất phía trên phản hồi đã xử lý (`"Đã update theo yêu cầu"`, `"Done"`, `"-Done"`), không trộn lệnh gỡ cũ với yêu cầu tạo popup mới.
+              - Loại trừ các câu gỡ bài trên Facebook/social (`"gỡ poster đăng trên facebook"`, `"Xoá bài trên FB -Done"`) và cụm `"update lại content"` khỏi hành động gỡ/thay thế popup website.
+            - **Hỗ trợ multi-poster, thay ảnh theo kích thước, giữ popup cũ & sắp xếp theo thứ tự (Tickets #1609697, #1607802):**
+              - Chờ tải đủ ảnh/comment AJAX trên CRM và gửi kích thước pixel (`width x height`, aspect ratio) cho Gemini Vision chọn đúng ảnh đúng size (ví dụ `1:1` vuông).
+              - Nhận diện đúng multi-poster (`"2 coupon pop up"`), giữ popup cũ (`keepsExistingPopups`), áp dụng lịch riêng từng poster, hỗ trợ đối chiếu thay ảnh khác tỷ lệ khung hình (`allowCrossAspectRatioConfirmation`) và tự động sắp xếp lại danh sách theo thứ tự yêu cầu (`Thứ tự: A - B - C`) qua Gemini Vision.
+              - Sửa `openPopupSettings` không thoát sớm bởi ảnh trên khung preview khi accordion `Popup_setting` còn đóng, đồng thời bổ sung `readLegacyFlatPopupItems` đọc popup form phẳng bản `1.0.31`.
             - **Sửa lỗi timeout 30s ở bộ chọn ngày `v-calendar` trong Popup settings (Ticket #1609262):**
               - Đọc tiêu đề tháng/năm (`calendarHeading`) nguyên tử qua `evaluate()` trên DOM đang hiển thị, bổ sung timeout ngắn và cơ chế retry thay vì treo 30s trên `.vc-title.nth(1)` khi Vue vừa unmount node transition.
               - Bổ sung chờ popover lịch (`popupCalendar`), chuẩn hóa `calendarMonthStart`, retry khi click ngày/nút chuyển tháng và blur input sau `Clear` (`clearPopupDateControl`).

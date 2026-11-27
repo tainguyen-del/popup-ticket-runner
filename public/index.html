@@ -72,6 +72,12 @@
             <input id="ticket-url" name="ticketUrl" type="url" inputmode="url" autocomplete="off" placeholder="Dán link ticket Fastboy" required>
             <button id="run-button" type="submit">Tạo popup &amp; Build <span aria-hidden="true">→</span></button>
           </div>
+          <div class="ticket-options">
+            <label class="checkbox-row" for="cleanup-expired">
+              <input id="cleanup-expired" name="cleanupExpired" type="checkbox" checked>
+              <span>Tự động xóa các popup đã hết hạn trên CMS</span>
+            </label>
+          </div>
           <p id="form-message" class="form-message" role="alert"></p>
         </form>
         <p class="safety-note">Mỗi lần bấm chạy sẽ tải poster về máy, cập nhật CMS, lưu popup và Build/publish website khi các kiểm tra an toàn thành công.</p>

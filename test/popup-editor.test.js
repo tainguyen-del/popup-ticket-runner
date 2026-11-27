@@ -9,6 +9,7 @@ const {
   popupListItemsPanel,
   popupListItemCards,
   readPopupListItems,
+  readLegacyFlatPopupItems,
   openPopupListCard,
   popupImageUploadControl,
   waitForPopupImageUpload,
@@ -25,7 +26,10 @@ const {
   isCorruptedSectionText,
   isAnnouncementSectionText,
   existingPopupSection,
-  openPopupSection
+  openPopupSection,
+  openPopupSettings,
+  cleanupExpiredPopupsInDrawer,
+  reorderEntriesByCustomOrder
 } = require('../src/run');
 
 test('readPopupListItems ignores a stale empty Vue snapshot when a populated snapshot exists', async () => {
@@ -986,6 +990,358 @@ test('calendarHeading reads active v-calendar month atomically without hanging o
   };
   const fallbackHeading = await calendarHeading(fallbackCalendar);
   assert.equal(fallbackHeading, 'November 2026');
+});
+
+test('readLegacyFlatPopupItems recovers legacy 1.0.31 popup image without list_items and reorderEntriesByCustomOrder sorts entries', async () => {
+  const fs = require('node:fs');
+  const os = require('node:os');
+  const path = require('node:path');
+
+  const drawerScope = {
+    evaluate: async () => ({
+      ready: true,
+      serializedItems: null,
+      flatItems: [{
+        image: 'https://nz-website-media-r2-pub.gocheckin.net/17333-8950/page/weekly-special.webp',
+        link: 'https://nailit.com/book',
+        time_start: '',
+        time_end: ''
+      }]
+    })
+  };
+  const mockPage = {
+    locator: () => drawerScope,
+    waitForTimeout: async () => {}
+  };
+  const recovered = await readLegacyFlatPopupItems(mockPage, {
+    time_start: '2026-11-01 00:00',
+    time_end: '2026-12-31 23:59'
+  });
+  assert.equal(recovered.length, 1);
+  assert.equal(recovered[0].image, 'https://nz-website-media-r2-pub.gocheckin.net/17333-8950/page/weekly-special.webp');
+  assert.equal(recovered[0].time_end, '2026-12-31 23:59');
+  assert.equal(recovered[0].link, 'https://nailit.com/book');
+
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'popup-order-entries-'));
+  try {
+    const png = Buffer.from('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQIHWP4z8DwHwAFgAI/ScL9lQAAAABJRU5ErkJggg==', 'base64');
+    const p1 = path.join(dir, 'a-weekly-appreciation.png');
+    const p2 = path.join(dir, 'b-giftcard.png');
+    const p3 = path.join(dir, 'c-weekly-special.png');
+    fs.writeFileSync(p1, png);
+    fs.writeFileSync(p2, png);
+    fs.writeFileSync(p3, png);
+    const inputEntries = [
+      { imagePath: p1, filename: 'a-weekly-appreciation.png', isTicket: true },
+      { imagePath: p2, filename: 'b-giftcard.png', isTicket: true },
+      { imagePath: p3, filename: 'c-weekly-special.png', isTicket: false }
+    ];
+    const result = await reorderEntriesByCustomOrder(
+      inputEntries,
+      ['Giftcard', 'Weekly Appreciation', 'Weekly Special'],
+      {
+        orderVisionFn: async () => ({
+          orderedIndices: [2, 1, 3],
+          audit: { rationale: 'Giftcard -> Weekly Appreciation -> Weekly Special' }
+        })
+      }
+    );
+    assert.equal(result.ordered, true);
+    assert.deepEqual(result.entries.map((e) => e.filename), [
+      'b-giftcard.png',
+      'a-weekly-appreciation.png',
+      'c-weekly-special.png'
+    ]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('openPopupSettings expands collapsed Popup_setting even when allowFlatForm sees preview images', async () => {
+  const createMockPage = ({ hasAddBlock, flatControlInsideDrawer, previewHasMedia }) => {
+    let expanded = false;
+    let popupSettingClicks = 0;
+
+    const makeLocator = (visibleFn, opts = {}) => {
+      const loc = {
+        first: () => loc,
+        count: async () => (visibleFn() ? 1 : 0),
+        nth: () => loc,
+        filter: ({ has } = {}) => (has ? makeLocator(() => visibleFn() && Boolean(has._isVisible?.())) : loc),
+        isVisible: async () => visibleFn(),
+        evaluate: async (fn) => (opts.evaluate ? opts.evaluate(fn, expanded) : false),
+        getAttribute: async () => (opts.getAttribute ? opts.getAttribute(expanded) : null),
+        click: async () => {
+          if (opts.onClick) opts.onClick();
+        },
+        waitFor: async ({ timeout = 1000 } = {}) => {
+          if (!visibleFn()) throw new Error(`Timeout ${timeout}ms`);
+        },
+        _isVisible: visibleFn
+      };
+      return loc;
+    };
+
+    const addBlockLocator = makeLocator(() => expanded && hasAddBlock);
+    const popupSettingLocator = makeLocator(() => true, {
+      evaluate: () => expanded,
+      onClick: () => {
+        popupSettingClicks += 1;
+        expanded = !expanded;
+      }
+    });
+    const drawerFlatControls = makeLocator(() => expanded && flatControlInsideDrawer);
+    const drawerLocator = {
+      first: () => drawerLocator,
+      count: async () => 1,
+      nth: () => drawerLocator,
+      filter: () => drawerLocator,
+      evaluate: async () => false,
+      locator: (sel) => {
+        if (String(sel).includes('check-all-')) return drawerFlatControls;
+        return makeLocator(() => false);
+      }
+    };
+
+    const page = {
+      waitForTimeout: async () => {},
+      evaluate: async () => true,
+      getByText: (matcher) => {
+        const text = String(matcher || '');
+        if (/Popup/i.test(text)) return popupSettingLocator;
+        if (/Slide direction style/i.test(text)) return makeLocator(() => true);
+        return makeLocator(() => false);
+      },
+      getByRole: (role, { name } = {}) => {
+        if (role === 'button' && /Add/i.test(String(name || ''))) return addBlockLocator;
+        return makeLocator(() => false);
+      },
+      locator: (sel) => {
+        const selector = String(sel || '');
+        if (selector.includes('overflow-y-auto')) return drawerLocator;
+        if (selector.includes('Add block')) return addBlockLocator;
+        if (selector.includes('nz-website-media') && !selector.includes('Add block')) {
+          return makeLocator(() => previewHasMedia || (expanded && flatControlInsideDrawer));
+        }
+        if (selector.includes('Slide direction style') || selector.includes('Popup')) {
+          return makeLocator(() => true);
+        }
+        return makeLocator(() => false);
+      }
+    };
+
+    return {
+      page,
+      getState: () => ({ expanded, popupSettingClicks, addBlockVisible: expanded && hasAddBlock })
+    };
+  };
+
+  // Case 1 (1.0.38): Website preview shows nz-website-media images while Popup_setting accordion is collapsed.
+  // openPopupSettings({ allowFlatForm: true }) must still click Popup_setting to expand it until Add block appears.
+  const listSection = createMockPage({ hasAddBlock: true, flatControlInsideDrawer: false, previewHasMedia: true });
+  await openPopupSettings(listSection.page, 'item_block_section#4', { allowFlatForm: true });
+  assert.deepEqual(listSection.getState(), { expanded: true, popupSettingClicks: 1, addBlockVisible: true });
+
+  // Case 2 (1.0.31): Flat section inside drawer without Add block expands once and stays open without toggling shut.
+  const flatSection = createMockPage({ hasAddBlock: false, flatControlInsideDrawer: true, previewHasMedia: true });
+  await openPopupSettings(flatSection.page, 'item_block_section#2', { allowFlatForm: true });
+  assert.deepEqual(flatSection.getState(), { expanded: true, popupSettingClicks: 1, addBlockVisible: false });
+});
+
+test('cleanupExpiredPopupsInDrawer deletes expired non-protected items from highest index down', async () => {
+  const { todayInTimezone } = require('../src/cms/popup-verification');
+  const tz = { iana: 'America/New_York' };
+  const today = todayInTimezone(tz.iana);
+  const [y, m, d] = today.split('-').map(Number);
+  const isoDayOffset = (days) => new Date(Date.UTC(y, m - 1, d + days)).toISOString().slice(0, 10);
+
+  let items = [
+    { image: 'https://cdn.example/1-indefinite.webp', time_start: '', time_end: '' },
+    { image: 'https://cdn.example/2-expired.webp', time_start: '', time_end: isoDayOffset(-2) },
+    { image: 'https://cdn.example/3-protected-old.webp', time_start: '', time_end: isoDayOffset(-1) },
+    { image: 'https://cdn.example/4-active.webp', time_start: '', time_end: isoDayOffset(5) },
+    { image: 'https://cdn.example/5-expired.webp', time_start: '', time_end: isoDayOffset(-5) }
+  ];
+  const deletedOrder = [];
+
+  let pendingDeleteIdx = -1;
+  const makeMenuBtn = (idx, image) => ({
+    isVisible: async () => true,
+    click: async () => { pendingDeleteIdx = idx; deletedOrder.push(image); }
+  });
+  const makeCard = (item, idx) => ({
+    count: async () => 1,
+    elementHandle: async () => item,
+    evaluate: async () => {},
+    innerText: async () => item.image,
+    isVisible: async () => true,
+    locator: (sel) => {
+      if (sel === 'img') {
+        return {
+          evaluateAll: async () => [item.image],
+          count: async () => 1
+        };
+      }
+      return {
+        count: async () => 1,
+        nth: () => makeMenuBtn(idx, item.image),
+        first: () => makeMenuBtn(idx, item.image),
+        last: () => makeMenuBtn(idx, item.image)
+      };
+    }
+  });
+  const makeDragButton = (idx) => ({
+    count: async () => 1,
+    isVisible: async () => true,
+    locator: (sel) => {
+      if (String(sel).includes('cursor-pointer')) return makeCard(items[idx], idx);
+      return { count: async () => 0 };
+    }
+  });
+
+  const makeMockPage = () => ({
+    viewportSize: () => ({ width: 1440, height: 900 }),
+    setViewportSize: async () => {},
+    bringToFront: async () => {},
+    waitForTimeout: async () => {},
+    evaluate: async (fn, arg) => (Array.isArray(arg) ? arg[0] === arg[1] : true),
+    keyboard: {
+      press: async (key) => {
+        if (key === 'Escape') {
+          throw new Error('deletePopupItemAtIndex must not press Escape while slideover [role="dialog"] is open');
+        }
+      }
+    },
+    getByRole: (role, opts = {}) => {
+      if (role === 'menu') {
+        return {
+          first: () => ({
+            isVisible: async () => true,
+            getByRole: () => ({
+              first: () => ({ isVisible: async () => true, click: async () => {} }),
+              count: async () => 1,
+              nth: () => ({ isVisible: async () => true, click: async () => {} })
+            }),
+            locator: () => ({ count: async () => 0 })
+          }),
+          isVisible: async () => true,
+          count: async () => 1
+        };
+      }
+      if (role === 'button' && /Confirm|Delete/i.test(String(opts.name || ''))) {
+        return {
+          first: () => ({
+            isVisible: async () => true,
+            click: async () => {
+              if (pendingDeleteIdx >= 0 && pendingDeleteIdx < items.length) {
+                items.splice(pendingDeleteIdx, 1);
+                pendingDeleteIdx = -1;
+              }
+            }
+          }),
+          count: async () => 1,
+          nth: () => ({
+            isVisible: async () => true,
+            click: async () => {
+              if (pendingDeleteIdx >= 0 && pendingDeleteIdx < items.length) {
+                items.splice(pendingDeleteIdx, 1);
+                pendingDeleteIdx = -1;
+              }
+            }
+          })
+        };
+      }
+      return { first: () => ({ isVisible: async () => false }), count: async () => 0 };
+    },
+    locator: (sel) => {
+      const s = String(sel || '');
+      if (s.includes('check-all-list_items-')) {
+        const snapshot = `check-all-list_items-${JSON.stringify(items)}`;
+        const cbItem = {
+          getAttribute: async () => snapshot,
+          locator: () => ({ count: async () => 0 }),
+          evaluate: async () => items.map((it) => it.image)
+        };
+        return {
+          count: async () => 1,
+          nth: () => cbItem,
+          first: () => cbItem,
+          last: () => cbItem
+        };
+      }
+      if (s.includes('button-drag')) {
+        return {
+          count: async () => items.length,
+          nth: (i) => makeDragButton(i),
+          first: () => ({ isVisible: async () => items.length > 0 })
+        };
+      }
+      if (s.includes('Add block')) {
+        const addBtn = { isVisible: async () => true, locator: () => ({ count: async () => 0 }) };
+        return { first: () => addBtn, last: () => addBtn, count: async () => 1 };
+      }
+      if (s.includes('list_items') || s.includes('overflow-y-auto')) {
+        const drawerMock = {
+          evaluate: async () => false,
+          isVisible: async () => true,
+          count: async () => 1,
+          locator: (innerSel) => {
+            const inner = String(innerSel || '');
+            if (inner.includes('check-all-list_items-')) {
+              const snapshot = `check-all-list_items-${JSON.stringify(items)}`;
+              const cbItem = { getAttribute: async () => snapshot, locator: () => ({ count: async () => 0 }) };
+              return {
+                count: async () => 1,
+                nth: () => cbItem,
+                first: () => cbItem,
+                last: () => cbItem
+              };
+            }
+            if (inner.includes('button-drag')) {
+              return { count: async () => items.length, nth: (i) => makeDragButton(i) };
+            }
+            return { count: async () => 0 };
+          }
+        };
+        return {
+          count: async () => 1,
+          nth: () => drawerMock,
+          filter: () => ({
+            count: async () => 1,
+            nth: () => drawerMock
+          }),
+          first: () => drawerMock
+        };
+      }
+      if (s.includes('.el-overlay') || s.includes('[role="dialog"]')) {
+        // Simulate HeadlessUI/NuxtUI slideover drawer rendered inside `[role="dialog"]`.
+        return { count: async () => 1, filter: () => ({ first: () => ({ isVisible: async () => false }) }), first: () => ({ isVisible: async () => true }) };
+      }
+      if (s.includes('.el-message-box__wrapper')) {
+        return { filter: () => ({ first: () => ({ isVisible: async () => false }) }), count: async () => 0 };
+      }
+      return { count: async () => 0, filter: () => ({ first: () => ({ isVisible: async () => false }) }), first: () => ({ isVisible: async () => false }) };
+    }
+  });
+
+  // Note: mock deletePopupItemAtIndex uses direct items splice via menu/confirm; test DOM resolution with stable list cards:
+  const events = [];
+  const res = await cleanupExpiredPopupsInDrawer(makeMockPage(), tz, {
+    protectedUrls: new Set(['https://cdn.example/3-protected-old.webp']),
+    progress: (stage, message) => events.push({ stage, message })
+  });
+  assert.deepEqual(res.warnings, []);
+  assert.equal(res.removedCount, 2);
+  assert.deepEqual(deletedOrder, [
+    'https://cdn.example/5-expired.webp',
+    'https://cdn.example/2-expired.webp'
+  ]);
+  assert.deepEqual(items.map((x) => x.image), [
+    'https://cdn.example/1-indefinite.webp',
+    'https://cdn.example/3-protected-old.webp',
+    'https://cdn.example/4-active.webp'
+  ]);
+  assert.equal(events.filter((e) => e.stage === 'popup-expired-cleanup').length, 2);
 });
 
 

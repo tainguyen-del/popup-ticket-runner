@@ -134,6 +134,15 @@ function allAttachmentsDownloadButton(root) {
 }
 
 async function revealTicketAttachmentArea(page, root) {
+  // First touch the top of the panel so top attachments stay decoded, then
+  // reveal Conversations and scroll down so comment attachments load as well.
+  await root.evaluate((panel) => {
+    const nodes = [panel, ...panel.querySelectorAll('*')];
+    for (const node of nodes) {
+      if (node.scrollHeight > node.clientHeight + 8) node.scrollTop = 0;
+    }
+  }).catch(() => {});
+  await page.waitForTimeout(80);
   await root.evaluate((panel) => {
     const nodes = [panel, ...panel.querySelectorAll('*')];
     for (const node of nodes) {
@@ -155,7 +164,7 @@ async function revealTicketAttachmentArea(page, root) {
       }).catch(() => false);
     });
     if (opened) await conversation.evaluate((button) => button.setAttribute('data-popup-ticket-runner-revealed', 'true')).catch(() => {});
-    await page.waitForTimeout(300);
+    await page.waitForTimeout(350);
   }
   await root.evaluate((panel) => {
     const nodes = [panel, ...panel.querySelectorAll('*')];
@@ -163,7 +172,7 @@ async function revealTicketAttachmentArea(page, root) {
       if (node.scrollHeight > node.clientHeight + 8) node.scrollTop = node.scrollHeight;
     }
   }).catch(() => {});
-  await page.waitForTimeout(100);
+  await page.waitForTimeout(120);
 }
 
 async function visibleTicketAttachmentItems(root) {
@@ -387,16 +396,29 @@ async function readFullTicketContext(page, ticketUrl) {
   let items = await visibleTicketImageCandidates(root);
   let previousCount = items.length;
   let stablePolls = 0;
-  // In background tabs or throttled windows, comments and attachments take time to render
-  for (let poll = 0; poll < 15; poll += 1) {
+  // In background tabs or SPA transitions, top upload cards and comment
+  // attachments often arrive over 1-3 seconds. Wait for Ant Design spinners
+  // and require stability across multiple polls before freezing candidates.
+  for (let poll = 0; poll < 22; poll += 1) {
     await page.waitForTimeout(300);
+    if (poll === 4 && items.length === 0) {
+      await revealTicketAttachmentArea(page, root);
+    }
+    const spinning = await root.locator('.ant-spin-spinning').count().catch(() => 0);
     items = await visibleTicketImageCandidates(root);
-    if (items.length > 0 && items.length === previousCount) {
+    if (!spinning && items.length > 0 && items.length === previousCount) {
       stablePolls += 1;
-      // Require at least 4 stable polls (~1200ms) AND at least poll >= 4 (~1500ms total) before breaking
-      if (stablePolls >= 4 && poll >= 4) {
+      if (stablePolls >= 5 && poll >= 6) {
         break;
       }
+    } else if (!spinning && items.length === 0 && poll >= 11) {
+      // Allow pure text/removal tickets (no attachments) to continue without
+      // waiting out the full 6.6s cap once the panel has settled.
+      const bodySnapshot = await root.innerText({ timeout: 3000 }).catch(() => '');
+      if (!/\b(?:dinh\s*kem|attach(?:ment|ed)|coupon|poster)\b/i.test(bodySnapshot)) {
+        break;
+      }
+      stablePolls = 0;
     } else {
       stablePolls = 0;
     }

@@ -2,6 +2,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const {
   stableImageUrl,
+  isExpiredPopupItem,
   popupDateFromCmsValue,
   popupItemScheduleMatches,
   resolvePopupItemByImageAndSchedule,
@@ -244,4 +245,28 @@ test('verifyPersistedPopupItem refuses stale pre-replacement image URL until Vue
   });
   assert.equal(updated.ok, true);
   assert.equal(updated.item.image, newUrl);
+});
+
+test('isExpiredPopupItem detects strictly past end dates while preserving active and indefinite items', () => {
+  const today = '2026-11-27';
+  assert.deepEqual(
+    isExpiredPopupItem({ image: '', time_start: '', time_end: '2026-11-20' }, timezone, today),
+    { expired: false, endDate: null, today: null }
+  );
+  assert.deepEqual(
+    isExpiredPopupItem({ image: 'https://cdn.example/indefinite.webp', time_start: '', time_end: '' }, timezone, today),
+    { expired: false, endDate: null, today: null }
+  );
+  assert.deepEqual(
+    isExpiredPopupItem({ image: 'https://cdn.example/today.webp', time_start: '', time_end: '2026-11-27 23:59' }, timezone, today),
+    { expired: false, endDate: '2026-11-27', today }
+  );
+  assert.deepEqual(
+    isExpiredPopupItem({ image: 'https://cdn.example/future.webp', time_start: '', time_end: '2026-11-30' }, timezone, today),
+    { expired: false, endDate: '2026-11-30', today }
+  );
+  assert.deepEqual(
+    isExpiredPopupItem({ image: 'https://cdn.example/expired.webp', time_start: '', time_end: '2026-11-26' }, timezone, today),
+    { expired: true, endDate: '2026-11-26', today }
+  );
 });

@@ -198,6 +198,7 @@ function safePlan(plan) {
       ticketMergedWithLegacy: Boolean(plan.popup.ticketMergedWithLegacy),
       repaired: Boolean(plan.popup.repaired),
       removedEmptyItems: Number(plan.popup.removedEmptyItems) || 0,
+      removedExpiredItems: Number(plan.popup.removedExpiredItems) || 0,
       clearedStart: Boolean(plan.popup.clearedStart),
       deduplicated: Boolean(plan.popup.deduplicated),
       deduplicationMethod: plan.popup.deduplicationMethod || null,
@@ -275,7 +276,7 @@ function processOutputLine(job, line) {
   }
 }
 
-function launchJob(ticketUrl, applyChanges = false, expiryOverride = null, buildRequested = false, downloadPoster = false) {
+function launchJob(ticketUrl, applyChanges = false, expiryOverride = null, buildRequested = false, downloadPoster = false, cleanupExpired = true) {
   const job = {
     id: crypto.randomUUID(),
     state: 'running',
@@ -297,6 +298,7 @@ function launchJob(ticketUrl, applyChanges = false, expiryOverride = null, build
   if (applyChanges) args.push('--apply');
   if (downloadPoster) args.push('--download-poster');
   if (buildRequested) args.push('--build');
+  if (cleanupExpired === false) args.push('--no-cleanup-expired');
   if (expiryOverride) args.push('--expiry', expiryOverride);
   const runnerCwd = appDataDirectory(ROOT);
   fs.mkdirSync(runnerCwd, { recursive: true });
@@ -488,10 +490,11 @@ const server = http.createServer(async (request, response) => {
       if (payload.apply !== undefined && typeof payload.apply !== 'boolean') return json(response, 400, { error: 'Chế độ thay đổi CMS không hợp lệ.' });
       if (payload.build !== undefined && typeof payload.build !== 'boolean') return json(response, 400, { error: 'Chế độ Build không hợp lệ.' });
       if (payload.downloadPoster !== undefined && typeof payload.downloadPoster !== 'boolean') return json(response, 400, { error: 'Chế độ tải poster không hợp lệ.' });
+      if (payload.cleanupExpired !== undefined && typeof payload.cleanupExpired !== 'boolean') return json(response, 400, { error: 'Chế độ xóa popup hết hạn không hợp lệ.' });
       if (payload.build === true && payload.apply !== true) return json(response, 400, { error: 'Build chỉ được chạy cùng chế độ thay đổi CMS.' });
       const expiry = validExpiry(payload.expiry);
       if (!expiry.valid) return json(response, 400, { error: 'Ngày hết hạn cần có dạng YYYY-MM-DD.' });
-      const job = launchJob(ticketUrl, payload.apply === true, expiry.value, payload.build === true, payload.downloadPoster === true);
+      const job = launchJob(ticketUrl, payload.apply === true, expiry.value, payload.build === true, payload.downloadPoster === true, payload.cleanupExpired !== false);
       return json(response, 202, { id: job.id });
     } catch {
       return json(response, 400, { error: 'Dữ liệu gửi lên không hợp lệ.' });

@@ -282,7 +282,8 @@ test('requires the all/every quantifier to target popups in the same removal ins
   assert.equal(parsed('ID#3317 - Support\nPlease remove every existing popup.', 1591107).popupAction, 'remove-all');
   assert.equal(parsed('ID#3317 - Support\nDo not remove all popups; remove only the attached popup.', 1591107).popupAction, 'remove-one');
   assert.equal(parsed('ID#3317 - Support\nRemove attached popup but keep all remaining popups unchanged.', 1591107).popupAction, 'remove-one');
-  assert.equal(parsed('ID#3317 - Support\nRemove every expired popup but keep active popups.', 1591107).popupAction, 'remove-one');
+  assert.equal(parsed('ID#3317 - Support\nRemove every expired popup but keep active popups.', 1591107).popupAction, 'remove-expired');
+  assert.equal(parsed('ID#3317 - Support\nRemove all expired popups; keep current promos.', 1591107).popupAction, 'remove-expired');
   assert.equal(parsed('ID#3317 - Support\nNever remove all popups; remove only attached popup.', 1591107).popupAction, 'remove-one');
   assert.equal(parsed('ID#3317 - Support\nYou must not remove all popups; remove this one only.', 1591107).popupAction, 'remove-one');
   assert.equal(parsed('ID#3317 - Support\nĐừng xóa toàn bộ popup, chỉ xóa popup trong ảnh.', 1591107).popupAction, 'remove-one');
@@ -1191,4 +1192,101 @@ test('extractPopupDuration avoids street addresses, decades, and bare slider ind
   assert.equal(newPopupWithDuration.popupAction, 'create');
   assert.equal(newPopupWithDuration.popupDuration.requestedSeconds, 10);
   assert.equal(newPopupWithDuration.popupDuration.delaySliderSeconds, 13);
+});
+
+test('supports 2 coupon pop up without misreading keep-existing counts and parses keep/order/size directives (tickets 1609697 & 1607802)', () => {
+  const {
+    hasMultiPosterIntent,
+    hasAffirmativePopupReplace,
+    keepsExistingPopups,
+    extractPopupOrderSequence,
+    requestedAspectRatio,
+    hasSizeOrReuploadInstruction
+  } = require('../src/ticket-parser');
+
+  // Ticket 1609697: "2 coupon pop up đính kèm" MUST count as multi-poster
+  const t1609697 = 'ID#17333 - Update website\nNhờ team update 2 coupon pop up đính kèm, vẫn giữu nguyên coupon đang pop up\nThứ tự: Giftcard - Weekly Appreciation - Weekly Special';
+  assert.equal(hasMultiPosterIntent(t1609697), true);
+  assert.equal(keepsExistingPopups(t1609697), true);
+  assert.deepEqual(extractPopupOrderSequence(t1609697), ['Giftcard', 'Weekly Appreciation', 'Weekly Special']);
+
+  // Ticket 1607802: "vẫn giữ 2 coupon pop hiện có" keeps 2 OLD popups; only 1 NEW poster is requested
+  const t1607802 = 'ID#18757 - Update coupon pop up\nNhờ team update coupon pop up, đính kèm tuy nhiên vẫn giữ 2 coupon pop hiện có\nTheo thứ tự coupon: Giftcard - Weekly Appreciation - Weekly Special\nNhờ team up lại ảnh này, vì đúng size 1x1';
+  assert.equal(hasMultiPosterIntent(t1607802), false);
+  assert.equal(keepsExistingPopups(t1607802), true);
+  assert.equal(hasAffirmativePopupReplace(t1607802), true);
+  assert.equal(hasSizeOrReuploadInstruction(t1607802), true);
+  assert.deepEqual(requestedAspectRatio(t1607802), { label: '1:1', ratio: 1 });
+  assert.deepEqual(extractPopupOrderSequence(t1607802), ['Giftcard', 'Weekly Appreciation', 'Weekly Special']);
+
+  assert.equal(keepsExistingPopups('Không giữ popup cũ nữa'), false);
+});
+
+test('scopes multi-round CRM conversations to uncompleted active request and ignores Facebook removals and update-content phrases (tickets 1609899 & 9343)', () => {
+  const {
+    hasAffirmativePopupRemoval,
+    hasAffirmativePopupReplace,
+    hasAffirmativeExpiredRemoval,
+    explicitRemoveAllRequested
+  } = require('../src/ticket-parser');
+
+  // Ticket 1609899: Old completed round removed "20% gift card" + old FB post removal; new active comment creates a popup.
+  const t1609899 = [
+    'ID#4832 - Take care - Hỗ trợ vấn đề website',
+    'Khách cần hỗ trợ gỡ poster đăng trên facebook ở ticket https://crm.fastboy.dev/tickets/detail/1609332',
+    'Sau đó sẽ điều chỉnh lại nội dung theo nội dung sms',
+    'Conversations',
+    'Reload',
+    'Hau Do - AE 02',
+    '(assign)',
+    'hau_do@fastboy.net',
+    'Nov 27, 2026 11:17 PM',
+    'Hi team,',
+    'Nhờ team hỗ trợ popup poster lên website giúp khách nha',
+    'EXP: 11/27/2026',
+    'Thank team',
+    'Tai Nguyen (TE)',
+    'tai_nguyen@fastboy.net',
+    'Nov 27, 2026 11:15 PM',
+    'Hi team,',
+    'Đã update theo yêu cầu',
+    'Thanks',
+    'Hau Do - AE 02',
+    '(assign)',
+    'hau_do@fastboy.net',
+    'Nov 27, 2026 10:55 PM',
+    'Nhờ team hỗ trợ remove poster 20% gift card nha',
+    'SM Leader - Huỳnh Hào',
+    '(assign)',
+    'hao_huynh@fastboy.net',
+    'Nov 26, 2026 7:06 AM',
+    'Xoá bài trên FB -Done',
+    'Fastboy CRM @ 2026 Created by Fastboy'
+  ].join('\n');
+
+  const parsed1609899 = parsed(t1609899, 1609899);
+  assert.equal(parsed1609899.siteId, '4832');
+  assert.equal(parsed1609899.popupAction, 'create');
+  assert.equal(parsed1609899.hasInlineRemovalRequest, false);
+  assert.equal(parsed1609899.expiryDate, '2026-11-27');
+
+  // Non-website social removal alone must never be treated as removing a CMS website popup.
+  assert.equal(hasAffirmativePopupRemoval('Khách cần hỗ trợ gỡ poster đăng trên facebook'), false);
+  assert.equal(hasAffirmativePopupRemoval('Xoá bài trên FB -Done'), false);
+
+  // "update lại content" in a ticket mentioning popup must never trigger popup replacement (ID#9343).
+  assert.equal(hasAffirmativePopupReplace('Nhờ team popup poster.\nAE update lại content'), false);
+  const parsed9343 = parsed('ID#9343 - Design poster\nNhờ team popup poster.\nEXP: 01/01/2027\nAE update lại content', 9343);
+  assert.equal(parsed9343.popupAction, 'create');
+
+  // Expired popup removal requests map strictly to 'remove-expired' (never 'remove-all' or 'remove-one').
+  assert.equal(hasAffirmativeExpiredRemoval('Nhờ team xóa các popup đã hết hạn giúp khách'), true);
+  assert.equal(hasAffirmativeExpiredRemoval('Xóa toàn bộ popup đã hết hạn trên CMS'), true);
+  assert.equal(explicitRemoveAllRequested('Xóa toàn bộ popup đã hết hạn trên CMS'), false);
+  assert.equal(hasAffirmativePopupRemoval('Xóa các popup đã hết hạn giúp tiệm'), false);
+  assert.equal(hasAffirmativeExpiredRemoval('Không xóa popup hết hạn'), false);
+
+  const expiredTicket = parsed('ID#4832 - Update website\nNhờ team xóa các popup đã hết hạn giúp website', 1609900);
+  assert.equal(expiredTicket.popupAction, 'remove-expired');
+  assert.equal(popupActionNeedsTicketImage(expiredTicket.popupAction, 0), false);
 });

@@ -12,6 +12,7 @@ const {
 const { popupImageIdentity } = require('./popup-image-policy');
 const {
   stableImageUrl,
+  todayInTimezone,
   verifyPersistedPopupItem,
   popupItemsForReport,
   popupDateFromCmsValue
@@ -29,14 +30,6 @@ function expiryAriaLabel(expiry) {
   return new Intl.DateTimeFormat('en-US', {
     weekday: 'long', month: 'short', day: 'numeric', year: 'numeric', timeZone: 'UTC'
   }).format(new Date(`${expiry}T12:00:00.000Z`));
-}
-
-function todayInTimezone(iana) {
-  const parts = new Intl.DateTimeFormat('en-CA', {
-    timeZone: iana, year: 'numeric', month: '2-digit', day: '2-digit'
-  }).formatToParts(new Date());
-  const value = Object.fromEntries(parts.filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]));
-  return `${value.year}-${value.month}-${value.day}`;
 }
 
 function calendarMonthStart(heading) {
@@ -433,6 +426,16 @@ async function hasElement(locator) {
 async function isPopupListItemsViewOpen(page) {
   const addBlock = safeFirst(page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")'));
   return isElementDisplayed(addBlock);
+}
+
+async function isFlatPopupFormOpen(page) {
+  if (await isPopupListItemsViewOpen(page)) return false;
+  const drawer = await getActivePopupDrawer(page);
+  if (!drawer) return false;
+  const controls = drawer.locator(
+    'input[name^="check-all-"], input[type="file"], img[src*="gocheckin.net"], img[src*="nz-website-media"]'
+  );
+  return isElementDisplayed(safeFirst(controls));
 }
 
 async function getActivePopupDrawer(page) {
@@ -1040,6 +1043,90 @@ async function readPopupListItems(page, expectedCount = null) {
     error.stage = 'popup-replacement-ambiguous';
     throw error;
   }
+}
+
+async function readLegacyFlatPopupItems(page, sectionDefaults = {}) {
+  const drawer = await getActivePopupDrawer(page).catch(() => null);
+  const scope = drawer || page.locator('body');
+
+  // Wait briefly for drawer fields or preview images to finish hydrating
+  for (let attempt = 0; attempt < 6; attempt += 1) {
+    const probe = await scope.evaluate((root) => {
+      if (!root) return { ready: false, serializedItems: null, flatItems: [] };
+      const allCheckAll = Array.from(root.querySelectorAll('input[name^="check-all-"]'));
+      for (const el of allCheckAll) {
+        const name = el.getAttribute('name') || '';
+        const prefixMatch = /^check-all-[^-]+-(.*)$/.exec(name);
+        if (prefixMatch && prefixMatch[1]) {
+          try {
+            const parsed = JSON.parse(prefixMatch[1]);
+            if (Array.isArray(parsed) && parsed.length > 0) {
+              return { ready: true, serializedItems: parsed, flatItems: [] };
+            }
+          } catch {}
+        }
+      }
+
+      const isImageUrl = (raw) => /^(?:https?:\/\/|data:image\/)/i.test(String(raw || '').trim());
+      const seenImages = new Set();
+      const imageUrls = [];
+
+      // Inspect flat input fields carrying image URLs (legacy 1.0.31 single-item schema)
+      for (const input of root.querySelectorAll('input, textarea')) {
+        const key = `${input.getAttribute('name') || ''} ${input.getAttribute('id') || ''}`.toLowerCase();
+        const val = String(input.value || '').trim();
+        if (!val) continue;
+        if ((key.includes('image') || key.includes('banner') || key.includes('poster') || isImageUrl(val))
+          && /\.(?:png|jpe?g|webp|gif)(?:$|[?#])|gocheckin\.net|nz-website-media/i.test(val)
+          && !seenImages.has(val)) {
+          seenImages.add(val);
+          imageUrls.push(val);
+        }
+      }
+
+      // Inspect visible preview thumbnails inside the popup drawer
+      for (const img of root.querySelectorAll('img')) {
+        const src = String(img.currentSrc || img.getAttribute('src') || '').trim();
+        if (!isImageUrl(src) || seenImages.has(src)) continue;
+        const lower = src.toLowerCase();
+        if (/\/(?:icons?|avatars?|flags?|logo)\b|\.svg(?:$|[?#])/i.test(lower)) continue;
+        const style = window.getComputedStyle(img);
+        if (style.display === 'none' || style.visibility === 'hidden') continue;
+        const rect = img.getBoundingClientRect();
+        if (rect.width <= 0 || rect.height <= 0) continue;
+        if (/gocheckin\.net|nz-website-media|cloudflare|r2\.dev|storage|\/page\//i.test(lower) || (rect.width >= 36 && rect.height >= 36)) {
+          seenImages.add(src);
+          imageUrls.push(src);
+        }
+      }
+
+      if (imageUrls.length > 0) {
+        const linkInput = Array.from(root.querySelectorAll('input')).find((input) => {
+          const k = `${input.getAttribute('name') || ''} ${input.getAttribute('id') || ''}`.toLowerCase();
+          return (k === 'link' || k.endsWith('[link]') || k.includes('link')) && !k.includes('list_items');
+        });
+        const link = linkInput?.value ? String(linkInput.value).trim() : '';
+        return {
+          ready: true,
+          serializedItems: null,
+          flatItems: imageUrls.map((image) => ({ image, link, time_start: '', time_end: '' }))
+        };
+      }
+      return { ready: false, serializedItems: null, flatItems: [] };
+    }).catch(() => ({ ready: false, serializedItems: null, flatItems: [] }));
+
+    const found = probe.serializedItems || probe.flatItems;
+    if (Array.isArray(found) && found.length > 0) {
+      return found.map((item) => ({
+        ...item,
+        time_start: item?.time_start || sectionDefaults?.time_start || '',
+        time_end: item?.time_end || sectionDefaults?.time_end || ''
+      }));
+    }
+    if (probe.ready) break;
+    await pageDelay(page, 250);
+  }
+  return [];
 }
 
 async function waitForPopupListItemCount(page, expected, timeout = 5000) {
@@ -1784,19 +1871,24 @@ async function deletePopupItemAtIndex(page, targetIndex, expectedRemaining, desc
     true,
     2500
   ).catch(() => null) || await waitForVisibleMatch(
-    page.locator('button:has-text("Confirm"), button:has-text("Delete"), button:has-text("Yes"), button:has-text("OK")'),
+    page.locator('button:text-is("Confirm"), button:text-is("Delete"), button:text-is("Yes"), button:text-is("OK")'),
     `${description} delete confirmation`,
     true,
     1500
   ).catch(() => null);
   if (confirm) await confirm.click({ force: true }).catch(() => {});
-  // Only press Escape if a modal overlay is still open; never press Escape unconditionally
-  // as it closes the slideover drawer / settings panel in NewZen CMS.
-  const modalStillOpen = await page.locator('.el-overlay:visible, .ant-modal-root:visible, [role="dialog"]:visible').count().catch(() => 0);
-  if (modalStillOpen > 0) {
+  await waitForPopupListItemCount(page, expectedRemaining);
+  // Never press Escape just because `[role="dialog"]` is visible: Nuxt UI / HeadlessUI
+  // renders the entire Announcement slideover drawer itself inside `[role="dialog"]`,
+  // so pressing Escape closes the settings panel and hides `list_items`.
+  const confirmModalStillOpen = await page.locator('.el-message-box__wrapper, .ant-modal-confirm, [role="alertdialog"]')
+    .filter({ hasText: /Are\s+you\s+sure|Confirm|Delete\s+\d+\s+item/i })
+    .first()
+    .isVisible()
+    .catch(() => false);
+  if (confirmModalStillOpen) {
     await page.keyboard.press('Escape').catch(() => {});
   }
-  await waitForPopupListItemCount(page, expectedRemaining);
   await page.waitForTimeout(300);
 }
 
@@ -2001,11 +2093,13 @@ module.exports = {
   isPopupItemEditorOpen,
   popupListItemEditorIsOpen,
   isPopupListItemsViewOpen,
+  isFlatPopupFormOpen,
   popupListItemsPanel,
   waitForPopupListItemsPanel,
   popupListItemCards,
   openPopupListCard,
   readPopupListItems,
+  readLegacyFlatPopupItems,
   waitForPopupListItemCount,
   isEmptyPopupItem,
   planPopupItemTarget,

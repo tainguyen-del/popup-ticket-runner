@@ -10,7 +10,8 @@ const {
   resolveTicketVision,
   resolveTicketPopupVisionSet,
   resolveTicketPopupRemovalVision,
-  resolveVisualDuplicateConfirmation
+  resolveVisualDuplicateConfirmation,
+  resolvePopupOrderVision
 } = require('./semantic-ticket');
 const {
   foldTicketText,
@@ -18,10 +19,15 @@ const {
   findTicketDate,
   endOfMonthExpiryFromTicket,
   ticketData,
+  activeTicketRequestText,
+  hasAffirmativePopupRemoval,
   hasAffirmativePopupUpdate,
   isPopupRemovalAction,
   popupActionNeedsTicketImage,
   hasMultiPosterIntent,
+  keepsExistingPopups,
+  extractPopupOrderSequence,
+  hasSizeOrReuploadInstruction,
   resolveRemovalScopeFromAttachments,
   popupScheduleFromTicket
 } = require('./ticket-parser');
@@ -64,6 +70,8 @@ const {
 } = require('./cms/plugin-policy');
 const {
   stableImageUrl,
+  todayInTimezone,
+  isExpiredPopupItem,
   popupDateFromCmsValue,
   popupItemScheduleMatches,
   resolvePopupItemByImageAndSchedule,
@@ -88,7 +96,6 @@ const {
 const {
   setProgressHandler: setPopupProgressHandler,
   expiryAriaLabel,
-  todayInTimezone,
   calendarMonthStart,
   popupInputValues,
   trySetPopupDateInput,
@@ -113,6 +120,7 @@ const {
   popupListItemCards,
   openPopupListCard,
   readPopupListItems,
+  readLegacyFlatPopupItems,
   waitForPopupListItemCount,
   isEmptyPopupItem,
   planPopupItemTarget,
@@ -121,6 +129,7 @@ const {
   resolveAddedPopupItemTarget,
   openPopupListItem,
   openConfiguredPopupListItem,
+  isFlatPopupFormOpen,
   popupImageUploadControl,
   popupImageUrls,
   waitForPopupImageUpload,
@@ -1091,56 +1100,76 @@ async function openPopupSection(page, sectionId = null, { openTimeoutMs = 15000 
   throw new Error('Popup section editor did not open after the section was added.');
 }
 
+async function isPopupSettingAccordionExpanded(popupSetting) {
+  return popupSetting.evaluate((el) => {
+    const item = el.closest('.el-collapse-item') || el.closest('[role="tab"]') || el.parentElement;
+    if (item && (item.classList.contains('is-active') || item.classList.contains('active'))) return true;
+    if (el.getAttribute('aria-expanded') === 'true' || el.closest('[aria-expanded="true"]')) return true;
+    return false;
+  }).catch(() => false);
+}
+
 async function openPopupSettings(page, sectionId = null, options = {}) {
+  const { allowFlatForm = false } = options || {};
   await openPopupSection(page, sectionId, options);
-  const isAddBlockVisible = async () => {
-    return isElementDisplayed(page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")').first());
-  };
+  const addBlockLocator = page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")');
+  const isAddBlockVisible = async () => isElementDisplayed(addBlockLocator.first());
+  // Only short-circuit before touching Popup_setting when Add block itself is visible;
+  // page-wide media selectors match the live preview canvas while Popup_setting is collapsed.
   if (await isAddBlockVisible()) return;
 
   const popupSetting = await visibleMatch(page.getByText('Popup_setting', { exact: true }), null)
     || await visibleMatch(page.getByText(/Popup[\s_]setting/i), null);
 
   if (!popupSetting) {
-    if (await isAddBlockVisible()) return;
     return;
   }
 
-  // Check if the accordion item is already expanded/active before clicking
-  const isExpanded = await popupSetting.evaluate((el) => {
-    const item = el.closest('.el-collapse-item') || el.closest('[role="tab"]') || el.parentElement;
-    if (item && (item.classList.contains('is-active') || item.classList.contains('active'))) return true;
-    if (el.getAttribute('aria-expanded') === 'true' || el.closest('[aria-expanded="true"]')) return true;
-    return false;
-  }).catch(() => false);
-
+  // Check if the accordion item is already expanded/active before clicking.
+  const isExpanded = await isPopupSettingAccordionExpanded(popupSetting);
   if (!isExpanded) {
     await popupSetting.click();
   }
 
+  const addBlockTimeoutMs = allowFlatForm ? 2500 : 4000;
   const appeared = await waitForVisibleMatch(
     page.getByRole('button', { name: /Add\s*block/i }),
     null,
     true,
-    4000
+    addBlockTimeoutMs
   ).catch(() => null) || await waitForVisibleMatch(
-    page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")'),
+    addBlockLocator,
     null,
     true,
-    4000
+    addBlockTimeoutMs
   ).catch(() => null);
 
-  if (!appeared) {
-    // If clicking closed an already open accordion or if the transition was delayed,
-    // retry clicking Popup_setting once to re-open the panel.
+  if (appeared || await isAddBlockVisible()) return;
+  if (allowFlatForm && await isFlatPopupFormOpen(page)) return;
+
+  // Retry clicking only if the accordion is still collapsed so an already-expanded
+  // flat section (1.0.31) is never accidentally toggled shut.
+  const expandedAfterWait = await isPopupSettingAccordionExpanded(popupSetting);
+  if (!expandedAfterWait) {
     await popupSetting.click().catch(() => {});
-    await waitForVisibleMatch(
-      page.locator('button:has-text("Add block"), [role="button"]:has-text("Add block")'),
-      'Popup Add block control',
-      true,
-      8000
-    );
   }
+
+  if (allowFlatForm) {
+    await waitForVisibleMatch(
+      addBlockLocator,
+      null,
+      true,
+      2500
+    ).catch(() => null);
+    return;
+  }
+
+  await waitForVisibleMatch(
+    addBlockLocator,
+    'Popup Add block control',
+    true,
+    8000
+  );
 }
 
 async function waitForSaveEnabled(page) {
@@ -1219,7 +1248,10 @@ async function snapshotActiveLegacyPopups(page, baseUrl, timezone, runDir, { pre
     }
     sectionIds.push(sectionId);
     try {
-      await openPopupSettings(page, sectionId, isCorrupted ? { openTimeoutMs: 4000 } : undefined);
+      await openPopupSettings(page, sectionId, {
+        ...(isCorrupted ? { openTimeoutMs: 4000 } : {}),
+        allowFlatForm: true
+      });
     } catch (error) {
       if (isCorrupted) {
         warnings.push(`Broken N/A section ${sectionId} could not be opened (${error.message}); queued for replacement.`);
@@ -1260,7 +1292,11 @@ async function snapshotActiveLegacyPopups(page, baseUrl, timezone, runDir, { pre
       };
     }).catch(() => ({ time_start: null, time_end: null }));
 
-    const { items } = await readPopupListItems(page);
+    let { items } = await readPopupListItems(page);
+    if (!items.some((item) => !isEmptyPopupItem(item))) {
+      const flatItems = await readLegacyFlatPopupItems(page, sectionDefaults);
+      if (flatItems.length > 0) items = flatItems;
+    }
     for (const item of items) {
       if (isEmptyPopupItem(item)) continue;
       const rawStart = item?.time_start || sectionDefaults.time_start;
@@ -1575,6 +1611,7 @@ async function dragPopupImageToPosition(page, imageUrl, position) {
   if (!plan.ok) {
     const error = new Error(`Popup image position is ambiguous (${plan.reason}). CMS Build was not started.`);
     error.stage = 'popup-position-verification';
+    error.popupItems = popupItemsForReport(before.items, { iana: 'UTC' });
     throw error;
   }
   if (!plan.needsMove) return false;
@@ -1971,6 +2008,184 @@ async function removePopupForTicket(page, baseUrl, runDir, ticketText, action, r
   };
 }
 
+async function reorderEntriesByCustomOrder(
+  entries,
+  customOrderLabels = [],
+  { orderVisionFn = resolvePopupOrderVision } = {}
+) {
+  const list = Array.isArray(entries) ? entries : [];
+  const labels = Array.isArray(customOrderLabels) ? customOrderLabels.map((l) => String(l || '').trim()).filter(Boolean) : [];
+  if (list.length < 2 || labels.length < 2) {
+    return { entries: list, ordered: false, method: null, rationale: null };
+  }
+
+  const visionEntries = list
+    .map((entry, idx) => visionCandidateFromLocalImage(
+      { path: entry?.imagePath, filename: entry?.filename || (entry?.imagePath ? path.basename(entry.imagePath) : null) },
+      idx + 1,
+      entry?.isTicket === false ? 'existing CMS popup' : 'new ticket poster'
+    ))
+    .filter(Boolean);
+
+  if (visionEntries.length === list.length && typeof orderVisionFn === 'function') {
+    const result = await orderVisionFn(labels, visionEntries).catch(() => ({ orderedIndices: null }));
+    if (Array.isArray(result?.orderedIndices) && result.orderedIndices.length >= 2) {
+      const seen = new Set();
+      const ordered = [];
+      for (const oneBased of result.orderedIndices) {
+        const idx = oneBased - 1;
+        if (idx >= 0 && idx < list.length && !seen.has(idx)) {
+          seen.add(idx);
+          ordered.push(list[idx]);
+        }
+      }
+      for (let idx = 0; idx < list.length; idx += 1) {
+        if (!seen.has(idx)) ordered.push(list[idx]);
+      }
+      return {
+        entries: ordered,
+        ordered: ordered.some((entry, idx) => entry !== list[idx]),
+        method: 'gemini-vision-order',
+        rationale: result.audit?.rationale || null
+      };
+    }
+  }
+
+  return { entries: list, ordered: false, method: null, rationale: null };
+}
+
+async function cleanupExpiredPopupsInDrawer(page, timezone, {
+  protectedUrls = new Set(),
+  progress = () => {}
+} = {}) {
+  const today = todayInTimezone(timezone?.iana || 'America/Los_Angeles');
+  let removedCount = 0;
+  const removedItems = [];
+  const warnings = [];
+  let { items: currentList } = await readPopupListItems(page);
+  for (let idx = currentList.length - 1; idx >= 0; idx -= 1) {
+    const candidate = currentList[idx];
+    const candidateUrl = stableImageUrl(candidate?.image);
+    if (candidateUrl && protectedUrls.has(candidateUrl)) continue;
+    const { expired, endDate } = isExpiredPopupItem(candidate, timezone, today);
+    if (!expired) continue;
+    progress(
+      'popup-expired-cleanup',
+      `Xóa popup đã hết hạn (${endDate} < ${today}) tại vị trí #${idx + 1}`
+    );
+    try {
+      await deletePopupItemAtIndex(
+        page,
+        idx,
+        currentList.length - 1,
+        `Expired popup item (${endDate})`,
+        candidate?.image || null
+      );
+      removedCount += 1;
+      removedItems.push({ index: idx, imageUrl: candidate?.image || null, end: endDate });
+      const updated = await readPopupListItems(page);
+      currentList = updated.items;
+      idx = Math.min(idx, currentList.length);
+    } catch (error) {
+      const warning = `Không thể xóa popup hết hạn #${idx + 1}: ${error.message}`;
+      warnings.push(warning);
+      progress('popup-expired-cleanup-warning', warning);
+    }
+  }
+  return { removedCount, removedItems, today, warnings };
+}
+
+async function removeExpiredPopupsForTicket(page, baseUrl, timezone, runDir, {
+  mustUpgrade = false,
+  sectionVersionInfo = { legacySectionIds: [] },
+  plan = null,
+  progress = () => {}
+} = {}) {
+  if (mustUpgrade) {
+    progress('legacy-popup-snapshot', 'Đang kiểm tra các popup cũ và hạn hiển thị trước khi dọn popup hết hạn');
+    const legacyPopupSnapshot = await snapshotActiveLegacyPopups(page, baseUrl, timezone, runDir, {
+      preserveActive: true
+    });
+    if (!legacyPopupSnapshot.scannedItems.length || legacyPopupSnapshot.expiredCount === 0) {
+      return {
+        scope: 'expired',
+        changed: false,
+        removedCount: 0,
+        sectionCount: legacyPopupSnapshot.sectionIds.length,
+        removedItems: [],
+        warnings: legacyPopupSnapshot.warnings || []
+      };
+    }
+    progress('plugin-apply', 'Cập nhật Announcement plugin lên phiên bản mới nhất');
+    const plugin = await ensureAnnouncementPlugin(page, baseUrl);
+    if (plan) plan.plugin = plugin;
+    progress('section-apply', 'Tạo lại Announcement section mới với các popup còn hạn');
+    const section = await ensurePopupSection(page, baseUrl, {
+      replaceExisting: true,
+      expectedPluginVersion: plugin.version,
+      targetSectionIds: sectionVersionInfo.legacySectionIds
+    });
+    if (plan) plan.popupSection = section;
+    if (legacyPopupSnapshot.items.length > 0) {
+      await configurePopup(page, null, null, timezone, {
+        replaceExisting: false,
+        sectionId: section.sectionId,
+        legacyPopups: legacyPopupSnapshot.items,
+        cleanupExpired: false
+      });
+    } else {
+      try {
+        await openPopupSettings(page, section.sectionId);
+        await deleteOneEmptyPopupItem(page, 0).catch(() => {});
+      } catch {}
+    }
+    return {
+      scope: 'expired',
+      changed: legacyPopupSnapshot.expiredCount > 0,
+      removedCount: legacyPopupSnapshot.expiredCount,
+      sectionCount: 1,
+      sectionId: section.sectionId,
+      removedItems: legacyPopupSnapshot.scannedItems
+        .filter((item) => item?.end?.date && item.end.date < todayInTimezone(timezone?.iana || 'America/Los_Angeles'))
+        .map((item, index) => ({ index, imageUrl: item.sourceImageUrl || null, end: item.end.date })),
+      warnings: legacyPopupSnapshot.warnings || []
+    };
+  }
+
+  await openPageEditor(page, baseUrl);
+  const cards = await popupSectionCards(page);
+  const sectionIds = [];
+  for (const card of cards) {
+    const id = await card.getAttribute('id');
+    if (id) sectionIds.push(id);
+  }
+  let totalRemoved = 0;
+  const allRemovedItems = [];
+  const allWarnings = [];
+  for (let i = 0; i < sectionIds.length; i += 1) {
+    const sectionId = sectionIds[i];
+    await openPopupSettings(page, sectionId);
+    const cleaned = await cleanupExpiredPopupsInDrawer(page, timezone, { progress });
+    totalRemoved += cleaned.removedCount;
+    allRemovedItems.push(...cleaned.removedItems.map((item) => ({ ...item, sectionId })));
+    allWarnings.push(...(cleaned.warnings || []));
+    if (i < sectionIds.length - 1) {
+      await returnToPageEditor(page);
+    }
+  }
+  return {
+    scope: 'expired',
+    changed: totalRemoved > 0,
+    removedCount: totalRemoved,
+    sectionCount: sectionIds.length,
+    sectionId: allRemovedItems[0]?.sectionId || sectionIds[0] || null,
+    itemIndex: allRemovedItems[0]?.index ?? null,
+    imageUrl: allRemovedItems[0]?.imageUrl || null,
+    removedItems: allRemovedItems,
+    warnings: allWarnings
+  };
+}
+
 async function configurePopup(page, imagePath, schedule, timezone, {
   replaceExisting = false,
   sectionId = null,
@@ -1982,7 +2197,10 @@ async function configurePopup(page, imagePath, schedule, timezone, {
   duplicateMatches = [],
   removalMatches = [],
   imageLink = null,
-  popupDuration = null
+  popupDuration = null,
+  customOrderLabels = [],
+  cmsScannedItems = [],
+  cleanupExpired = true
 } = {}) {
   await ensureDesktopViewport(page);
   await openPopupSection(page, sectionId);
@@ -2069,12 +2287,30 @@ async function configurePopup(page, imagePath, schedule, timezone, {
   // Default popup position: ticket poster should ALWAYS be at the first position
   // unless the ticket explicitly requested another position (such as 'last').
   const effectivePosition = popupPosition === 'last' ? 'last' : 'first';
-  const { entries, matchingLegacyIndex, matchingLegacyIndexes } = buildPopupEntriesForTickets(
+  const builtEntries = buildPopupEntriesForTickets(
     normalizedTicketEntries,
     legacyPopups,
     duplicateMatches,
     { replaceExisting, popupPosition: effectivePosition, replacementMatches: removalMatches }
   );
+  let entries = builtEntries.entries;
+  const { matchingLegacyIndex, matchingLegacyIndexes } = builtEntries;
+  let customOrderApplied = false;
+  if (legacyPopups.length > 0 && Array.isArray(customOrderLabels) && customOrderLabels.length >= 2 && entries.length >= 2) {
+    progress('popup-order-vision', `Đang đối chiếu thứ tự popup theo yêu cầu: ${customOrderLabels.join(' - ')}`);
+    const customOrdered = await reorderEntriesByCustomOrder(
+      entries.map((entry) => ({
+        ...entry,
+        filename: entry.filename || (entry.imagePath ? path.basename(entry.imagePath) : null)
+      })),
+      customOrderLabels
+    );
+    entries = customOrdered.entries;
+    customOrderApplied = customOrdered.method === 'gemini-vision-order';
+    if (customOrdered.rationale) {
+      progress('popup-order-matched', customOrdered.rationale);
+    }
+  }
   const emptyItemsBefore = before.items.filter(isEmptyPopupItem);
   const configuredItemsBefore = before.items.filter((item) => !isEmptyPopupItem(item));
   const hasReusablePlaceholder = emptyItemsBefore.length > 0;
@@ -2218,6 +2454,21 @@ async function configurePopup(page, imagePath, schedule, timezone, {
     progress('popup-cleanup-warning', `Không thể tự động xóa block trống: ${err.message}`);
   }
 
+  let expiredCleanup = { removedCount: 0, removedItems: [], today: null };
+  if (cleanupExpired) {
+    const protectedUrls = new Set(
+      Array.from(ticketItems.values())
+        .map((item) => stableImageUrl(item?.imageUrl))
+        .filter(Boolean)
+    );
+    try {
+      expiredCleanup = await cleanupExpiredPopupsInDrawer(page, timezone, { protectedUrls, progress });
+    } catch (err) {
+      progress('popup-expired-cleanup-warning', `Không thể tự động xóa popup hết hạn: ${err.message}`);
+    }
+  }
+  const expiredRemovedCount = expiredCleanup.removedCount || 0;
+
   let positionResult = { applied: false, moved: false };
   if (legacyPopups.length > 0) {
     const originalOrderUrls = entries.map((_, index) => configuredEntryItems.get(index)?.imageUrl || null);
@@ -2226,9 +2477,63 @@ async function configurePopup(page, imagePath, schedule, timezone, {
       error.stage = 'popup-position-verification';
       throw error;
     }
-    progress('popup-position', 'Sắp xếp thứ tự popup: popup mới ở vị trí đầu tiên, các popup cũ giữ nguyên thứ tự');
+    progress(
+      'popup-position',
+      customOrderApplied
+        ? `Sắp xếp thứ tự popup theo yêu cầu ticket: ${customOrderLabels.join(' - ')}`
+        : 'Sắp xếp thứ tự popup: popup mới ở vị trí đầu tiên, các popup cũ giữ nguyên thứ tự'
+    );
     positionResult = await restoreMigratedPopupOrder(page, originalOrderUrls);
-  } else if (ticketItems.size > 0 && configuredItemsBefore.length > 0) {
+  } else if (Array.isArray(customOrderLabels) && customOrderLabels.length >= 2) {
+    const currentSnapshot = await readPopupListItems(page);
+    if (currentSnapshot.items.length >= 2) {
+      const scannedByUrl = new Map(
+        (Array.isArray(cmsScannedItems) ? cmsScannedItems : [])
+          .filter((item) => item?.sourceImageUrl && item?.imagePath)
+          .map((item) => [stableImageUrl(item.sourceImageUrl), item])
+      );
+      const entryUrlToLocal = new Map();
+      for (const ticket of normalizedTicketEntries) {
+        const persistedUrl = ticketItems.get(ticket.ticketIndex)?.imageUrl;
+        if (persistedUrl && ticket.imagePath) {
+          entryUrlToLocal.set(stableImageUrl(persistedUrl), {
+            imagePath: ticket.imagePath,
+            filename: ticket.filename,
+            isTicket: true
+          });
+        }
+      }
+      const liveEntries = currentSnapshot.items.map((cmsItem) => {
+        const normalizedUrl = stableImageUrl(cmsItem?.image);
+        const ticketLocal = entryUrlToLocal.get(normalizedUrl);
+        if (ticketLocal) return { cmsUrl: cmsItem.image, ...ticketLocal };
+        const scannedLocal = scannedByUrl.get(normalizedUrl);
+        if (scannedLocal) {
+          return {
+            cmsUrl: cmsItem.image,
+            imagePath: scannedLocal.imagePath,
+            filename: scannedLocal.filename,
+            isTicket: false
+          };
+        }
+        return { cmsUrl: cmsItem.image, imagePath: null, filename: null, isTicket: false };
+      });
+      if (liveEntries.every((entry) => entry.imagePath)) {
+        progress('popup-order-vision', `Đang đối chiếu thứ tự popup theo yêu cầu: ${customOrderLabels.join(' - ')}`);
+        const customOrdered = await reorderEntriesByCustomOrder(liveEntries, customOrderLabels);
+        if (customOrdered.method === 'gemini-vision-order') {
+          if (customOrdered.rationale) progress('popup-order-matched', customOrdered.rationale);
+          const orderedUrls = customOrdered.entries.map((entry) => entry.cmsUrl);
+          progress('popup-position', `Sắp xếp thứ tự popup theo yêu cầu ticket: ${customOrderLabels.join(' - ')}`);
+          positionResult = await restoreMigratedPopupOrder(page, orderedUrls);
+        }
+      }
+    }
+  }
+  if (!positionResult.applied && legacyPopups.length === 0 && ticketItems.size > 0 && configuredItemsBefore.length > 0) {
+    if (!await isPopupListItemsViewOpen(page)) {
+      await openPopupSettings(page, sectionId).catch(() => {});
+    }
     const ticketImageUrls = normalizedTicketEntries
       .map((ticket) => ticketItems.get(ticket.ticketIndex)?.imageUrl || null)
       .filter(Boolean);
@@ -2242,10 +2547,10 @@ async function configurePopup(page, imagePath, schedule, timezone, {
   // replacement ticket, where the original single popup was intentionally
   // removed before adding the new one.
   const expectedConfiguredCount = legacyPopups.length > 0
-    ? entries.length
+    ? Math.max(1, entries.length - expiredRemovedCount)
     : (duplicateTargetIndex >= 0
-        ? Math.max(1, configuredItemsBefore.length)
-        : Math.max(1, configuredItemsBefore.length + entries.length - itemsRemovedAfterAdd)
+        ? Math.max(1, configuredItemsBefore.length - expiredRemovedCount)
+        : Math.max(1, configuredItemsBefore.length + entries.length - itemsRemovedAfterAdd - expiredRemovedCount)
       );
   const expectedItemCount = expectedConfiguredCount;
   const configuredItems = after.items.filter((item) => typeof item?.image === 'string' && item.image.trim());
@@ -2327,7 +2632,9 @@ async function configurePopup(page, imagePath, schedule, timezone, {
     link: imageLink || null,
     delaySlider: delaySliderResult,
     delaySliderSeconds: popupDuration?.delaySliderSeconds || null,
-    timezoneControl
+    timezoneControl,
+    removedExpiredItems: expiredRemovedCount,
+    removedExpiredDetails: expiredCleanup.removedItems || []
   };
 }
 
@@ -3182,6 +3489,7 @@ async function main() {
   const downloadPoster = process.argv.includes('--download-poster');
   const buildRequested = process.argv.includes('--build');
   const repairExistingPopup = process.argv.includes('--repair-existing-popup');
+  const cleanupExpired = !process.argv.includes('--no-cleanup-expired');
   const expiryOverride = value('--expiry', null);
   const linkOverride = value('--link', null);
   if (buildRequested && !applyChanges) throw new Error('--build requires --apply.');
@@ -3216,7 +3524,7 @@ async function main() {
     await openTicketDetails(page, ticketUrl);
     progress('crm-loaded', 'Đã tải nội dung ticket');
     const ticketContext = await readFullTicketContext(page, ticketUrl);
-    const body = ticketContext.text;
+    let body = ticketContext.text;
     fs.writeFileSync(path.join(runDir, 'ticket.txt'), body, 'utf8');
     await page.screenshot({ path: path.join(runDir, 'ticket.png'), fullPage: false });
     plan.ticketPageUrl = page.url();
@@ -3229,60 +3537,74 @@ async function main() {
       plan.status = 'ticket-not-loaded';
       plan.nextAction = 'CRM did not finish loading its ticket UI within 15 seconds. Confirm the runner Chrome profile is signed in, then retry. No CMS action was attempted.';
     } else {
-      const deterministicTicket = ticketData(body, ticketUrl);
-      progress('ticket-semantics', 'Reading ticket meaning with Gemini safety fallback');
-      const semanticResolution = await resolveTicketSemantics(deterministicTicket, body, {
-        attachmentCandidates: ticketContext.attachmentCandidates
-      });
-      plan.ticket = semanticResolution.ticket;
-      plan.semantic = semanticResolution.audit;
-      plan.ticket.attachmentAvailable = Boolean(
-        ticketContext.attachmentCandidates.length
-        || (ticketContext.root && await isElementDisplayed(allAttachmentsDownloadButton(ticketContext.root)))
-      );
-      plan.ticket.attachmentCount = ticketContext.attachmentCandidates.length;
-      plan.ticket = resolveRemovalScopeFromAttachments(plan.ticket, ticketContext.attachmentCandidates);
-      // If a ticket carries a non-removal poster attachment (especially an uploaded file card)
-      // and mentions display duration, treat it as creating/updating that popup poster while keeping
-      // popupDuration, unless Gemini explicitly set requiresAttachment === false on a reference screenshot.
-      const hasUploadableAttachment = ticketContext.attachmentCandidates.some((c) => !c.isRemovalReference);
-      const hasUploadCardAttachment = ticketContext.attachmentCandidates.some((c) => !c.isRemovalReference && c.kind === 'upload-card');
-      if (
-        plan.ticket.popupAction === 'update-duration'
-        && hasUploadableAttachment
-        && (
-          plan.ticket.requiresAttachment === true
-          || Boolean(plan.ticket.popupAttachmentIndex)
-          || (plan.ticket.requiresAttachment !== false && (hasUploadCardAttachment || hasAffirmativePopupUpdate(body)))
-        )
-      ) {
-        plan.ticket.popupAction = 'create';
-      }
-      if (plan.ticket.actionSummary) {
-        progress('ticket-plan', `Kế hoạch thực hiện: ${plan.ticket.actionSummary}`, {
-          action: plan.ticket.popupAction,
-          summary: plan.ticket.actionSummary,
-          topic: plan.ticket.removalTopic || null
+      const evaluateTicketAnalysis = async (currentText, currentCandidates, currentRoot) => {
+        const deterministicTicket = ticketData(currentText, ticketUrl);
+        progress('ticket-semantics', 'Reading ticket meaning with Gemini safety fallback');
+        const semanticResolution = await resolveTicketSemantics(deterministicTicket, currentText, {
+          attachmentCandidates: currentCandidates
         });
-      }
-      if (ticketContext.attachmentCandidates.length === 1 && !plan.ticket.popupAttachmentIndex) {
-        // A sole visible image attachment is unambiguous even if Gemini is
-        // unavailable. Retain the numbered choice so the downloader cannot
-        // silently select a different image later in the run.
-        plan.ticket.popupAttachmentIndex = 1;
-        plan.ticket.popupAttachmentSelection = 'only-visible-image';
-      } else if (plan.ticket.popupAttachmentIndex) {
-        plan.ticket.popupAttachmentSelection = 'gemini-comment-evidence';
-      }
-      if (suppliedSiteId) {
-        if (!/^\d{3,}$/.test(suppliedSiteId)) throw new Error('--site-id must be a numeric Website ID.');
-        plan.ticket.siteId = suppliedSiteId;
-        plan.ticket.siteIdSource = 'command-line override';
-      } else if (plan.ticket.siteId) {
-        plan.ticket.siteIdSource = 'ticket text';
-      }
-      if (linkOverride) {
-        plan.ticket.popupLink = linkOverride;
+        plan.ticket = semanticResolution.ticket;
+        plan.semantic = semanticResolution.audit;
+        plan.ticket.attachmentAvailable = Boolean(
+          currentCandidates.length
+          || (currentRoot && await isElementDisplayed(allAttachmentsDownloadButton(currentRoot)))
+        );
+        plan.ticket.attachmentCount = currentCandidates.length;
+        plan.ticket = resolveRemovalScopeFromAttachments(plan.ticket, currentCandidates);
+        const hasUploadableAttachment = currentCandidates.some((c) => !c.isRemovalReference);
+        const hasUploadCardAttachment = currentCandidates.some((c) => !c.isRemovalReference && c.kind === 'upload-card');
+        if (
+          plan.ticket.popupAction === 'update-duration'
+          && hasUploadableAttachment
+          && (
+            plan.ticket.requiresAttachment === true
+            || Boolean(plan.ticket.popupAttachmentIndex)
+            || (plan.ticket.requiresAttachment !== false && (hasUploadCardAttachment || hasAffirmativePopupUpdate(activeTicketRequestText(currentText))))
+          )
+        ) {
+          plan.ticket.popupAction = 'create';
+        }
+        if (plan.ticket.actionSummary) {
+          progress('ticket-plan', `Kế hoạch thực hiện: ${plan.ticket.actionSummary}`, {
+            action: plan.ticket.popupAction,
+            summary: plan.ticket.actionSummary,
+            topic: plan.ticket.removalTopic || null
+          });
+        }
+        if (currentCandidates.length === 1 && !plan.ticket.popupAttachmentIndex) {
+          // A sole visible image attachment is unambiguous even if Gemini is
+          // unavailable. Retain the numbered choice so the downloader cannot
+          // silently select a different image later in the run.
+          plan.ticket.popupAttachmentIndex = 1;
+          plan.ticket.popupAttachmentSelection = 'only-visible-image';
+        } else if (plan.ticket.popupAttachmentIndex) {
+          plan.ticket.popupAttachmentSelection = 'gemini-comment-evidence';
+        }
+        if (suppliedSiteId) {
+          if (!/^\d{3,}$/.test(suppliedSiteId)) throw new Error('--site-id must be a numeric Website ID.');
+          plan.ticket.siteId = suppliedSiteId;
+          plan.ticket.siteIdSource = 'command-line override';
+        } else if (plan.ticket.siteId) {
+          plan.ticket.siteIdSource = 'ticket text';
+        }
+        if (linkOverride) {
+          plan.ticket.popupLink = linkOverride;
+        }
+      };
+
+      await evaluateTicketAnalysis(body, ticketContext.attachmentCandidates, ticketContext.root);
+      if (!plan.ticket.scheduleError && plan.ticket.siteId && ((applyChanges && !repairExistingPopup) || downloadPoster)
+        && popupActionNeedsTicketImage(plan.ticket.popupAction, null)) {
+        const refreshed = await ticketAttachmentItems(page, ticketUrl, { reveal: true }).catch(() => null);
+        if (refreshed?.root && refreshed.items.length !== ticketContext.attachmentCandidates.length) {
+          ticketContext.root = refreshed.root;
+          body = await refreshed.root.innerText({ timeout: 10000 }).catch(() => body);
+          ticketContext.text = body;
+          ticketContext.attachmentCandidates = await ticketAttachmentDescriptors(refreshed.root, refreshed.items);
+          fs.writeFileSync(path.join(runDir, 'ticket.txt'), body, 'utf8');
+          progress('ticket-attachments-synced', `CRM vừa tải đủ ${ticketContext.attachmentCandidates.length} ảnh đính kèm; đang cập nhật phân tích ticket`);
+          await evaluateTicketAnalysis(body, ticketContext.attachmentCandidates, ticketContext.root);
+        }
       }
       if (plan.ticket.scheduleError) {
         plan.status = 'schedule-needs-review';
@@ -3390,10 +3712,11 @@ async function main() {
             const validTextSelection = textSelection && textCandidate && !textCandidate.isRemovalReference ? textSelection : null;
             if (validTextSelection && !visionResolution.selection.indices.includes(validTextSelection)) {
               const rationale = String(visionResolution.audit?.rationale || visionResolution.selection?.rationale || '');
+              const activeTicketText = activeTicketRequestText(body);
               const textSelectionWasRejected = new RegExp(String.raw`attachment\s*#?${validTextSelection}\b.*(?:remove|gỡ|xóa|old|screenshot|chụp|không\s*phải)`, 'i').test(rationale)
                 || isPopupRemovalAction(plan.ticket.popupAction)
                 || plan.ticket.popupAction === 'replace'
-                || hasAffirmativePopupRemoval(body);
+                || hasAffirmativePopupRemoval(activeTicketText);
 
               if (textSelectionWasRejected && visionResolution.selection.indices.length > 0) {
                 progress('attachment-selection-corrected', `Gemini text chọn ảnh #${validTextSelection} (ảnh cũ/cần gỡ); Gemini Vision đã xác minh poster mới chính xác là #${visionResolution.selection.indices.join(', ')}`);
@@ -3404,7 +3727,7 @@ async function main() {
                 throw error;
               }
             }
-            const multiIntent = hasMultiPosterIntent(body);
+            const multiIntent = hasMultiPosterIntent(activeTicketRequestText(body));
             if (!multiIntent && validTextSelection && visionResolution.selection.indices.includes(validTextSelection)) {
               progress('attachment-selection-refined', `Ticket chỉ yêu cầu 1 popup; ưu tiên poster #${validTextSelection} từ ngữ cảnh/comment`);
               plan.ticket.popupAttachmentIndexes = [validTextSelection];
@@ -3478,6 +3801,16 @@ async function main() {
               visionCandidateDownloads = await downloadTicketCandidateImages(page, ticketUrl, runDir, {
                 expectedAttachmentCount: ticketContext.attachmentCandidates.length
               });
+              if (visionCandidateDownloads.length > ticketContext.attachmentCandidates.length) {
+                const postDownload = await ticketAttachmentItems(page, ticketUrl, { reveal: true }).catch(() => null);
+                if (postDownload?.root && postDownload.items.length >= visionCandidateDownloads.length) {
+                  ticketContext.root = postDownload.root;
+                  body = await postDownload.root.innerText({ timeout: 10000 }).catch(() => body);
+                  ticketContext.text = body;
+                  ticketContext.attachmentCandidates = await ticketAttachmentDescriptors(postDownload.root, postDownload.items);
+                  plan.ticket.attachmentCount = ticketContext.attachmentCandidates.length;
+                }
+              }
               let preparedVision = await visionCandidatesFromDownloads(visionCandidateDownloads, ticketContext.attachmentCandidates, { page });
               if (preparedVision.candidates.length) {
                 progress('ticket-vision', 'Đang dùng Gemini Vision để xác minh poster và đọc ngày hết hạn...');
@@ -3503,13 +3836,16 @@ async function main() {
                   const textSelection = plan.ticket.popupAttachmentIndex || null;
                   if (textSelection && textSelection !== visionResolution.selection.index) {
                     const rationale = String(visionResolution.audit?.rationale || visionResolution.selection?.rationale || '');
+                    const activeTicketText = activeTicketRequestText(body);
                     const textSelectionWasRejected = new RegExp(String.raw`attachment\s*#?${textSelection}\b.*(?:remove|gỡ|xóa|old|screenshot|chụp|không\s*phải)`, 'i').test(rationale)
                       || isPopupRemovalAction(plan.ticket.popupAction)
                       || plan.ticket.popupAction === 'replace'
-                      || hasAffirmativePopupRemoval(body);
+                      || hasAffirmativePopupRemoval(activeTicketText)
+                      || hasSizeOrReuploadInstruction(activeTicketText)
+                      || /\b(?:size|1x1|1:1|square|vuông|re-?upload|up\s*lại|thay\s*bằng|later\s*comment|newer|updated)\b/i.test(rationale);
 
                     if (textSelectionWasRejected) {
-                      progress('attachment-selection-corrected', `Gemini text chọn ảnh #${textSelection} (ảnh cũ/cần gỡ); Gemini Vision đã xác minh poster mới chính xác là #${visionResolution.selection.index}`);
+                      progress('attachment-selection-corrected', `Gemini text chọn ảnh #${textSelection} (ảnh cũ/cần gỡ/sai size); Gemini Vision đã xác minh poster mới chính xác là #${visionResolution.selection.index}`);
                     } else {
                       const error = new Error(`Gemini text selected attachment #${textSelection}, while Gemini Vision selected #${visionResolution.selection.index}. The poster was not guessed.`);
                       error.stage = 'attachment-selection';
@@ -3878,6 +4214,82 @@ async function main() {
                 plan.nextAction = 'Popup removal was verified. Rerun with --apply --build to publish the removal.';
               }
             }
+          } else if (plan.ticket.popupAction === 'remove-expired') {
+            plan.status = 'ready-to-remove-expired-popups';
+            plan.nextAction = 'Ticket yêu cầu xóa các popup đã hết hạn trên CMS. Rerun với --apply --build để thực hiện và xuất bản.';
+            if (applyChanges) {
+              plan.safety = buildRequested
+                ? 'Expired popup cleanup and Build/publish were explicitly requested.'
+                : 'Expired popup cleanup was explicitly requested. Build/publish was not requested.';
+              progress('timezone-check', 'Đọc địa chỉ project để xác định timezone so sánh ngày hết hạn');
+              plan.timezone = await discoverProjectTimezone(page, baseUrl, {
+                selectedDomain: plan.cms?.selectedDomain,
+                website: plan.website,
+                ticketText: plan.ticket?.raw
+              });
+              let sectionVersionInfo = { expectedToken: null, sections: [], legacySectionIds: [] };
+              try {
+                sectionVersionInfo = await inspectAnnouncementSectionVersions(page, baseUrl, plan.plugin.version);
+                plan.legacySection = {
+                  expectedVersion: sectionVersionInfo.expectedToken,
+                  legacyCount: sectionVersionInfo.legacySectionIds.length
+                };
+              } catch {}
+              const pluginStateBeforeApply = plan.plugin.state;
+              const mustUpgrade = pluginStateBeforeApply === 'outdated'
+                || pluginStateBeforeApply === 'missing'
+                || sectionVersionInfo.legacySectionIds.length > 0
+                || (plan.plugin.version && announcementSectionVersionToken(plan.plugin.version) !== '1038');
+              const removal = await removeExpiredPopupsForTicket(page, baseUrl, plan.timezone, runDir, {
+                mustUpgrade,
+                sectionVersionInfo,
+                plan,
+                progress
+              });
+              plan.popupRemoval = {
+                scope: 'expired',
+                changed: removal.changed,
+                removedCount: removal.removedCount,
+                sectionCount: removal.sectionCount || null,
+                sectionId: removal.sectionId || null,
+                itemIndex: Number.isInteger(removal.itemIndex) ? removal.itemIndex : null,
+                imageUrl: removal.imageUrl || null,
+                warnings: removal.warnings || []
+              };
+              plan.popup = {
+                removedExpiredItems: removal.removedCount || 0,
+                removedExpiredDetails: removal.removedItems || []
+              };
+              await page.screenshot({ path: path.join(runDir, 'popup-removal.png'), fullPage: false });
+              if (!removal.changed) {
+                plan.status = 'popup-removal-noop';
+                plan.nextAction = 'Không có popup nào đã hết hạn trên CMS. Website không thay đổi và Build chưa chạy.';
+              } else if (buildRequested) {
+                progress('build-start', 'Bắt đầu Build website sau khi xóa popup hết hạn');
+                plan.build = await buildWebsite(page, baseUrl, {
+                  fallbackDomain: plan.cms?.selectedDomain || null,
+                  progress
+                });
+                plan.website = plan.build.website;
+                plan.cmsStatus = plan.build.cmsStatus || null;
+                if (plan.build.status === 'success') {
+                  const websiteUrl = plan.website.liveUrl || plan.website.previewUrl || null;
+                  plan.status = 'popup-removed';
+                  const statusNote = plan.cmsStatus?.summary ? ` · [${plan.cmsStatus.summary}]` : '';
+                  plan.nextAction = websiteUrl
+                    ? `Đã xóa ${removal.removedCount} popup hết hạn và Build thành công: ${websiteUrl}${statusNote}`
+                    : `Đã xóa ${removal.removedCount} popup hết hạn; CMS xác nhận: ${plan.cmsStatus?.summary || 'Build COMPLETE'}`;
+                  progress('build-complete', plan.nextAction, { websiteUrl, cmsStatus: plan.cmsStatus });
+                } else {
+                  plan.status = 'build-unconfirmed';
+                  plan.nextAction = 'Đã xóa popup hết hạn và bấm Build nhưng chưa xác nhận Build hoàn tất.';
+                  progress('build-unconfirmed', plan.nextAction, { websiteUrl: plan.website.liveUrl || plan.website.previewUrl || null, cmsStatus: plan.cmsStatus });
+                }
+              } else {
+                plan.status = 'popup-removal-awaiting-build';
+                plan.nextAction = `Đã xóa ${removal.removedCount} popup hết hạn. Chạy thêm --build để xuất bản.`;
+              }
+            }
           } else if (plan.ticket.popupAction === 'update-duration') {
             plan.status = 'ready-to-update-duration';
             const dur = plan.ticket.popupDuration;
@@ -3976,9 +4388,12 @@ async function main() {
               throw new Error('Ticket popup start date was found but could not be converted automatically to a safe date. Use an ISO date (YYYY-MM-DD) in the ticket.');
             }
             const popupSchedule = popupScheduleFromTicket(plan.ticket, effectiveExpiry);
+            const perPosterBaseSchedule = !expiryOverride && plan.ticket.scheduleSource === 'poster-artwork' && downloadedAttachments.length > 1
+              ? { ...popupSchedule, end: null }
+              : popupSchedule;
             const stagedTicketEntries = repairExistingPopup
               ? []
-              : popupTicketEntriesFromDownloads(downloadedAttachments, popupSchedule, visionPosterSchedules);
+              : popupTicketEntriesFromDownloads(downloadedAttachments, perPosterBaseSchedule, visionPosterSchedules);
             plan.ticket.popupItems = stagedTicketEntries.map((entry) => ({
               attachmentIndex: entry.candidateIndex,
               filename: entry.filename,
@@ -4064,8 +4479,45 @@ async function main() {
                       }
                     }
                   }
+                } else if (
+                  plan.ticket.popupAction === 'replace'
+                  && removalMatches.length === 0
+                  && legacyPopupSnapshot.scannedItems.length > 1
+                  && plan.ticket.removalTopic
+                  && hasAffirmativePopupRemoval(activeTicketRequestText(body))
+                ) {
+                  const popupCandidates = legacyPopupSnapshot.scannedItems.map((item, idx) => ({
+                    ...item,
+                    visionIndex: idx + 1,
+                    sectionId: 'cms',
+                    itemIndex: idx
+                  }));
+                  try {
+                    const prepared = preparePopupRemovalVision(null, popupCandidates);
+                    if (prepared.candidates.length > 0) {
+                      const resolution = await resolveTicketPopupRemovalVision(activeTicketRequestText(body), null, prepared.candidates);
+                      if (resolution.selection?.index) {
+                        const matchedIdx = resolution.selection.index - 1;
+                        removalMatches.push({
+                          refIndex: null,
+                          cmsIndex: matchedIdx,
+                          rationale: resolution.selection.rationale,
+                          cmsItem: legacyPopupSnapshot.scannedItems[matchedIdx]
+                        });
+                        progress('legacy-popup-removal-match', `Đã nhận diện popup #${matchedIdx + 1} (${legacyPopupSnapshot.scannedItems[matchedIdx]?.filename || 'popup'}) khớp chủ đề cần thay/gỡ "${plan.ticket.removalTopic}"`);
+                      }
+                    }
+                  } catch {}
                 }
                 if (preserveLegacyPopups) {
+                  if (legacyPopupSnapshot.sectionIds.length > 0 && legacyPopupSnapshot.scannedItems.length === 0 && keepsExistingPopups(body)) {
+                    const error = new Error(
+                      'CMS still has an active Announcement section and the ticket asks to keep existing popups, '
+                      + 'but 0 readable popup items could be captured before section replacement. Legacy section was NOT deleted.'
+                    );
+                    error.stage = 'legacy-popup-snapshot';
+                    throw error;
+                  }
                   if (removalMatches.length > 0 && legacyPopupSnapshot.items.length > 0) {
                     const removedCmsIndices = new Set(removalMatches.map((m) => m.cmsIndex));
                     legacyPopupSnapshot.items = legacyPopupSnapshot.items.filter((item) => {
@@ -4080,11 +4532,14 @@ async function main() {
                     expiredCount: legacyPopupSnapshot.expiredCount
                   };
                 }
+                const allowCrossAspectRatioConfirmation = plan.ticket.popupAction === 'replace'
+                  || hasSizeOrReuploadInstruction(activeTicketRequestText(body));
                 const duplicates = await findDuplicatePopupImagesWithVision(
                   page,
                   downloadedAttachments,
                   legacyPopupSnapshot.scannedItems,
                   {
+                    allowCrossAspectRatioConfirmation,
                     confirmVisualMatch: async ({ ticket, cms, ticketBase64, ticketMime, cmsBase64, cmsMime }) => (
                       resolveVisualDuplicateConfirmation(
                         { filename: ticket?.filename || 'ticket-poster', mimeType: ticketMime, base64: ticketBase64 },
@@ -4204,6 +4659,7 @@ async function main() {
                 : `Adding ${stagedTicketEntries.length} ticket poster${stagedTicketEntries.length === 1 ? '' : 's'} to Popup settings`
             );
             try {
+              const customOrderLabels = extractPopupOrderSequence(body);
               const configuredPopup = await configurePopup(page, downloadedAttachment?.uploadPath || downloadedAttachment?.path || null, popupSchedule, plan.timezone, {
                 replaceExisting: plan.ticket.popupAction === 'replace',
                 sectionId: plan.popupSection.sectionId,
@@ -4217,7 +4673,10 @@ async function main() {
                 duplicateMatches: matchingDuplicatePairs,
                 removalMatches: (replaceSectionAfterPluginUpdate || recoveredMigration || legacyPopupSnapshot?.items?.length > 0) ? [] : removalMatches,
                 imageLink: plan.ticket.popupLink || null,
-                popupDuration: plan.ticket.popupDuration || null
+                popupDuration: plan.ticket.popupDuration || null,
+                customOrderLabels,
+                cmsScannedItems: legacyPopupSnapshot?.scannedItems || [],
+                cleanupExpired
               });
               plan.popup = {
                 imageConfigured: configuredPopup.imageConfigured !== false,
@@ -4238,6 +4697,8 @@ async function main() {
                 ticketMergedWithLegacy: configuredPopup.ticketMergedWithLegacy,
                 repaired: configuredPopup.repaired === true,
                 removedEmptyItems: configuredPopup.removedEmptyItems || 0,
+                removedExpiredItems: configuredPopup.removedExpiredItems || 0,
+                removedExpiredDetails: configuredPopup.removedExpiredDetails || [],
                 clearedStart: configuredPopup.clearedStart === true,
                 deduplicated: configuredPopup.deduplicated === true,
                 deduplicationMethod: configuredPopup.deduplicationMethod || null,
@@ -4319,7 +4780,7 @@ async function main() {
       ? `Stopped at ${error.stage}: ${error.message}`
       : error.status === 'build-failed'
       ? 'CMS reported a Build failure. Review the CMS Status page; the tool did not declare the popup live.'
-      : 'Run with --headed, sign in inside the tool Chrome window, then rerun the same command.';
+      : `Ticket execution stopped: ${error.message}`;
     progress(error.stage ? `${error.stage}-failed` : 'failed', plan.error, { status: plan.status });
   } finally {
     if (runDir) {
@@ -4353,9 +4814,15 @@ module.exports = {
   isPopupRemovalAction,
   popupActionNeedsTicketImage,
   hasMultiPosterIntent,
+  keepsExistingPopups,
+  extractPopupOrderSequence,
+  hasSizeOrReuploadInstruction,
   resolveRemovalScopeFromAttachments,
   popupScheduleFromTicket,
   popupTicketEntriesFromDownloads,
+  reorderEntriesByCustomOrder,
+  cleanupExpiredPopupsInDrawer,
+  removeExpiredPopupsForTicket,
   applyArtworkSchedulePrecedence,
   shouldUseTicketVision,
   buildPopupEntries,
@@ -4398,6 +4865,7 @@ module.exports = {
   discoverProjectTimezone,
   recoverInterruptedLegacyMigration,
   setPopupImageLink,
+  isFlatPopupFormOpen,
   popupImageUploadControl,
   popupImageUrls,
   waitForPopupImageUpload,

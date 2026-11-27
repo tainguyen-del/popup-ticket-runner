@@ -261,6 +261,83 @@ function geminiVisionMimeType(imagePath) {
   return null;
 }
 
+function formatAspectRatioLabel(width, height) {
+  if (!Number.isFinite(width) || !Number.isFinite(height) || width <= 0 || height <= 0) return null;
+  const ratio = width / height;
+  if (Math.abs(ratio - 1) <= 0.03) return '1:1 (square)';
+  const gcd = (a, b) => (b === 0 ? a : gcd(b, a % b));
+  const w = Math.round(width);
+  const h = Math.round(height);
+  const divisor = gcd(w, h);
+  const rw = Math.round(w / divisor);
+  const rh = Math.round(h / divisor);
+  const orientation = ratio > 1 ? 'landscape' : 'portrait';
+  if (rw <= 20 && rh <= 20) return `${rw}:${rh} (${orientation})`;
+  return `${ratio.toFixed(2)} (${orientation})`;
+}
+
+function imagePixelDimensions(buffer, mimeType = null) {
+  if (!Buffer.isBuffer(buffer) || buffer.length < 12) return null;
+  if ((!mimeType || mimeType === 'image/png')
+    && buffer.length >= 24
+    && buffer.subarray(0, 8).equals(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))) {
+    const width = buffer.readUInt32BE(16);
+    const height = buffer.readUInt32BE(20);
+    if (width > 0 && height > 0) return { width, height, aspectLabel: formatAspectRatioLabel(width, height) };
+  }
+  if ((!mimeType || mimeType === 'image/jpeg') && buffer[0] === 0xff && buffer[1] === 0xd8) {
+    let offset = 2;
+    while (offset + 9 < buffer.length) {
+      if (buffer[offset] !== 0xff) {
+        offset += 1;
+        continue;
+      }
+      while (offset < buffer.length && buffer[offset] === 0xff) offset += 1;
+      if (offset >= buffer.length) break;
+      const marker = buffer[offset];
+      offset += 1;
+      if (marker === 0xd8 || marker === 0xd9 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue;
+      if (offset + 2 > buffer.length) break;
+      const segmentLength = buffer.readUInt16BE(offset);
+      if (segmentLength < 2 || offset + segmentLength > buffer.length) break;
+      const isSof = marker >= 0xc0 && marker <= 0xcf && marker !== 0xc4 && marker !== 0xc8 && marker !== 0xcc;
+      if (isSof && segmentLength >= 7 && offset + 7 <= buffer.length) {
+        const height = buffer.readUInt16BE(offset + 3);
+        const width = buffer.readUInt16BE(offset + 5);
+        if (width > 0 && height > 0) return { width, height, aspectLabel: formatAspectRatioLabel(width, height) };
+        break;
+      }
+      offset += segmentLength;
+    }
+  }
+  if ((!mimeType || mimeType === 'image/webp')
+    && buffer.length >= 30
+    && buffer.subarray(0, 4).toString('ascii') === 'RIFF'
+    && buffer.subarray(8, 12).toString('ascii') === 'WEBP') {
+    const chunk = buffer.subarray(12, 16).toString('ascii');
+    if (chunk === 'VP8X' && buffer.length >= 30) {
+      const width = 1 + buffer.readUIntLE(24, 3);
+      const height = 1 + buffer.readUIntLE(27, 3);
+      if (width > 0 && height > 0) return { width, height, aspectLabel: formatAspectRatioLabel(width, height) };
+    } else if (chunk === 'VP8L' && buffer.length >= 25) {
+      const bits = buffer.readUInt32LE(21);
+      const width = (bits & 0x3fff) + 1;
+      const height = ((bits >> 14) & 0x3fff) + 1;
+      if (width > 0 && height > 0) return { width, height, aspectLabel: formatAspectRatioLabel(width, height) };
+    } else if (chunk === 'VP8 ' && buffer.length >= 30) {
+      const width = buffer.readUInt16LE(26) & 0x3fff;
+      const height = buffer.readUInt16LE(28) & 0x3fff;
+      if (width > 0 && height > 0) return { width, height, aspectLabel: formatAspectRatioLabel(width, height) };
+    }
+  }
+  if (buffer.length >= 10 && (buffer.subarray(0, 6).toString('ascii') === 'GIF87a' || buffer.subarray(0, 6).toString('ascii') === 'GIF89a')) {
+    const width = buffer.readUInt16LE(6);
+    const height = buffer.readUInt16LE(8);
+    if (width > 0 && height > 0) return { width, height, aspectLabel: formatAspectRatioLabel(width, height) };
+  }
+  return null;
+}
+
 function isImageContainerComplete(buffer, mimeType) {
   if (!Buffer.isBuffer(buffer) || buffer.length < 12) return false;
   if (mimeType === 'image/png') {
@@ -330,10 +407,14 @@ async function visionCandidatesFromDownloads(downloads, attachmentCandidates, { 
       base64 = rawBuffer.toString('base64');
     }
     totalBytes += candidateBytes;
+    const dimensions = imagePixelDimensions(rawBuffer, geminiVisionMimeType(download.path));
     const context = attachmentCandidates.find((candidate) => candidate.index === download.candidateIndex) || {};
     candidates.push({
       index: download.candidateIndex,
       filename: download.filename,
+      width: dimensions?.width || null,
+      height: dimensions?.height || null,
+      aspectLabel: dimensions?.aspectLabel || null,
       context: context.context || '',
       precedingText: context.precedingText || '',
       kind: context.kind || 'unknown',
@@ -354,12 +435,17 @@ function visionCandidateFromLocalImage(image, index, context = '') {
     try { bytes = fs.statSync(imagePath).size; } catch { return null; }
   }
   if (bytes <= 0 || bytes > 4 * 1024 * 1024) return null;
+  const rawBuffer = fs.readFileSync(imagePath);
+  const dimensions = imagePixelDimensions(rawBuffer, mimeType);
   return {
     index,
     filename: image?.filename || path.basename(imagePath),
+    width: dimensions?.width || null,
+    height: dimensions?.height || null,
+    aspectLabel: dimensions?.aspectLabel || null,
     context,
     mimeType,
-    base64: fs.readFileSync(imagePath).toString('base64'),
+    base64: rawBuffer.toString('base64'),
     bytes
   };
 }
@@ -400,6 +486,8 @@ module.exports = {
   cmsSafeUploadFilename,
   stageCmsUploadImage,
   geminiVisionMimeType,
+  formatAspectRatioLabel,
+  imagePixelDimensions,
   isImageContainerComplete,
   visionCandidatesFromDownloads,
   visionCandidateFromLocalImage,

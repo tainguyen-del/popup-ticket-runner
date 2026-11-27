@@ -127,6 +127,32 @@ function isEmptyPopupItem(item) {
     .every((key) => !String(item?.[key] || '').trim());
 }
 
+function todayInTimezone(iana) {
+  const tz = typeof iana === 'string' ? iana : iana?.iana;
+  const parts = new Intl.DateTimeFormat('en-CA', {
+    timeZone: tz || 'UTC',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit'
+  }).formatToParts(new Date());
+  const value = Object.fromEntries(parts.filter((part) => part.type !== 'literal').map((part) => [part.type, part.value]));
+  return `${value.year}-${value.month}-${value.day}`;
+}
+
+function isExpiredPopupItem(item, timezone, today = null) {
+  if (isEmptyPopupItem(item)) return { expired: false, endDate: null, today: null };
+  const rawEnd = String(item?.time_end || '').trim();
+  if (!rawEnd) return { expired: false, endDate: null, today: null };
+  const endDate = popupDateFromCmsValue(rawEnd, timezone);
+  if (!endDate) return { expired: false, endDate: null, today: null };
+  const referenceToday = today || todayInTimezone(timezone);
+  return {
+    expired: endDate < referenceToday,
+    endDate,
+    today: referenceToday
+  };
+}
+
 function popupItemsForReport(items, timezone) {
   return (Array.isArray(items) ? items : []).map((item, index) => ({
     index,
@@ -139,6 +165,8 @@ function popupItemsForReport(items, timezone) {
 
 module.exports = {
   stableImageUrl,
+  todayInTimezone,
+  isExpiredPopupItem,
   popupDateFromCmsValue,
   popupItemScheduleMatches,
   resolvePopupItemByImageAndSchedule,

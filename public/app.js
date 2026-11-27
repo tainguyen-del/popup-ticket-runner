@@ -1,6 +1,7 @@
 const form = document.querySelector('#ticket-form');
 const ticketCard = document.querySelector('#ticket-card');
 const input = document.querySelector('#ticket-url');
+const cleanupExpiredInput = document.querySelector('#cleanup-expired');
 const button = document.querySelector('#run-button');
 const loginOpen = document.querySelector('#login-open');
 const loginCheck = document.querySelector('#login-check');
@@ -86,6 +87,8 @@ const stages = [
   ['popup-settings-failed', 'Không thể cấu hình Popup settings — CMS đã dừng'],
   ['popup-position', 'Sắp xếp poster theo vị trí được yêu cầu trong ticket'],
   ['popup-position-verification-failed', 'Không xác minh được vị trí poster — Build chưa chạy'],
+  ['popup-expired-cleanup', 'Xóa các popup đã hết hạn'],
+  ['popup-expired-cleanup-warning', 'Lưu ý khi dọn popup hết hạn'],
   ['popup-removal-all', 'Gỡ toàn bộ popup hiện có theo ticket'],
   ['popup-removal-scan', 'Tải popup CMS để đối chiếu ảnh'],
   ['popup-removal-vision', 'Gemini Vision đang đối chiếu ảnh popup cần gỡ'],
@@ -499,11 +502,15 @@ function renderResult(result) {
   if (result.ticket) {
     const actionLabel = result.ticket.popupAction === 'replace'
       ? 'Gỡ popup cũ, thêm popup mới'
+      : result.ticket.popupAction === 'remove-expired'
+        ? 'Xóa các popup đã hết hạn'
       : result.ticket.popupAction === 'remove-one'
         ? 'Gỡ đúng popup khớp ảnh từ ticket'
         : result.ticket.popupAction === 'remove-all'
           ? 'Gỡ toàn bộ popup hiện có'
-          : 'Thêm/cập nhật popup';
+          : result.ticket.popupAction === 'update-duration'
+            ? 'Cập nhật thời gian hiển thị popup'
+            : 'Thêm/cập nhật popup';
     field('Thao tác popup', actionLabel);
     field('Website ID', result.ticket.siteId || 'Chưa tìm thấy');
     if (result.ticket.popupPosition) field('Vị trí popup yêu cầu', result.ticket.popupPosition === 'last' ? 'Cuối danh sách' : 'Đầu danh sách');
@@ -643,6 +650,7 @@ function renderResult(result) {
     const configuredCount = result.popup.ticketPosterCount || result.popup.cmsImageUrls?.length || (result.popup.imageConfigured ? 1 : 0);
     field('Poster đã cấu hình', result.popup.imageConfigured ? `Đã upload và lưu ${configuredCount} poster` : 'Chưa cấu hình');
     if (result.popup.repaired) field('Dọn popup', `Đã xóa ${result.popup.removedEmptyItems || 1} item trống${result.popup.clearedStart ? ' và bỏ ngày bắt đầu không có trong ticket' : ''}`);
+    if (result.popup.removedExpiredItems > 0) field('Popup hết hạn đã xóa', `Đã xóa ${result.popup.removedExpiredItems} popup đã hết hạn`);
     if (result.popup.deduplicated) field('Nhận diện poster', 'Ảnh đã có trong Popup settings; chỉ cập nhật lịch, không tạo item trùng');
     if (result.popup.popupPosition) field('Vị trí poster đã xác minh', result.popup.popupPosition === 'last' ? 'Cuối danh sách' : 'Đầu danh sách');
     if (result.popup.replaced) field('Popup cũ', 'Đã gỡ đúng một popup cũ trước khi thêm poster mới');
@@ -677,6 +685,8 @@ function renderResult(result) {
     const topicLabel = result.ticket?.removalTopic ? `thông báo "${result.ticket.removalTopic}"` : 'thông báo';
     const scope = result.popupRemoval.scope === 'all'
       ? 'toàn bộ popup'
+      : result.popupRemoval.scope === 'expired'
+        ? 'các popup đã hết hạn'
       : (isTopic
         ? (count > 1 ? `${count} popup ${topicLabel}` : `popup ${topicLabel}`)
         : (count > 1 ? `${count} popup khớp ảnh ticket` : 'popup khớp ảnh ticket'));
@@ -780,7 +790,14 @@ async function startJob() {
   renderTimeline([], 'running');
   try {
     const response = await fetch('/api/jobs', {
-      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ ticketUrl, apply: true, build: true, downloadPoster: true, expiry: null })
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({
+        ticketUrl,
+        apply: true,
+        build: true,
+        downloadPoster: true,
+        cleanupExpired: cleanupExpiredInput ? cleanupExpiredInput.checked : true,
+        expiry: null
+      })
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'Không thể chạy ticket.');

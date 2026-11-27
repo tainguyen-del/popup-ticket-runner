@@ -131,3 +131,59 @@ test('findDuplicatePopupImagesWithVision uses confirmVisualMatch tie-breaker to 
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('findDuplicatePopupImagesWithVision matches resized same-artwork across aspect ratios when allowCrossAspectRatioConfirmation is enabled', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'popup-cross-aspect-'));
+  try {
+    const ticketFile = path.join(dir, 'giftcard-1x1.webp');
+    const cmsGiftcard = path.join(dir, 'giftcard-portrait.webp');
+    const cmsOther = path.join(dir, 'weekly-special.webp');
+    fs.writeFileSync(ticketFile, Buffer.from('giftcard-1x1'));
+    fs.writeFileSync(cmsGiftcard, Buffer.from('giftcard-portrait'));
+    fs.writeFileSync(cmsOther, Buffer.from('weekly-special'));
+
+    const mockPage = {
+      evaluate: async (_fn, { cData, computeCrossAspect }) => {
+        const isGiftcard = Buffer.from(cData, 'base64').toString() === 'giftcard-portrait';
+        if (isGiftcard) {
+          return computeCrossAspect
+            ? { pixelSimilarity: 0.72, pearson: 0.74, changedRatio: 0.4, aspectMismatch: true }
+            : { pixelSimilarity: 0, pearson: 0, changedRatio: 1, aspectMismatch: true };
+        }
+        return { pixelSimilarity: 0.45, pearson: 0.25, changedRatio: 0.7 };
+      }
+    };
+
+    const strictDisabled = await findDuplicatePopupImagesWithVision(
+      mockPage,
+      [{ path: ticketFile, filename: 'giftcard-1x1.webp', sha256: '1'.repeat(64) }],
+      [
+        { imagePath: cmsGiftcard, sourceImageUrl: 'https://cdn.example/giftcard-portrait.webp', sha256: '2'.repeat(64) },
+        { imagePath: cmsOther, sourceImageUrl: 'https://cdn.example/weekly-special.webp', sha256: '3'.repeat(64) }
+      ],
+      { confirmVisualMatch: async () => ({ confirmed: true, rationale: 'match' }) }
+    );
+    assert.deepEqual(strictDisabled, []);
+
+    const crossAspectMatched = await findDuplicatePopupImagesWithVision(
+      mockPage,
+      [{ path: ticketFile, filename: 'giftcard-1x1.webp', sha256: '1'.repeat(64) }],
+      [
+        { imagePath: cmsGiftcard, sourceImageUrl: 'https://cdn.example/giftcard-portrait.webp', sha256: '2'.repeat(64) },
+        { imagePath: cmsOther, sourceImageUrl: 'https://cdn.example/weekly-special.webp', sha256: '3'.repeat(64) }
+      ],
+      {
+        allowCrossAspectRatioConfirmation: true,
+        confirmVisualMatch: async ({ cms }) => ({
+          confirmed: cms.sourceImageUrl.includes('giftcard-portrait'),
+          rationale: 'Both depict Gift Card Sale 20% OFF resized from portrait to 1:1 square.'
+        })
+      }
+    );
+    assert.equal(crossAspectMatched.length, 1);
+    assert.equal(crossAspectMatched[0].cmsIndex, 0);
+    assert.equal(crossAspectMatched[0].method, 'cross-aspect-visual-match');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

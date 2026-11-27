@@ -10,6 +10,7 @@ const {
   stageCmsUploadImage,
   geminiVisionMimeType,
   isImageContainerComplete,
+  imagePixelDimensions,
   visionCandidatesFromDownloads,
   visionCandidateFromLocalImage,
   preparePopupRemovalVision
@@ -191,4 +192,39 @@ test('isImageContainerComplete detects valid vs truncated PNG and repairs trunca
   assert.equal(prepared.candidates.length, 1);
   assert.equal(prepared.candidates[0].mimeType, 'image/jpeg');
   assert.equal(prepared.warnings.length, 0);
+});
+
+test('imagePixelDimensions reads PNG and WebP dimensions and preserves them in Vision candidates', async (t) => {
+  const { directory } = fixture(t);
+  const pngHeader = Buffer.alloc(24);
+  Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]).copy(pngHeader, 0);
+  pngHeader.writeUInt32BE(682, 16);
+  pngHeader.writeUInt32BE(1024, 20);
+  assert.deepEqual(imagePixelDimensions(pngHeader, 'image/png'), {
+    width: 682,
+    height: 1024,
+    aspectLabel: '0.67 (portrait)'
+  });
+
+  const webpSquare = Buffer.alloc(30);
+  webpSquare.write('RIFF', 0, 'ascii');
+  webpSquare.writeUInt32LE(22, 4);
+  webpSquare.write('WEBP', 8, 'ascii');
+  webpSquare.write('VP8X', 12, 'ascii');
+  webpSquare.writeUIntLE(1023, 24, 3);
+  webpSquare.writeUIntLE(1023, 27, 3);
+  const webpPath = path.join(directory, 'square.webp');
+  fs.writeFileSync(webpPath, webpSquare);
+
+  const dims = imagePixelDimensions(webpSquare, 'image/webp');
+  assert.deepEqual(dims, { width: 1024, height: 1024, aspectLabel: '1:1 (square)' });
+
+  const prepared = await visionCandidatesFromDownloads(
+    [{ path: webpPath, filename: 'square.webp', bytes: webpSquare.length, candidateIndex: 2 }],
+    [{ index: 2, context: 'Nhờ team up lại ảnh này, vì đúng size 1x1' }]
+  );
+  assert.equal(prepared.candidates.length, 1);
+  assert.equal(prepared.candidates[0].width, 1024);
+  assert.equal(prepared.candidates[0].height, 1024);
+  assert.equal(prepared.candidates[0].aspectLabel, '1:1 (square)');
 });
